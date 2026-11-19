@@ -138,8 +138,14 @@ active deadlines ordered by urgency descending, target ascending and ID; up to
 five tasks with criteria; and the recorded byte-evidence limitation. Missing
 blocker information stays unknown. Long guidance is explicitly truncated. The
 hook scans deadlines in pages with a time budget; large projects may return an
-unavailable message rather than stale or partially ranked guidance. SQLite lock
-wait is limited to 100 ms for this hook (ordinary operations retain 5 seconds).
+unavailable message rather than stale or partially ranked guidance. Once the host
+returns a connection, SQLite lock wait is limited to 100 ms for this hook
+(ordinary operations retain 5 seconds). Use an up-to-date Hermes-managed Python:
+on older SQLite builds affected by the WAL-reset bug, Hermes falls back to DELETE
+journaling and its connection setup can wait several seconds **before** this
+plugin can set that timeout. The sub-second contention test does not pass on
+those legacy runtimes; upgrade the runtime rather than disabling Hermes's SQLite
+safety fallback.
 
 These bounds trade detail for low latency. They are not a hard OS execution
 budget: filesystem or hardware failures can still delay a call. Redaction runs

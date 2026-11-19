@@ -8,7 +8,9 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, reset_tzpath, TZPATH
 
+from test_ledger import fixture_zones
 from urgency_engine.ledger import Ledger
 from urgency_engine.runtime import Parser, Runtime, setup_parser
 
@@ -42,6 +44,8 @@ class RuntimeTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        fixture_zones(self.root)
+        self.addCleanup(lambda: (reset_tzpath(TZPATH), ZoneInfo.clear_cache()))
         self.now = datetime(2030, 1, 1, tzinfo=timezone.utc)
         self.ctx = Context()
         def opener(**kwargs):
