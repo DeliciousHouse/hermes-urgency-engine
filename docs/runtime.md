@@ -10,11 +10,11 @@ Byte identity is **not independent semantic quality acceptance**.
 
 ### Compatibility and installation
 
-Requires Python 3.11–3.14 and Hermes >=0.23.1. The registration, settings, state,
-redaction and storage APIs are present in that release's source. Native validation
-is also exercised against a pinned upstream development checkout; this is not a
-claim that every intervening release has been tested. Date entry needs system
-IANA timezone data or `tzdata` (normally included with Hermes).
+Requires Python 3.11–3.14 and Hermes >=0.23.2. Hermes 0.23.1 lacks the
+`PluginContext.redact_text` API required for exports and guidance. Native CI
+pins both the 0.23.2 release source and a stock upstream development checkout.
+Date entry needs system IANA timezone data or `tzdata` (normally included with
+Hermes).
 
 Install a reviewed immutable revision, replacing `COMMIT_SHA` with its full
 40-character Git commit ID:
@@ -57,7 +57,8 @@ Status and history return `items`, `has_more` and `next`; pass `next` as `after`
 Success is `{"ok":true,"data":...}`. Failure is `{"ok":false,"error":{...}}` with
 `code`, `operation`, `field`, `retryable`, `side_effects` (`none` or `unknown`) and
 `next_action`. CLI success goes to stdout (exit 0); operation failure goes to
-stderr (exit 1); usage errors are JSON on stderr (exit 2). Help is text; a missing
+stderr (exit 1); usage errors are JSON on stderr (exit 2). Hermes itself can emit
+startup diagnostics before the plugin's final JSON error line. Help is text; a missing
 subcommand prints help and exits 2. Slash and tool return a JSON string. String
 values are redacted through Hermes before export; redaction can therefore alter
 an identifier containing a credential-like value. Do not put secrets in IDs.
@@ -130,22 +131,21 @@ the hook returns no context.
 
 All transports reuse the existing ledger; storage opens in the host's active
 profile per operation rather than sharing a process-global SQLite connection.
-The pre-turn hook reads the existing forecast, progress and commitment data.
-It never snapshots forecasts, moves targets, changes criteria or grants credit.
+The pre-turn hook opens only an existing ledger in SQLite read-only mode. It
+does not initialize the schema, create the artifact directory, or run journal
+setup. SQLite can still maintain WAL coordination files. The hook never snapshots
+forecasts, moves targets, changes criteria or grants credit.
 
 The hook labels objective/task text as untrusted data. It includes up to five
 active deadlines ordered by urgency descending, target ascending and ID; up to
 five tasks with criteria; and the recorded byte-evidence limitation. Missing
 blocker information stays unknown. Long guidance is explicitly truncated. The
-hook scans deadlines in pages with a time budget; large projects may return an
-unavailable message rather than stale or partially ranked guidance. Once the host
-returns a connection, SQLite lock wait is limited to 100 ms for this hook
-(ordinary operations retain 5 seconds). Use an up-to-date Hermes-managed Python:
-on older SQLite builds affected by the WAL-reset bug, Hermes falls back to DELETE
-journaling and its connection setup can wait several seconds **before** this
-plugin can set that timeout. The sub-second contention test does not pass on
-those legacy runtimes; upgrade the runtime rather than disabling Hermes's SQLite
-safety fallback.
+hook reads one size-limited snapshot of the atomically replaced focus file
+without taking the writer lock. It applies a 750 ms cooperative work budget and
+a 100 ms SQLite busy timeout. Large projects can return an unavailable message
+rather than stale or partially ranked guidance. Ordinary commands still use the
+host's storage opener and retain its safe journaling policy. `diagnose` runs
+the full integrity checks; the hook checks the schema without a full scan.
 
 These bounds trade detail for low latency. They are not a hard OS execution
 budget: filesystem or hardware failures can still delay a call. Redaction runs

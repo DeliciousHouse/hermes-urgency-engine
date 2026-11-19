@@ -16,19 +16,23 @@ from urgency_engine.runtime import Parser, Runtime, setup_parser
 
 
 class State:
-    def __init__(self):
+    quota_bytes = 10 * 1024 * 1024
+
+    def __init__(self, path):
         self.values = {}
+        self.path = path
 
     def get(self, key, default=None):
         return self.values.get(key, default)
 
     def set(self, key, value):
         self.values[key] = value
+        self.path.write_text(json.dumps(self.values), encoding='utf-8')
 
 
 class Context:
-    def __init__(self):
-        self.state = State()
+    def __init__(self, path):
+        self.state = State(path)
         self.settings = {}
 
     def get_config(self, key, default=None):
@@ -47,7 +51,7 @@ class RuntimeTests(unittest.TestCase):
         fixture_zones(self.root)
         self.addCleanup(lambda: (reset_tzpath(TZPATH), ZoneInfo.clear_cache()))
         self.now = datetime(2030, 1, 1, tzinfo=timezone.utc)
-        self.ctx = Context()
+        self.ctx = Context(self.root / 'state.json')
         def opener(**kwargs):
             return Ledger(sqlite3.connect(self.root / 'data.db'), clock=kwargs['clock'], artifact_root=self.root)
         self.runtime = Runtime(self.ctx, clock=lambda: self.now, opener=opener, data_dir=lambda: self.root)
@@ -209,6 +213,19 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(self.runtime.pre_llm_call(session_id='s'))
         self.ctx.settings['context_enabled'] = 'false'
         self.assertFalse(self.request('status')['ok'])
+
+    def test_hook_leaves_missing_and_empty_storage_untouched(self):
+        self.ctx.settings['default_project'] = 'p'
+        db = self.root / 'data.db'
+        for exists in (False, True):
+            with self.subTest(exists=exists):
+                if exists:
+                    db.touch()
+                before = sorted(self.root.iterdir())
+                self.assertIn('unavailable', self.runtime.pre_llm_call()['context'])
+                self.assertEqual(sorted(self.root.iterdir()), before)
+                if exists:
+                    self.assertEqual(db.read_bytes(), b'')
 
 
 if __name__ == '__main__':

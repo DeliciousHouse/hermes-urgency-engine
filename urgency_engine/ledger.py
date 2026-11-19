@@ -151,17 +151,17 @@ _HAS_EVIDENCE = '''EXISTS(SELECT 1 FROM evidence e WHERE e.board_id=c.board_id A
 class Ledger:
     """Own a dedicated connection until context exit; do not share it across threads."""
 
-    def __init__(self, connection, *, clock, artifact_root, busy_timeout_ms=5000):
+    def __init__(self, connection, *, clock, artifact_root, busy_timeout_ms=5000, read_only=False):
         _integer(busy_timeout_ms, 'busy_timeout_ms', 0, 5000)
         self.busy_timeout_ms = busy_timeout_ms
         self.connection, self.clock = connection, clock
         if connection.in_transaction:
             _invalid('connection')
         try:
-            self.artifact_root = Path(artifact_root).resolve(strict=True)
-            if not self.artifact_root.is_dir():
+            self.artifact_root = Path(artifact_root).resolve(strict=not read_only)
+            if not read_only and not self.artifact_root.is_dir():
                 _invalid('artifact_root')
-            self._initialize()
+            self._initialize(read_only)
         except (OSError, TypeError, ValueError):
             connection.close()
             raise LedgerError('INVALID_INPUT', 'initialize', 'artifact_root') from None
@@ -172,15 +172,17 @@ class Ledger:
             connection.close()
             raise
 
-    def _initialize(self):
+    def _initialize(self, read_only):
         connection = self.connection
         connection.row_factory = sqlite3.Row
         connection.execute(f'PRAGMA busy_timeout={self.busy_timeout_ms}')
         connection.execute('PRAGMA foreign_keys=ON')
-        with self._transaction('initialize', write=True):
+        with self._transaction('initialize', write=not read_only):
             version = connection.execute('PRAGMA user_version').fetchone()[0]
             objects = connection.execute("SELECT sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
             if version == 0 and not objects:
+                if read_only:
+                    raise LedgerError('NOT_FOUND', 'initialize', next_action='Initialize the ledger with hermes urgency apply.')
                 for statement in _SCHEMA:
                     connection.execute(statement)
                 connection.execute('PRAGMA user_version=1')
@@ -188,7 +190,7 @@ class Ledger:
                 raise LedgerError('UNSUPPORTED_SCHEMA', 'initialize')
             elif sorted(row[0] for row in objects) != sorted(_SCHEMA):
                 raise LedgerError('CORRUPT_STATE', 'initialize')
-            if connection.execute('PRAGMA quick_check').fetchone()[0] != 'ok' or connection.execute('PRAGMA foreign_key_check').fetchone():
+            if not read_only and (connection.execute('PRAGMA quick_check').fetchone()[0] != 'ok' or connection.execute('PRAGMA foreign_key_check').fetchone()):
                 raise LedgerError('CORRUPT_STATE', 'initialize')
 
     def __enter__(self):
@@ -690,6 +692,20 @@ class Ledger:
             return dict(project_id=project_id, baseline_weight=json.loads(baseline[0])['weight'] if baseline else None,
                         current_weight=weight, verified_weight=verified, percent=percent,
                         state='determinate' if weight else 'insufficient_evidence', last_verified_progress_at=last, revision=project['revision'])
+
+
+def open_readonly_ledger(path, *, clock, deadline):
+    """Open existing ledger bytes only; never run the host's journal setup."""
+    import time
+
+    if not path.is_file():
+        raise LedgerError('NOT_FOUND', 'open', next_action='Initialize the ledger with hermes urgency apply.')
+    try:
+        connection = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=.1)
+    except sqlite3.Error:
+        raise LedgerError('STORAGE_FAILURE', 'open') from None
+    connection.set_progress_handler(lambda: time.monotonic() >= deadline, 1000)
+    return Ledger(connection, clock=clock, artifact_root=path.parent / 'artifacts', busy_timeout_ms=100, read_only=True)
 
 
 def open_hermes_ledger(*, clock, artifact_root, busy_timeout_ms=5000):

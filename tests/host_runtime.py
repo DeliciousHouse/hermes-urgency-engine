@@ -20,6 +20,36 @@ PLUGIN = 'hermes-urgency-engine'
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def cli_reply(result):
+    if result.returncode == 0:
+        reply = json.loads(result.stdout)
+        assert reply.get('ok') is True, reply
+        return reply
+    # Hermes can log startup diagnostics before the plugin emits its error.
+    # Keep the whole stderr for failures and require the terminal JSON record.
+    assert not result.stdout, (result.stdout, result.stderr)
+    lines = result.stderr.strip().splitlines()
+    assert lines and not any(line.lstrip().startswith('{') for line in lines[:-1]), result.stderr
+    try:
+        reply = json.loads(lines[-1])
+    except ValueError as exc:
+        raise AssertionError(result.stderr) from exc
+    assert reply.get('ok') is False and isinstance(reply.get('error'), dict), result.stderr
+    return reply
+
+
+def hold_focus_lock(path):
+    with path.open('r+b') as lock:
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        print('held', flush=True)
+        time.sleep(2.5)  # Hold longer than the acceptance budget, but always exit.
+
+
 def probe():
     from hermes_cli.plugins import discover_plugins, get_plugin_command_handler, invoke_hook
     from hermes_cli.plugin_command_dispatch import invoke_plugin_command
@@ -56,18 +86,35 @@ def probe():
     assert 'Synthetic objective' not in context('a')
     assert slash('focus demo')['ok']
     from plugins.plugin_storage import plugin_data_dir
-    db = plugin_data_dir(PLUGIN) / 'data.db'
+    data_dir = plugin_data_dir(PLUGIN)
+    focus_lock, = data_dir.parent.glob('*/.state.json.lock')
+    with subprocess.Popen([sys.executable, __file__, '--hold-focus-lock', str(focus_lock)],
+                          stdout=subprocess.PIPE, text=True) as process:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == 'held'
+        started = time.monotonic()
+        focused = context('a')
+        focus_elapsed = time.monotonic() - started
+        assert process.poll() is None, 'focus writer lock released before the hook returned'
+    # gstack-timing-ok: independent process holds Hermes's real writer lock.
+    assert focus_elapsed < 1, focus_elapsed
+    assert 'Synthetic objective' in focused, focused
+    # In WAL, readers and an EXCLUSIVE writer coexist. Test a lock that
+    # actually excludes readers, on an isolated copy using rollback journaling.
+    db = data_dir / 'data.db'
     lock = sqlite3.connect(db)
-    lock.execute('BEGIN EXCLUSIVE')
-    started = time.monotonic()
-    result = context('a')
-    elapsed = time.monotonic() - started
-    lock.rollback()
-    lock.close()
+    try:
+        assert lock.execute('PRAGMA journal_mode=DELETE').fetchone()[0] == 'delete'
+        lock.execute('BEGIN EXCLUSIVE')
+        started = time.monotonic()
+        result = context('a')
+        elapsed = time.monotonic() - started
+    finally:
+        lock.close()
     # gstack-timing-ok: explicit acceptance budget under a real held SQLite write lock.
     assert elapsed < 1, elapsed
     assert 'unavailable' in result, result
-    print(json.dumps({'native_dispatch': 'passed', 'lock_seconds': elapsed}))
+    print(json.dumps({'native_dispatch': 'passed', 'lock_seconds': elapsed, 'focus_lock_seconds': focus_elapsed}))
 
 
 def journey(host, home, installed=False):
@@ -99,15 +146,13 @@ def journey(host, home, installed=False):
         assert 'apply' in run(args).stdout
     assert 'apply' in run(['urgency'], 2).stdout
     bad = run(['urgency', 'status', '--limit', 'PRIVATE_MARKER'], 2)
-    assert not bad.stdout
-    assert bad.stderr.lstrip().startswith('{'), bad.stderr
-    assert json.loads(bad.stderr)['error']['code'] == 'INVALID_INPUT'
+    assert cli_reply(bad)['error']['code'] == 'INVALID_INPUT'
     assert 'PRIVATE_MARKER' not in bad.stderr
     def apply(operation, data, code=0):
         payload = home / 'input.json'
         payload.write_text(json.dumps(data), encoding='utf-8')
         result = run(['urgency', 'apply', operation, '--json-file', str(payload)], code)
-        return json.loads(result.stdout if code == 0 else result.stderr)
+        return cli_reply(result)
     project = dict(project_id='demo', title='Synthetic objective', request_id='create')
     created = apply('create_project', project)
     assert created == apply('create_project', project)
@@ -126,7 +171,7 @@ def journey(host, home, installed=False):
     status = json.loads(run(['urgency', 'status', '--project', 'demo']).stdout)['data']['items'][0]
     assert status['progress']['percent'] == 0
     assert status['evidence_kind'] == 'artifact_byte_identity'
-    apply('upsert_task', {**task, 'remaining_seconds': 5, 'expected_revision': 1, 'request_id': 'stale'}, 1)
+    assert apply('upsert_task', {**task, 'remaining_seconds': 5, 'expected_revision': 1, 'request_id': 'stale'}, 1)['error']['code'] == 'REVISION_CONFLICT'
     artifact = home / 'plugin-data' / PLUGIN / 'artifacts' / 'proof.txt'
     artifact.write_bytes(b'synthetic proof\n')
     apply('verify_artifact', dict(board_id='board', task_id='task', criterion_id='proof', artifact_relative_path='proof.txt',
@@ -156,8 +201,11 @@ if __name__ == '__main__':
     parser.add_argument('--hermes-root', type=Path)
     parser.add_argument('--installed-home', type=Path)
     parser.add_argument('--probe', action='store_true')
+    parser.add_argument('--hold-focus-lock', type=Path)
     args = parser.parse_args()
-    if args.probe:
+    if args.hold_focus_lock:
+        hold_focus_lock(args.hold_focus_lock)
+    elif args.probe:
         probe()
     else:
         assert args.hermes_root and (args.hermes_root / 'hermes').is_file()

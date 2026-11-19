@@ -3,7 +3,7 @@ version: 0.1.0
 description: Local audited commitments, byte-identity progress and scoped pre-turn urgency guidance
 license: Apache-2.0
 homepage: https://github.com/DeliciousHouse/hermes-urgency-engine
-requires_hermes: ">=0.23.1"
+requires_hermes: ">=0.23.2"
 provides_tools:
   - urgency_query
 provides_hooks:
