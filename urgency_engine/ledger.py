@@ -91,7 +91,18 @@ def _command(method, *, prepare=False) -> Any:
                     replay = self._replay(payload['request_id'], digest)
                     if replay is not None:
                         return replay
-                prepared = method(self, *args, **kwargs)
+                try:
+                    prepared = method(self, *args, **kwargs)
+                except LedgerError as exc:
+                    if exc.code not in ('REVISION_CONFLICT', 'NOT_FOUND', 'INVALID_INPUT', 'EVIDENCE_MISMATCH'):
+                        raise
+                    # A competing request may have committed after the first lookup,
+                    # before preparation could reach the replay check under the write lock.
+                    with self._transaction(operation):
+                        replay = self._replay(payload['request_id'], digest)
+                        if replay is not None:
+                            return replay
+                    raise
             with self._transaction(operation, write=True):
                 replay = self._replay(payload['request_id'], digest)
                 if replay is not None:

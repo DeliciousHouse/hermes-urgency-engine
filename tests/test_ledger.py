@@ -304,6 +304,44 @@ class LedgerTests(unittest.TestCase):
                     self.assertEqual(ledger.get_task('b', 't')['revision'], 3)
                     self.assertEqual(len(ledger.history('task', '["b","t"]')), 3)
 
+    def test_inflight_verification_replays_after_initial_lookup_misses(self):
+        """Use two real connections; commit the winner before the retry captures the task."""
+        from contextlib import contextmanager
+        from urgency_engine.ledger import LedgerError
+
+        for actor in ('verifier', 'other-verifier'):
+            with self.subTest(actor=actor):
+                self.db = self.root / (actor + '.db')
+                self.prepare_task()
+                args = ('b', 't', 'c', 'artifact')
+                kwargs = dict(expected_revision=2, request_id='verify', reason='Check')
+                with self.open() as retry, self.open() as winner:
+                    transaction = retry._transaction
+                    accepted = []
+
+                    @contextmanager
+                    def interleave(*tx_args, **tx_kwargs):
+                        with transaction(*tx_args, **tx_kwargs):
+                            yield
+                        if not accepted:
+                            accepted.append(winner.verify_artifact(*args, **kwargs, actor='verifier'))
+                            (self.root / 'artifact').unlink()
+
+                    with patch.object(retry, '_transaction', interleave):
+                        if actor == 'verifier':
+                            result = retry.verify_artifact(*args, **kwargs, actor=actor)
+                            self.assertEqual(result, accepted[0])
+                        else:
+                            with self.assertRaises(LedgerError) as caught:
+                                retry.verify_artifact(*args, **kwargs, actor=actor)
+                            self.assertEqual(caught.exception.code, 'IDEMPOTENCY_CONFLICT')
+                            self.assertEqual(caught.exception.side_effects, 'none')
+                    self.assertEqual(retry.get_task('b', 't')['revision'], 3)
+                    self.assertEqual(retry.get_project('p')['revision'], 4)
+                    for table in ('evidence', 'audit', 'operations'):
+                        self.assertEqual(retry.connection.execute(f'SELECT count(*) FROM {table}').fetchone()[0],
+                                         1 if table == 'evidence' else 4)
+
     def test_process_hash_compare_and_set_has_no_write_lock(self):
         """protects=evidence revision; fails_when=hash blocks or stale credits;
         why_new=split transaction; seam=post-hash gate; no_claim=file immutability.
