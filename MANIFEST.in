@@ -1,2 +1,6 @@
 include docs/forecast.md
 include docs/ledger.md
+include docs/runtime.md
+include plugin.yaml
+include __init__.py
+include tests/host_runtime.py

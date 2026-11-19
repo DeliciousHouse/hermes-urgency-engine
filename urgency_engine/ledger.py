@@ -151,7 +151,9 @@ _HAS_EVIDENCE = '''EXISTS(SELECT 1 FROM evidence e WHERE e.board_id=c.board_id A
 class Ledger:
     """Own a dedicated connection until context exit; do not share it across threads."""
 
-    def __init__(self, connection, *, clock, artifact_root):
+    def __init__(self, connection, *, clock, artifact_root, busy_timeout_ms=5000):
+        _integer(busy_timeout_ms, 'busy_timeout_ms', 0, 5000)
+        self.busy_timeout_ms = busy_timeout_ms
         self.connection, self.clock = connection, clock
         if connection.in_transaction:
             _invalid('connection')
@@ -173,7 +175,7 @@ class Ledger:
     def _initialize(self):
         connection = self.connection
         connection.row_factory = sqlite3.Row
-        connection.execute('PRAGMA busy_timeout=5000')
+        connection.execute(f'PRAGMA busy_timeout={self.busy_timeout_ms}')
         connection.execute('PRAGMA foreign_keys=ON')
         with self._transaction('initialize', write=True):
             version = connection.execute('PRAGMA user_version').fetchone()[0]
@@ -250,6 +252,33 @@ class Ledger:
         with self._transaction('list_projects'):
             return [dict(row) for row in self.connection.execute(
                 'SELECT * FROM projects WHERE project_id>? ORDER BY project_id LIMIT ?', (after or '', limit))]
+
+    def list_tasks(self, project_id, limit=100, after=None):
+        """Page task keys in project scope; fetch details with get_task."""
+        _id(project_id, 'project_id')
+        _integer(limit, 'limit', 1, 500)
+        if after is not None:
+            if not isinstance(after, (list, tuple)) or len(after) != 2:
+                _invalid('after')
+            for value in after:
+                _id(value, 'after')
+        with self._transaction('list_tasks'):
+            self._project(project_id)
+            return [dict(row) for row in self.connection.execute(
+                'SELECT board_id,task_id FROM tasks WHERE project_id=? AND (board_id,task_id)>(?,?) ORDER BY board_id,task_id LIMIT ?',
+                (project_id, *(after or ('', '')), limit))]
+
+    def list_deadlines(self, project_id, limit=100, after=None):
+        """Page commitments without evaluating or persisting forecasts."""
+        _id(project_id, 'project_id')
+        _integer(limit, 'limit', 1, 500)
+        if after is not None:
+            _id(after, 'after')
+        with self._transaction('list_deadlines'):
+            self._project(project_id)
+            return [dict(row) for row in self.connection.execute(
+                'SELECT * FROM deadlines WHERE project_id=? AND deadline_id>? ORDER BY deadline_id LIMIT ?',
+                (project_id, after or '', limit))]
 
     def history(self, entity_type, entity_id, limit=100, after=None):
         _id(entity_type, 'entity_type')
@@ -663,7 +692,7 @@ class Ledger:
                         state='determinate' if weight else 'insufficient_evidence', last_verified_progress_at=last, revision=project['revision'])
 
 
-def open_hermes_ledger(*, clock, artifact_root):
+def open_hermes_ledger(*, clock, artifact_root, busy_timeout_ms=5000):
     """Open documented, profile-aware plugin storage; caller uses a with block."""
     try:
         from plugins.plugin_storage import plugin_db
@@ -674,7 +703,7 @@ def open_hermes_ledger(*, clock, artifact_root):
     except (OSError, sqlite3.Error):
         raise LedgerError('STORAGE_FAILURE', 'open_hermes_ledger', side_effects='unknown') from None
     try:
-        return Ledger(connection, clock=clock, artifact_root=artifact_root)
+        return Ledger(connection, clock=clock, artifact_root=artifact_root, busy_timeout_ms=busy_timeout_ms)
     except BaseException:
         connection.close()
         raise

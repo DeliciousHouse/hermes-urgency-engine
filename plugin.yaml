@@ -1,0 +1,33 @@
+name: hermes-urgency-engine
+version: 0.1.0
+description: Local audited commitments, byte-identity progress and scoped pre-turn urgency guidance
+license: Apache-2.0
+homepage: https://github.com/DeliciousHouse/hermes-urgency-engine
+requires_hermes: ">=0.23.1"
+provides_tools:
+  - urgency_query
+provides_hooks:
+  - pre_llm_call
+  - on_session_end
+  - on_session_reset
+config_schema:
+  context_enabled:
+    type: bool
+    default: true
+    description: Include advisory urgency guidance before model turns
+  context_max_chars:
+    type: int
+    default: 4000
+    description: Maximum guidance characters (512 to 8000)
+  default_project:
+    type: str
+    default: ""
+    description: Explicit project fallback in this profile; empty disables fallback
+  artifact_root:
+    type: str
+    default: ""
+    description: Existing absolute directory for local byte checks; empty uses plugin-data artifacts
+  diagnostic_log_bytes:
+    type: int
+    default: 1048576
+    description: Local redacted diagnostic rotation size (65536 to 4194304 bytes)
