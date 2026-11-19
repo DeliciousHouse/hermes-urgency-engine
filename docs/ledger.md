@@ -1,6 +1,6 @@
 # Durable deadline and progress ledger
 
-Keep original commitments, revised targets and verified progress in one local SQLite database. This is a Python library, **not an installable Hermes plugin**: it provides no runtime hooks, scheduler, Kanban synchronization, CLI, Desktop page or release integration.
+Keep original commitments, revised targets and verified progress in one local SQLite database. This page describes the Python library; the [native plugin adapter](runtime.md) supplies CLI, slash/tool queries and advisory runtime hooks. Neither supplies a scheduler, Kanban synchronization, Desktop page or release integration.
 
 - [Reference](#reference)
 - [Why commitments and evidence are separate](#why-commitments-and-evidence-are-separate)
@@ -17,8 +17,8 @@ Import `Ledger`, `LedgerError` and `open_hermes_ledger` from `urgency_engine`. P
 ### Connections and ownership
 
 ```text
-Ledger(connection, *, clock, artifact_root)
-open_hermes_ledger(*, clock, artifact_root)
+Ledger(connection, *, clock, artifact_root, busy_timeout_ms=5000)
+open_hermes_ledger(*, clock, artifact_root, busy_timeout_ms=5000)
 ```
 
 Both return a context manager. `connection` is a dedicated `sqlite3.Connection`, with no active transaction. The ledger closes it on context exit or initialization failure; a connection rejected for an existing transaction remains the caller's responsibility. Never share a ledger between threads or nest its operations inside an external transaction. Returned records are independent, JSON-compatible dictionaries/lists, not live ORM objects.
@@ -27,12 +27,16 @@ Both return a context manager. `connection` is a dedicated `sqlite3.Connection`,
 
 `open_hermes_ledger` lazily calls the documented `plugins.plugin_storage.plugin_db('hermes-urgency-engine')` on **every open**, following the active Hermes profile without caching a connection. This is the sole production opener. Offline callers inject their own temporary connection. No Hermes modules are needed merely to import the library. See the [Hermes plugin documentation](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/).
 
+`busy_timeout_ms` is an integer from 0 to 5000 (not bool). The default retains the library wait budget; the native hook uses 100 ms to fail open promptly under a held write lock.
+
 ### Reads
 
 ```text
 get_project(project_id)
 get_task(board_id, task_id)
 list_projects(limit=100, after=None)
+list_tasks(project_id, limit=100, after=None)
+list_deadlines(project_id, limit=100, after=None)
 history(entity_type, entity_id, limit=100, after=None)
 progress(project_id)
 explain_deadline(deadline_id)
@@ -43,6 +47,8 @@ All reads use a consistent transaction and write nothing.
 - `get_project`: project columns from the schema below.
 - `get_task`: task columns plus `criteria`, the active criterion records ordered by ID.
 - `list_projects`: projects ordered by ID, strictly after the optional ID cursor. Limit is 1–500. Continue with the last `project_id`; an empty page ends enumeration. No omission/duplication is promised across concurrent changes; use a stable database/backup for a stable enumeration.
+- `list_tasks`: scoped task key dictionaries (`board_id`, `task_id`), ordered by that pair. The cursor is the last pair as a two-item list/tuple. Use `get_task` for details.
+- `list_deadlines`: scoped deadline records ordered by ID; the cursor is the last `deadline_id`. Both scoped lists require an existing project, accept limits 1–500, and have the same concurrent-enumeration limits as `list_projects`.
 - `history`: audit rows ordered by `sequence`, strictly after the optional integer cursor. Limit is 1–500. `entity_type` is `project`, `task`, `milestone` or `deadline`; task entity IDs are compact JSON arrays such as `["demo-board","demo-task"]`. Other entity IDs are their plain IDs. `before_json` and `after_json` are JSON strings. History includes successful commands only.
 - `progress`: `{project_id, baseline_weight, current_weight, verified_weight, percent, state, last_verified_progress_at, revision}`. No baseline yields `baseline_weight=null`. No active criteria yields `percent=null`, `state='insufficient_evidence'`; otherwise state is `determinate`. Progress is the weighted fraction of active criterion revisions with accepted, uninvalidated matching evidence. A missing required criterion prevents 100%, even if floating-point rounding would conceal its weight. `last_verified_progress_at` is historical: reopening invalidates credit without erasing the last accepted-evidence time.
 - `explain_deadline`: deadline columns plus `forecast`, `forecast_at`, nullable `actual_verified_at`, `baseline_variance_seconds`, `target_variance_seconds`, `input`, and `input_revisions`. Variance is actual verified completion minus the respective date when all scoped tasks have verified completion; otherwise it is projected completion minus that date. Positive means late. `forecast_at` is clock + summed stored work/buffers, not an empirical percentile. Work/buffers include every scoped task exactly once; callers update estimates explicitly. An empty scope has no actual completion. `input_revisions` records deadline/project revisions and `[board_id,task_id,revision]` tuples; `input` records aggregate seconds and evaluation time.
@@ -139,7 +145,7 @@ Every successful mutation --> audit + operations (same transaction)
 | `operations` | `request_id` PK; payload_sha256, response_json |
 | `audit` | `sequence` PK; request_id, entity_type, entity_id, action, actor, reason, occurred_at, before_json, after_json |
 
-Initialization uses `PRAGMA user_version=1`, foreign keys and atomic `BEGIN IMMEDIATE`; mutation also uses `BEGIN IMMEDIATE` with a 5000 ms busy timeout and rollback on failure. Reads use `BEGIN`. A nonempty unknown database, future version, incomplete layout or failed integrity check is refused without repair/deletion. One active criterion per ID, one accepted evidence record per criterion revision, and one baseline per project are enforced by unique indexes. Internal bounded snapshots contain summaries, up to 100 criteria for scope changes, or at most 10,000 task revision tuples for forecasts. Retained audit JSON records and historical criteria allow reconstruction; do not delete history independently.
+Initialization uses `PRAGMA user_version=1`, foreign keys and atomic `BEGIN IMMEDIATE`; mutation also uses `BEGIN IMMEDIATE` with a configurable busy timeout (5000 ms by default) and rollback on failure. Reads use `BEGIN`. A nonempty unknown database, future version, incomplete layout or failed integrity check is refused without repair/deletion. One active criterion per ID, one accepted evidence record per criterion revision, and one baseline per project are enforced by unique indexes. Internal bounded snapshots contain summaries, up to 100 criteria for scope changes, or at most 10,000 task revision tuples for forecasts. Retained audit JSON records and historical criteria allow reconstruction; do not delete history independently.
 
 ### Errors
 
@@ -299,4 +305,4 @@ Separately, in a Python environment with the documented Hermes plugin storage in
 python -c "import sys, unittest; sys.path.insert(0, 'tests'); result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromName('test_ledger.LedgerTests.check_documented_plugin_storage_isolates_homes')); raise SystemExit(not (result.wasSuccessful() and not result.skipped))"
 ```
 
-This switches only temporary `HERMES_HOME` directories, checks that the real documented storage API selects each home, and verifies closure and isolation. It is explicitly separate from offline discovery; an unavailable Hermes dependency is reported, not counted as integration success. Official plugin doctor/validate and live Desktop/gateway acceptance are **not applicable to this library slice** and remain necessary before a complete plugin release.
+This switches only temporary `HERMES_HOME` directories, checks that the real documented storage API selects each home, and verifies closure and isolation. It is explicitly separate from offline discovery; an unavailable Hermes dependency is reported, not counted as integration success. For plugin doctor/validate and native dispatch checks, use the [runtime testing guide](runtime.md#contributor-verification). Live Desktop/gateway acceptance remains separate and necessary before a complete plugin release.

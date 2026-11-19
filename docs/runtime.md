@@ -273,7 +273,7 @@ apply('verify_artifact', board_id='board', task_id='task', criterion_id='proof',
       artifact_relative_path='proof.txt', expected_revision=task['revision'],
       reason='Compare bytes', request_id='demo-verify')
 assert command('status', '--project', 'demo')['items'][0]['progress']['percent'] == 100
-command('history', 'task', 'board/task')
+command('history', 'task', '["board","task"]')
 ```
 
 ### What you built

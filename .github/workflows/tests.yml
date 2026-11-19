@@ -40,10 +40,6 @@ jobs:
     name: Native plugin (stock Hermes)
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    env:
-      HERMES_HOME: ${{ runner.temp }}/urgency-home
-      HERMES_RUNTIME_DIR: ${{ runner.temp }}/urgency-runtime
-      URGENCY_TEST_RUNTIME: ${{ runner.temp }}/urgency-runtime
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -63,6 +59,10 @@ jobs:
           python -m pip install uv==0.13.5
           uv sync --project .host --locked --no-dev
       - name: Validate source-only plugin and exercise native dispatch
+        env:
+          HERMES_HOME: ${{ runner.temp }}/urgency-home
+          HERMES_RUNTIME_DIR: ${{ runner.temp }}/urgency-runtime
+          URGENCY_TEST_RUNTIME: ${{ runner.temp }}/urgency-runtime
         run: |
           mkdir -p "$RUNNER_TEMP/plugin"
           git archive HEAD | tar -x -C "$RUNNER_TEMP/plugin"

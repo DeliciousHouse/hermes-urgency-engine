@@ -75,7 +75,9 @@ def journey(host, home, installed=False):
     for key in list(env):
         if key.startswith(('HERMES_', 'GIT_')) or key in ('VIRTUAL_ENV', 'PYTHONPATH'):
             env.pop(key)
-    env.update(HERMES_HOME=str(home), PYTHONPATH=str(host), PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
+    # The supplied interpreter is provisioned; tests must not update the host checkout.
+    env.update(HERMES_HOME=str(home), PYTHONPATH=str(host), PYTHONUTF8='1', PYTHONIOENCODING='utf-8',
+               HERMES_DISABLE_LAZY_INSTALLS='1')
     # Retain only an explicitly supplied disposable package-manager store.
     if os.environ.get('URGENCY_TEST_RUNTIME'):
         env['HERMES_RUNTIME_DIR'] = os.environ['URGENCY_TEST_RUNTIME']
