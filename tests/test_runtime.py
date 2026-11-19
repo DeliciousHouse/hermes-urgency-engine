@@ -74,6 +74,29 @@ class RuntimeTests(unittest.TestCase):
             self.assertFalse(self.request('create_project', project_id='x', title='x', request_id='x', **{key: 'x'})['ok'])
         self.assertEqual(len(self.request('status')['data']['items']), 1)
 
+    def test_reads_do_not_initialize_missing_or_empty_ledger(self):
+        db = self.root / 'data.db'
+        for exists in (False, True):
+            with self.subTest(exists=exists):
+                if exists:
+                    db.touch()
+                before = sorted(self.root.iterdir())
+                empty = dict(ok=True, data=dict(items=[], has_more=False, next=None))
+                self.assertEqual(self.request('status'), empty)
+                self.assertEqual(self.request('history', entity_type='project', entity_id='p'), empty)
+                self.assertEqual(self.request('status', project_id='p')['error']['field'], 'project_id')
+                self.assertEqual(self.request('task', board_id='b', task_id='t')['error']['code'], 'NOT_FOUND')
+                self.assertEqual(self.request('explain', deadline_id='d')['error']['code'], 'NOT_FOUND')
+                self.assertEqual(self.request('diagnose')['data']['storage'], 'uninitialized')
+                self.assertEqual(sorted(self.root.iterdir()), before)
+                if exists:
+                    self.assertEqual(db.read_bytes(), b'')
+        self.assertTrue(self.project()['ok'])
+        self.assertEqual(self.request('diagnose')['data']['storage'], 'available')
+        db.write_bytes(b'not a database')
+        self.assertEqual(self.request('status')['error']['code'], 'CORRUPT_STATE')
+        self.assertEqual(db.read_bytes(), b'not a database')
+
     def test_pagination_and_claim_has_no_credit(self):
         """protects=honest projections; fails_when=claim earns credit; seam=temp storage."""
         self.project()
@@ -161,13 +184,13 @@ class RuntimeTests(unittest.TestCase):
         def fail(**kwargs):
             raise RuntimeError('SYNTHETIC_SECRET private/path')
         self.runtime.opener = fail
-        result = self.request('status')
+        result = self.project()
         self.assertEqual(result['error']['code'], 'INTERNAL_ERROR')
         self.assertEqual(result['error']['side_effects'], 'unknown')
         log = self.root / 'diagnostics.log'
         self.assertNotIn('SYNTHETIC_SECRET', log.read_text())
         log.write_text('x' * 65536)
-        self.request('status')
+        self.project()
         self.assertTrue(log.with_suffix('.log.1').exists())
         self.assertLess(log.stat().st_size, 65536)
         self.assertIn('unavailable', self.runtime.pre_llm_call()['context'])

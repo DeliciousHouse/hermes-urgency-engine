@@ -66,6 +66,24 @@ def probe():
     assert handler is not None
     def slash(text, session='a'):
         return json.loads(invoke_plugin_command(handler, text, session_id=session, source='cli'))
+    def tool(operation, **arguments):
+        return json.loads(registry.dispatch('urgency_query', {'operation': operation, 'arguments': arguments}))
+    data_dir = Path(os.environ['HERMES_HOME']) / 'plugin-data' / PLUGIN
+    if os.environ.get('URGENCY_EXPECT_EMPTY') == '1':
+        empty = dict(ok=True, data=dict(items=[], has_more=False, next=None))
+        for name, status in [('tool', lambda: tool('status')), ('slash', lambda: slash('status'))]:
+            assert status() == empty, name
+            assert not data_dir.exists(), f'{name} status created persistent storage'
+        print('native tool and slash status leave empty home uninitialized')
+        return
+    db = data_dir / 'data.db'
+    before = db.read_bytes(), db.stat().st_mtime_ns
+    for status in (lambda: tool('status', project_id='demo'), lambda: slash('status --project demo')):
+        read = status()
+        assert read['ok'], read
+        item, = read['data']['items']
+        assert item['title'] == 'Synthetic objective' and item['progress']['percent'] == 100, read
+        assert before == (db.read_bytes(), db.stat().st_mtime_ns), 'native status wrote to the ledger'
     assert slash('focus demo')['ok']
     assert slash('focus demo', None)['error']['code'] == 'SESSION_REQUIRED'
     def context(session):
@@ -76,9 +94,7 @@ def probe():
     assert 'Synthetic objective' not in context('b')
     assert 'artifact_byte_identity' in context('a')
     assert not slash('apply create_project')['ok']
-    read = json.loads(registry.dispatch('urgency_query', {'operation': 'status', 'arguments': {'project_id': 'demo'}}))
-    assert read['ok'], read
-    denied = json.loads(registry.dispatch('urgency_query', {'operation': 'create_project', 'arguments': {}}))
+    denied = tool('create_project')
     assert denied['error']['code'] == 'READ_ONLY', denied
     invoke_hook('on_session_reset', old_session_id='a', session_id='new')
     assert 'Synthetic objective' not in context('a')
@@ -158,7 +174,10 @@ def journey(host, home, installed=False, tutorial=False):
             code, = re.findall(r'^```python\n(.*?)^```', docs, re.M | re.S)
             (demo / 'project.json').write_text(payload, encoding='utf-8')
             extra = {'HERMES_HOME': str(demo)}
-            for args in (['diagnose'], ['apply', 'create_project', '--json-file', 'project.json'], ['status', '--project', 'demo']):
+            diagnosis = cli_reply(run(['urgency', 'diagnose'], cwd=demo, extra=extra))['data']
+            assert diagnosis['storage'] == 'uninitialized' and diagnosis['schema'] == 0, diagnosis
+            assert not (demo / 'plugin-data' / PLUGIN).exists()
+            for args in (['apply', 'create_project', '--json-file', 'project.json'], ['status', '--project', 'demo']):
                 cli_reply(run(['urgency', *args], cwd=demo, extra=extra))
             # Keep the canonical tutorial unchanged apart from its executable prefix.
             assert "['hermes', 'urgency'" in code
@@ -171,6 +190,7 @@ def journey(host, home, installed=False, tutorial=False):
     bad = run(['urgency', 'status', '--limit', 'PRIVATE_MARKER'], 2)
     assert cli_reply(bad)['error']['code'] == 'INVALID_INPUT'
     assert 'PRIVATE_MARKER' not in bad.stderr
+    print(run([], probe_mode=True, extra={'URGENCY_EXPECT_EMPTY': '1'}).stdout.strip())
     def apply(operation, data, code=0):
         payload = home / 'input.json'
         payload.write_text(json.dumps(data), encoding='utf-8')

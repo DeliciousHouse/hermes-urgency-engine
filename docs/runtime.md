@@ -45,12 +45,16 @@ Hermes skips CLI registrations in its separate plugin-host process mode.
 | `task` | `BOARD TASK` |
 | `explain` | `DEADLINE` |
 | `history` | `TYPE ID`, optional `--limit N` (1–500), `--after N` sequence |
-| `diagnose` | None; opens/checks storage, does not repair it |
+| `diagnose` | None; checks existing storage without initializing or repairing it |
 
 Tool argument names are `project_id`, `board_id`, `task_id`, `deadline_id`,
 `entity_type`, `entity_id`, `limit` and `after`, as applicable. `after` is a string
 for project pages and an integer for history. Unknown fields and operations fail.
 Status and history return `items`, `has_more` and `next`; pass `next` as `after`.
+Before the ledger is initialized, status without a project filter and history
+return empty pages; scoped status, task and explain return `NOT_FOUND`.
+`diagnose` reports `storage: uninitialized` and `schema: 0`. Use
+`hermes urgency apply` to start recording data.
 `/urgency` uses shell-like quoting, never shell execution. `focus clear` reserves
 `clear`; use `default_project` for a project with that ID.
 
@@ -109,7 +113,7 @@ Hermes profile's config. They are read each operation, not cached at registratio
 | `artifact_root` | string, empty | Existing absolute directory; empty uses plugin-owned `artifacts/` |
 | `diagnostic_log_bytes` | int, `1048576` | 65536–4194304; current log plus one rotated backup |
 
-The default artifact directory is created under
+Operator writes create the default artifact directory under
 `<active Hermes home>/plugin-data/hermes-urgency-engine/artifacts/`. Configured
 artifact directories are never created automatically. Artifact paths in requests
 are relative; the ledger rejects escapes and symlinks. SQLite `data.db`, focus
@@ -131,9 +135,10 @@ the hook returns no context.
 
 All transports reuse the existing ledger; storage opens in the host's active
 profile per operation rather than sharing a process-global SQLite connection.
-The pre-turn hook opens only an existing ledger in SQLite read-only mode. It
-does not initialize the schema, create the artifact directory, or run journal
-setup. SQLite can still maintain WAL coordination files. The hook never snapshots
+Queries and the pre-turn hook open existing ledger data in SQLite read-only
+mode. They do not initialize the schema, create the artifact directory, or run
+journal setup. SQLite can still maintain WAL coordination files for an existing
+WAL ledger. The hook never snapshots
 forecasts, moves targets, changes criteria or grants credit.
 
 The hook labels objective/task text as untrusted data. It includes up to five
@@ -143,9 +148,9 @@ blocker information stays unknown. Long guidance is explicitly truncated. The
 hook reads one size-limited snapshot of the atomically replaced focus file
 without taking the writer lock. It applies a 750 ms cooperative work budget and
 a 100 ms SQLite busy timeout. Large projects can return an unavailable message
-rather than stale or partially ranked guidance. Ordinary commands still use the
-host's storage opener and retain its safe journaling policy. `diagnose` runs
-the full integrity checks; the hook checks the schema without a full scan.
+rather than stale or partially ranked guidance. Operator mutations still use
+the host's storage opener and retain its safe journaling policy. Ordinary
+queries run the integrity checks; the hook checks the schema without a full scan.
 
 These bounds trade detail for low latency. They are not a hard OS execution
 budget: filesystem or hardware failures can still delay a call. Redaction runs
@@ -193,9 +198,9 @@ Troubleshooting:
 - `IDEMPOTENCY_CONFLICT`: compare history; do not repurpose the original ID.
 - `INVALID_CONFIG`: use an existing absolute artifact directory or the empty default;
   use the documented setting types/ranges.
-- `INTERNAL_ERROR`: record `diagnostic_id`, inspect local `diagnostics.log`, and
-  reconcile history before retrying. Side effects may be unknown. Logs contain
-  redacted frame names/line numbers, not input values or exception messages.
+- `INTERNAL_ERROR`: record `diagnostic_id`. For operator writes, inspect local
+  `diagnostics.log` if present and reconcile history before retrying. Logs
+  contain redacted frame names/line numbers, not input values or exception messages.
 - Guidance unavailable: check `diagnose`, configuration and storage contention.
   A missing or corrupt ledger is not evidence of healthy progress.
 - CLI missing in plugin-host isolation mode: use the documented in-process CLI
@@ -210,7 +215,8 @@ Hermes environment and ensure its `hermes` command is on PATH.
 
 ### 1. Confirm the installed commands
 
-Run `hermes urgency diagnose`, then save this JSON as `project.json`:
+Run `hermes urgency diagnose`; on a fresh home it reports `uninitialized`
+without creating the ledger. Save this JSON as `project.json`:
 
 ```json
 {"project_id":"demo","title":"Synthetic objective","request_id":"demo-create"}

@@ -7,12 +7,13 @@ import hashlib
 import json
 from pathlib import Path
 import shlex
+import sqlite3
 import sys
 import time
 import traceback
 import uuid
 
-from .ledger import LedgerError, open_hermes_ledger, open_readonly_ledger
+from .ledger import Ledger, LedgerError, open_hermes_ledger, open_readonly_ledger
 
 PLUGIN_ID = 'hermes-urgency-engine'
 MAX_INPUT_BYTES = 256 * 1024
@@ -223,8 +224,23 @@ class Runtime:
             if 'expected_revision' in arguments and (type(arguments['expected_revision']) is not int or arguments['expected_revision'] < 0):
                 invalid('expected_revision')
             settings = self.settings()
-            storage = (open_readonly_ledger(self.data_dir() / 'data.db', clock=self.clock, deadline=time.monotonic() + .75)
-                       if surface == 'hook' else self.open(settings))
+            if operation in MUTATIONS:
+                storage = self.open(settings)
+            else:
+                try:
+                    storage = open_readonly_ledger(self.data_dir() / 'data.db', clock=self.clock,
+                                                   deadline=time.monotonic() + .75 if surface == 'hook' else None,
+                                                   busy_timeout_ms=100 if surface == 'hook' else 5000,
+                                                   check_integrity=surface != 'hook')
+                except LedgerError as exc:
+                    if exc.code != 'NOT_FOUND' or surface == 'hook':
+                        raise
+                    if operation == 'diagnose':
+                        return {'ok': True, 'data': dict(storage='uninitialized', schema=0,
+                                context_enabled=settings['context_enabled'], **EVIDENCE)}
+                    # Preserve empty lists, field validation and entity errors without creating files.
+                    storage = Ledger(sqlite3.connect(':memory:'), clock=self.clock,
+                                     artifact_root=Path(__file__).resolve().parent)
             with storage as ledger:
                 if operation in MUTATIONS:
                     data = self.mutate(ledger, operation, arguments)
@@ -258,7 +274,7 @@ class Runtime:
         except (TypeError, ValueError, UnicodeError, RecursionError):
             return self.error(LedgerError('INVALID_INPUT', safe_operation, 'arguments'), safe_operation)
         except Exception:
-            return self.unexpected(safe_operation, diagnostic=surface == 'cli')
+            return self.unexpected(safe_operation, diagnostic=surface == 'cli' and safe_operation in MUTATIONS)
 
     @staticmethod
     def mutate(ledger, operation, arguments):
