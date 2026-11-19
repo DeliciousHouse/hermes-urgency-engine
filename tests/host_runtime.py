@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -117,7 +118,7 @@ def probe():
     print(json.dumps({'native_dispatch': 'passed', 'lock_seconds': elapsed, 'focus_lock_seconds': focus_elapsed}))
 
 
-def journey(host, home, installed=False):
+def journey(host, home, installed=False, tutorial=False):
     env = dict(os.environ)
     for key in list(env):
         if key.startswith(('HERMES_', 'GIT_')) or key in ('VIRTUAL_ENV', 'PYTHONPATH'):
@@ -128,9 +129,11 @@ def journey(host, home, installed=False):
     # Retain only an explicitly supplied disposable package-manager store.
     if os.environ.get('URGENCY_TEST_RUNTIME'):
         env['HERMES_RUNTIME_DIR'] = os.environ['URGENCY_TEST_RUNTIME']
-    def run(args, code=0, probe_mode=False, extra=None):
-        command = [sys.executable, str(Path(__file__).resolve()), '--probe'] if probe_mode else [sys.executable, str(host / 'hermes'), *args]
-        result = subprocess.run(command, env={**env, **(extra or {})}, cwd=home,
+    cli = [sys.executable, str(host / 'hermes')]
+
+    def run(args, code=0, probe_mode=False, extra=None, cwd=home, command=None):
+        command = command or ([sys.executable, str(Path(__file__).resolve()), '--probe'] if probe_mode else [*cli, *args])
+        result = subprocess.run(command, env={**env, **(extra or {})}, cwd=cwd,
                                 capture_output=True, text=True, timeout=600)
         assert result.returncode == code, (args, result.returncode, result.stdout, result.stderr)
         return result
@@ -142,6 +145,26 @@ def journey(host, home, installed=False):
         shutil.copytree(ROOT / 'urgency_engine', target / 'urgency_engine', ignore=shutil.ignore_patterns('__pycache__'))
         # Synthetic test config only; installed-public mode uses installer-produced config.
         (home / 'config.yaml').write_text('plugins:\n  enabled:\n    - hermes-urgency-engine\n', encoding='utf-8')
+    if tutorial:
+        assert installed
+        # The tutorial and lifecycle both use demo IDs. Fork the clean native
+        # installation and installer-produced config before either writes data.
+        with tempfile.TemporaryDirectory(prefix='urgency-tutorial-') as directory:
+            demo = Path(directory)
+            shutil.copytree(home / 'plugins', demo / 'plugins')
+            shutil.copy2(home / 'config.yaml', demo / 'config.yaml')
+            docs = (ROOT / 'docs/runtime.md').read_text(encoding='utf-8')
+            payload, = re.findall(r'^```json\n(.*?)^```', docs, re.M | re.S)
+            code, = re.findall(r'^```python\n(.*?)^```', docs, re.M | re.S)
+            (demo / 'project.json').write_text(payload, encoding='utf-8')
+            extra = {'HERMES_HOME': str(demo)}
+            for args in (['diagnose'], ['apply', 'create_project', '--json-file', 'project.json'], ['status', '--project', 'demo']):
+                cli_reply(run(['urgency', *args], cwd=demo, extra=extra))
+            # Keep the canonical tutorial unchanged apart from its executable prefix.
+            assert "['hermes', 'urgency'" in code
+            code = code.replace("['hermes', 'urgency'", f"[{cli[0]!r}, {cli[1]!r}, 'urgency'")
+            run([], cwd=demo, extra=extra, command=[sys.executable, '-c', code])
+        print('canonical tutorial on exact public installation: passed', flush=True)
     for args in (['urgency', '--help'], ['urgency', 'apply', '--help']):
         assert 'apply' in run(args).stdout
     assert 'apply' in run(['urgency'], 2).stdout
@@ -200,6 +223,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--hermes-root', type=Path)
     parser.add_argument('--installed-home', type=Path)
+    parser.add_argument('--tutorial', action='store_true', help='Exercise the canonical tutorial using the installed configuration')
     parser.add_argument('--probe', action='store_true')
     parser.add_argument('--hold-focus-lock', type=Path)
     args = parser.parse_args()
@@ -210,7 +234,9 @@ if __name__ == '__main__':
     else:
         assert args.hermes_root and (args.hermes_root / 'hermes').is_file()
         if args.installed_home:
-            journey(args.hermes_root.resolve(), args.installed_home.resolve(), installed=True)
+            journey(args.hermes_root.resolve(), args.installed_home.resolve(), installed=True, tutorial=args.tutorial)
         else:
+            if args.tutorial:
+                parser.error('--tutorial requires --installed-home')
             with tempfile.TemporaryDirectory(prefix='urgency-host-') as directory:
                 journey(args.hermes_root.resolve(), Path(directory))

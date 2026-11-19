@@ -304,4 +304,7 @@ It creates disposable homes, copies the source plugin, and exercises native CLI,
 slash/tool/hook dispatch, profile separation and disable/re-enable. For testing an
 exact public installation, pass `--installed-home /path/to/disposable-home` after
 installing there. That home must be empty of tutorial data. Tests write only
-synthetic fixture state. No model or external control action is tested.
+synthetic fixture state. Add `--tutorial` to run the tutorial in a separate home
+using the same installed plugin and installer-generated configuration. CI runs
+both checks after a clean public install on the pinned Hermes release. No model
+or external control action is tested.
