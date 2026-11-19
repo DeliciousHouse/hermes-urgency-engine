@@ -352,13 +352,14 @@ class Runtime:
             # bounded snapshot without taking its blocking writer lock.
             state = self.ctx.state
             try:
-                with state.path.open('rb') as stream:
+                # Universal newlines match the host's logical JSON byte quota on Windows.
+                with state.path.open(encoding='utf-8-sig') as stream:
                     raw = stream.read(state.quota_bytes + 1)
             except FileNotFoundError:
-                raw = b'{}'
-            if len(raw) > state.quota_bytes:
+                raw = '{}'
+            if len(raw.encode('utf-8')) > state.quota_bytes:
                 invalid('focus', 'CORRUPT_STATE')
-            values = json.loads(raw.decode('utf-8-sig'))
+            values = json.loads(raw)
             if not isinstance(values, dict):
                 invalid('focus', 'CORRUPT_STATE')
             value = values.get(key)

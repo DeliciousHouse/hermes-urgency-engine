@@ -227,6 +227,21 @@ class RuntimeTests(unittest.TestCase):
                 if exists:
                     self.assertEqual(db.read_bytes(), b'')
 
+    def test_focus_quota_counts_logical_bytes_on_crlf(self):
+        self.project()
+        self.project('q')
+        self.ctx.settings['default_project'] = 'q'
+        self.runtime.focus('p', 'session')
+        self.now = datetime(2030, 1, 3, tzinfo=timezone.utc)
+        state = self.ctx.state
+        raw = json.dumps(state.values, indent=2).encode()
+        state.quota_bytes = len(raw)
+        state.path.write_bytes(raw.replace(bytes([10]), bytes([13, 10])))
+        self.assertIsNone(self.runtime.pre_llm_call(session_id='session'))
+        self.assertIn('Urgency planning guidance', self.runtime.pre_llm_call(session_id='other')['context'])
+        state.path.write_bytes(raw + b' ')
+        self.assertIn('CORRUPT_STATE', self.runtime.pre_llm_call(session_id='other')['context'])
+
 
 if __name__ == '__main__':
     unittest.main()
