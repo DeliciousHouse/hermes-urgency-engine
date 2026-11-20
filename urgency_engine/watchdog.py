@@ -493,18 +493,12 @@ class Monitor:
                 first = previous.get('running_since') if previous.get('status') == 'running' else None
                 first = first or stamp(now)
                 facts = self.detect(task, signal, previous, first, now, cfg, cycles, graph_rows, existing, graph_complete)
-                unknown = set()
-                if task['status'] == 'verified' or changed:
+                recovered = task['status'] == 'verified' or changed
+                if recovered:
                     facts = {}
-                else:
-                    if not graph_complete:
-                        unknown.add('dependency_cycle')
-                    if signal.get('agent_available') is None:
-                        unknown.add('delegated_work_unavailable')
-                    if 'dependency_unreachable' not in facts and signal.get('dependency_state') != 'available':
-                        unknown.add('dependency_unreachable')
                 spent, emitted, overflow = self.reconcile(task, facts, now, cfg, 100 - transitions,
-                    notice_budget=TICK_NOTICE_LIMIT - len(notices), unknown=unknown)
+                    notice_budget=TICK_NOTICE_LIMIT - len(notices),
+                    recovery=None if recovered else dict(signal=signal, graph_complete=graph_complete))
                 transitions += spent
                 notices.extend(emitted)
                 omitted += overflow
@@ -594,7 +588,7 @@ class Monitor:
             facts['stale_claim'] = dict(since=claim, action='inspect_only')
         if signal.get('dependency_state') == 'unreachable':
             facts['dependency_unreachable'] = dict(source='explicit_signal', observed_at=source_times.get('dependency_state'), freshness='retained_source' if 'dependency_state' in source_times else 'unknown_source_pruned')
-        elif graph_complete:
+        if graph_complete:
             missing = [list(r[2:]) for r in edges if tuple(r[:2]) == key and tuple(r[2:]) not in existing]
             if missing:
                 facts['dependency_unreachable'] = dict(missing=missing[:20], source='complete_known_graph')
@@ -628,24 +622,56 @@ class Monitor:
             facts['ineffective_recovery'] = dict(incident_ids=failed)
         return facts
 
-    def reconcile(self, task, facts, now, cfg, budget, *, notice_budget, deadline_id=None, unknown=()):
+    def reconcile(self, task, facts, now, cfg, budget, *, notice_budget, deadline_id=None, recovery=None):
         entity = ['deadline', deadline_id] if deadline_id else ['task', task['board_id'], task['task_id']]
         prefix = digest(entity)
         rows = [dict(r) for r in self.db.execute('SELECT * FROM incidents WHERE fingerprint LIKE ? ORDER BY episode', (prefix + ':%',))]
         latest = {r['detector']: r for r in rows}
         transitions, notices, omitted = 0, [], 0
-        for detector in sorted((set(latest) | set(facts)).difference(unknown)):
+        for detector in sorted(set(latest) | set(facts)):
             if transitions >= budget:
                 break
             old, detail = latest.get(detector), facts.get(detector)
+            prior = json.loads(old['explanation_json']) if old and old['state'] == 'active' else {}
+            prior_sources = set(prior.get('pending_sources', [prior.get('facts', {}).get('source')])) - {None}
+            pending_sources = prior_sources.copy()
+            if detector == 'dependency_unreachable' and recovery is not None:
+                signal, complete = recovery['signal'], recovery['graph_complete']
+                if complete:
+                    pending_sources.discard('complete_known_graph')
+                if signal.get('dependency_state') == 'available':
+                    pending_sources.discard('explicit_signal')
+                elif signal.get('dependency_state') == 'unreachable':
+                    pending_sources.add('explicit_signal')
+                if detail:
+                    pending_sources.add(detail['source'])
             if detail is None:
                 if old and old['state'] == 'active':
+                    # Absence only clears evidence this scan can evaluate.
+                    # Cached availability cannot clear a graph-proven missing target.
+                    if recovery is not None:
+                        signal, complete = recovery['signal'], recovery['graph_complete']
+                        clear = True
+                        if detector == 'dependency_cycle':
+                            clear = complete
+                        elif detector == 'dependency_unreachable':
+                            clear = not pending_sources
+                        elif detector == 'delegated_work_unavailable':
+                            clear = signal.get('agent_available') == 1
+                        if not clear:
+                            if detector == 'dependency_unreachable' and pending_sources != prior_sources:
+                                prior['pending_sources'] = sorted(pending_sources)
+                                self.db.execute('UPDATE incidents SET explanation_json=? WHERE incident_id=?',
+                                                (_json(prior), old['incident_id']))
+                            continue
                     self.db.execute("UPDATE incidents SET state='resolved',last_seen=? WHERE incident_id=?", (stamp(now), old['incident_id']))
                     self.db.execute("UPDATE plans SET state='resolved' WHERE incident_id=?", (old['incident_id'],))
                     transitions += 1
                 continue
             explanation = dict(facts=detail, source_revision=task['revision'], deadline_id=deadline_id,
                                confidence='observed_rule_match', unknowns=['semantic quality', 'external execution state'])
+            if detector == 'dependency_unreachable':
+                explanation['pending_sources'] = sorted(pending_sources)
             new = not old or old['state'] == 'resolved'
             if new:
                 self.capacity(cfg, 2)

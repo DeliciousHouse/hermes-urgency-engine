@@ -365,6 +365,118 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual([(i['episode'], i['state'], p['state']) for i, p in cycle_state()],
                          [(1, 'resolved', 'resolved'), (2, 'active', 'recommended')])
 
+    def assert_missing_target_survives_graph_limit(self, node_count, links):
+        self.observe({'dependency_state': 'available'}, event='older-available')
+        self.now += timedelta(seconds=1)
+        with self.monitor() as monitor, monitor.transaction():
+            monitor.db.execute('INSERT INTO dependencies VALUES(?,?,?,?)', ('board', 'task', 'board', 'missing'))
+        first, = self.tick()['notices']
+        with self.monitor(True) as monitor:
+            original = monitor.page('incidents')['items']
+            plans = monitor.page('plans')['items']
+        cfg = {**DEFAULTS, 'watchdog_max_rows': 100000}
+        nodes = [f'z{n:05d}' for n in range(node_count)]
+        with self.monitor() as monitor, monitor.transaction():
+            monitor.db.executemany('INSERT INTO dependencies VALUES(?,?,?,?)',
+                                   (('board', src, 'board', dst) for src, dst in links(nodes)))
+        self.now += timedelta(seconds=300)
+        with self.monitor() as monitor:
+            result = monitor.tick(self.ledger_path, cfg, force=True)
+            self.assertFalse(monitor.health()['coverage']['graph_complete'])
+            self.assertEqual((result['notices'], result['omitted']), ([], 0))
+            self.assertEqual(monitor.page('incidents')['items'], original)
+            self.assertEqual(monitor.page('plans')['items'], plans)
+        with self.monitor() as monitor, monitor.transaction():
+            monitor.db.execute("DELETE FROM dependencies WHERE task_id LIKE 'z%'")
+        self.assertEqual([n['incident_id'] for n in self.tick()['notices']], [first['incident_id']])
+        # Recovery is observed from the graph itself, even with no available signal.
+        self.observe({'dependency_state': None}, event='no-signal')
+        with self.ledger() as ledger:
+            ledger.upsert_task('board', 'missing', project_id='demo', goal='Restored target', status='running',
+                               remaining_seconds=600, expected_revision=0, reason='fixture', request_id='restore', actor='fixture')
+        self.assertEqual(self.tick()['notices'], [])
+        with self.monitor(True) as monitor:
+            incident, = monitor.page('incidents')['items']
+            plan, = monitor.page('plans')['items']
+        self.assertEqual((incident['incident_id'], incident['state'], incident['notice_count']),
+                         (first['incident_id'], 'resolved', 2))
+        self.assertEqual((plan['plan_id'], plan['state']), (plans[0]['plan_id'], 'resolved'))
+        with self.ledger() as ledger, ledger.connection:
+            ledger.connection.execute("DELETE FROM tasks WHERE task_id='missing'")
+        recurrence, = self.tick()['notices']
+        self.assertNotEqual(recurrence['incident_id'], first['incident_id'])
+        with self.monitor(True) as monitor:
+            self.assertEqual(sorted((i['episode'], i['state']) for i in monitor.page('incidents')['items']),
+                             [(1, 'resolved'), (2, 'active')])
+            self.assertEqual(len(monitor.page('plans')['items']), 2)
+
+    def test_missing_target_survives_node_cap(self):
+        self.assert_missing_target_survives_graph_limit(10000, lambda nodes: ((node, 'task') for node in nodes))
+
+    def test_missing_target_survives_edge_cap(self):
+        self.assert_missing_target_survives_graph_limit(224, lambda nodes: ((a, b) for a in nodes for b in nodes))
+
+    def test_graph_evidence_survives_explicit_signal_updates_during_cap(self):
+        with self.monitor() as monitor, monitor.transaction():
+            monitor.db.execute('INSERT INTO dependencies VALUES(?,?,?,?)', ('board', 'task', 'board', 'missing'))
+        first, = self.tick()['notices']
+        cfg = {**DEFAULTS, 'watchdog_max_rows': 100000}
+        with self.monitor() as monitor, monitor.transaction():
+            monitor.db.executemany('INSERT INTO dependencies VALUES(?,?,?,?)',
+                                   (('board', f'z{n}', 'board', 'task') for n in range(10000)))
+        self.now += timedelta(seconds=1)
+        with self.monitor() as monitor:
+            for event, state in [('failure', 'unreachable'), ('recovery', 'available')]:
+                monitor.observe(dict(request_id=event, reason='fixture', project_id='demo', board_id='board',
+                    task_id='task', kind='task_signal', occurred_at=self.now.isoformat(),
+                    data={'dependency_state': state}), self.ledger_path, cfg)
+                monitor.tick(self.ledger_path, cfg, force=True)
+            incident, = monitor.page('incidents')['items']
+            self.assertEqual((incident['incident_id'], incident['state']), (first['incident_id'], 'active'))
+            self.assertEqual(monitor.page('plans')['items'][0]['state'], 'recommended')
+
+    def test_explicit_recovery_does_not_require_graph_coverage(self):
+        self.observe({'dependency_state': 'unreachable', 'agent_available': False})
+        first = self.tick()['notices']
+        cfg = {**DEFAULTS, 'watchdog_max_rows': 100000}
+        with self.monitor() as monitor, monitor.transaction():
+            monitor.db.executemany('INSERT INTO dependencies VALUES(?,?,?,?)',
+                                   (('board', f'z{n}', 'board', 'task') for n in range(10000)))
+        self.now += timedelta(seconds=300)
+        with self.monitor() as monitor:
+            monitor.observe(dict(request_id='positive', reason='fixture', project_id='demo', board_id='board',
+                task_id='task', kind='task_signal', occurred_at=self.now.isoformat(),
+                data={'dependency_state': 'available', 'agent_available': True}), self.ledger_path, cfg)
+            self.assertEqual(monitor.tick(self.ledger_path, cfg, force=True)['notices'], [])
+            self.assertFalse(monitor.health()['coverage']['graph_complete'])
+            self.assertEqual({i['incident_id'] for i in monitor.page('incidents')['items']},
+                             {n['incident_id'] for n in first})
+            self.assertTrue(all(i['state'] == 'resolved' for i in monitor.page('incidents')['items']))
+            self.assertTrue(all(p['state'] == 'resolved' for p in monitor.page('plans')['items']))
+
+    def test_partial_recovery_retains_other_source_until_it_recovers(self):
+        self.observe({'dependency_state': 'unreachable'})
+        with self.monitor() as monitor, monitor.transaction():
+            monitor.db.execute('INSERT INTO dependencies VALUES(?,?,?,?)', ('board', 'task', 'board', 'missing'))
+        first, = self.tick()['notices']
+        cfg = {**DEFAULTS, 'watchdog_max_rows': 100000}
+        with self.monitor() as monitor, monitor.transaction():
+            monitor.db.executemany('INSERT INTO dependencies VALUES(?,?,?,?)',
+                                   (('board', f'z{n}', 'board', 'task') for n in range(10000)))
+        with self.monitor() as monitor:
+            for event, state in [('positive', 'available'), ('unknown', None)]:
+                monitor.observe(dict(request_id=event, reason='fixture', project_id='demo', board_id='board',
+                    task_id='task', kind='task_signal', occurred_at=self.now.isoformat(),
+                    data={'dependency_state': state}), self.ledger_path, cfg)
+                self.assertEqual(monitor.tick(self.ledger_path, cfg, force=True)['notices'], [])
+                self.assertEqual(monitor.page('incidents')['items'][0]['state'], 'active')
+        with self.monitor() as monitor, monitor.transaction():
+            monitor.db.execute('DELETE FROM dependencies')
+        self.assertEqual(self.tick()['notices'], [])
+        with self.monitor(True) as monitor:
+            incident, = monitor.page('incidents')['items']
+            self.assertEqual((incident['incident_id'], incident['state']), (first['incident_id'], 'resolved'))
+
     def test_cycle_episode_survives_node_cap(self):
         self.assert_cycle_survives_graph_limit(10000, lambda nodes: ((node, 'task') for node in nodes))
 

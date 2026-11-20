@@ -109,12 +109,17 @@ active without a reminder. If unavailability is observed again, it is still the
 same episode. Only observed recovery (such as explicit availability or verified
 progress) closes it; a later detection of unavailability then opens a new episode.
 
-For `dependency_unreachable`, an explicit `unreachable` signal or a missing target
-in a complete graph is positive evidence. Without either, `unknown`, null, or
-absent dependency state leaves the incident and its plan unchanged. No reminder
-is sent or consumed while coverage is unknown, and renewed evidence uses the same
-episode. An explicit `available` signal closes the episode if no missing target is
-detected. Verified progress or completion still closes task episodes.
+For `dependency_unreachable`, explicit `unreachable` and a missing target in a
+complete graph are independent positive evidence sources. Shared reconciliation
+retains each source until relevant recovery evidence is observed: `available`
+clears explicit-signal evidence; a complete graph without a missing target clears
+graph evidence. An older cached `available` cannot clear a graph-proven fault
+when graph coverage is lost. Unknown, null or absent signals and incomplete graphs
+are not recovery. Without positive fault evidence, unresolved sources keep the
+same episode and plan, last-seen time and reminder budget unchanged. Positive
+partial recovery is retained without sending a notice. Restored fault evidence
+resumes the same episode; only recovery followed by a true recurrence creates a
+new episode. Verified progress or completion still closes task episodes.
 
 A new incident creates one plan with facts, unknowns,
 objective, task IDs, required verification and stable ordered recommendations.
@@ -135,7 +140,9 @@ storage read-only. SQLite can maintain WAL coordination files for an existing DB
 Ticks process at most 500 tasks and 500 deadlines per page, 100 incident transitions,
 and a 10000-node/50000-edge graph. Exceeding either graph cap reports
 `coverage.graph_complete: false` in health. An incomplete graph cannot establish
-that a cycle has cleared or that a dependency is missing. Cursor and coverage
+that a cycle or graph-proven missing target has cleared, or that a dependency is
+newly missing. Explicit-signal evidence can still be detected or recovered without
+complete graph coverage. Cursor and coverage
 expose incomplete scans. Evaluation has cooperative 25/28-second checkpoints
 and a 100 ms SQLite busy wait; hardware/filesystem stalls
 are not a hard real-time guarantee. Selection is capped at 40 before notice
