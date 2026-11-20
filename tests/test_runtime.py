@@ -62,6 +62,31 @@ class RuntimeTests(unittest.TestCase):
     def project(self, name='p'):
         return self.request('create_project', project_id=name, title='Objective SYNTHETIC_SECRET', request_id=name)
 
+    def test_watchdog_empty_reads_and_safe_native_observation(self):
+        """protects=private telemetry; fails_when=body retained; seam=host-shaped hook."""
+        from unittest.mock import patch
+        from urgency_engine.watchdog import Monitor, DEFAULTS
+        for surface in ('tool', 'slash', 'hook'):
+            for operation in ('watchdog_health', 'watchdog_plans', 'watchdog_incidents'):
+                self.assertTrue(self.runtime.run_request(operation, {}, surface=surface, session_id='s')['ok'])
+        self.assertFalse((self.root / 'watchdog.db').exists())
+        self.project()
+        self.ctx.settings['watchdog_enabled'] = True
+        self.ctx.settings['default_project'] = 'p'
+        opener = lambda **kw: Monitor.open(self.root / 'watchdog.db', clock=self.runtime.clock)
+        with patch.object(Monitor, 'host', side_effect=opener):
+            self.runtime.post_tool_call(tool_name='synthetic', result={'ok': False, 'error': 'PRIVATE_MARKER'},
+                                       args={'secret': 'PRIVATE_MARKER'}, session_id='s', task_id='not-a-board-task', duration_ms=125)
+        with Monitor.open(self.root / 'watchdog.db', clock=self.runtime.clock, readonly=True) as monitor:
+            rows = monitor.page('observations')['items']
+            self.assertEqual(len(rows), 1)
+            self.assertIsNone(rows[0]['task_id'])
+            self.assertEqual(rows[0]['payload']['data']['duration_seconds'], .125)
+            self.assertEqual(rows[0]['payload']['data']['outcome'], 'failure')
+            self.assertNotIn('PRIVATE_MARKER', json.dumps(rows))
+        with Monitor.open(self.root / 'watchdog.db', clock=self.runtime.clock) as monitor:
+            self.assertEqual(monitor.tick(self.root / 'data.db', DEFAULTS)['notices'], [])
+
     def test_write_replay_and_read_surface_denial(self):
         """protects=local provenance; fails_when=reads write; seam=temp storage."""
         first = self.project()

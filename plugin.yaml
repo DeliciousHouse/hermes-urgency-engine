@@ -10,6 +10,7 @@ provides_hooks:
   - pre_llm_call
   - on_session_end
   - on_session_reset
+  - post_tool_call
 config_schema:
   context_enabled:
     type: bool
@@ -31,3 +32,35 @@ config_schema:
     type: int
     default: 1048576
     description: Local redacted diagnostic rotation size (65536 to 4194304 bytes)
+  watchdog_enabled:
+    type: bool
+    default: false
+    description: Enable hook observations and explicit ticks; install also activates monitoring
+  watchdog_normal_seconds:
+    type: int
+    default: 300
+    description: Normal scan interval, 60 to 3600 seconds
+  watchdog_risk_seconds:
+    type: int
+    default: 60
+    description: High-risk scan interval, 60 to 300 seconds and no greater than normal
+  watchdog_stall_seconds:
+    type: int
+    default: 1800
+    description: Running without verified progress threshold, 60 to 86400 seconds
+  watchdog_claim_seconds:
+    type: int
+    default: 900
+    description: Claim or heartbeat age threshold, 60 to 86400 seconds
+  watchdog_notice_limit:
+    type: int
+    default: 3
+    description: Maximum generated notices per episode, 1 to 10
+  watchdog_retention_days:
+    type: int
+    default: 30
+    description: Old observation and resolved episode retention, 1 to 365 days
+  watchdog_max_rows:
+    type: int
+    default: 10000
+    description: Retained monitor row cap, 100 to 100000; active and replay data never evicted
