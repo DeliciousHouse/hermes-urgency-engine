@@ -14,6 +14,8 @@ import traceback
 import uuid
 
 from .ledger import Ledger, LedgerError, open_hermes_ledger, open_readonly_ledger
+from .watchdog import Monitor, DEFAULTS as WATCHDOG_DEFAULTS, LIMITATIONS, settings as monitor_settings
+
 
 PLUGIN_ID = 'hermes-urgency-engine'
 MAX_INPUT_BYTES = 256 * 1024
@@ -26,6 +28,9 @@ READ_FIELDS = {
     'explain': ({'deadline_id': str}, {}),
     'history': ({'entity_type': str, 'entity_id': str}, {'limit': int, 'after': int}),
     'diagnose': ({}, {}),
+    'watchdog_health': ({}, {}),
+    'watchdog_incidents': ({}, {'project_id': str, 'limit': int, 'after': str}),
+    'watchdog_plans': ({}, {'project_id': str, 'limit': int, 'after': str}),
 }
 # Explicit signature allowlists, not reflection into the Ledger or host.
 MUTATIONS = {
@@ -114,6 +119,28 @@ def setup_parser(parser, *, conversational=False):
     status.add_argument('--limit', type=int, default=100)
     status.add_argument('--after')
     commands.add_parser('diagnose', help='Read storage health; no repairs')
+    watchdog = commands.add_parser('watchdog', help='Independent monitor and recovery plans')
+    monitor = watchdog.add_subparsers(dest='watchdog_operation', required=True)
+    monitor.add_parser('health')
+    for name in ('incidents', 'plans') + (() if conversational else ('export',)):
+        sub = monitor.add_parser(name)
+        sub.add_argument('--limit', type=int, default=100)
+        sub.add_argument('--after')
+        sub.add_argument('--project', dest='project_id')
+        if name == 'export':
+            sub.add_argument('--table', choices=('incidents', 'plans', 'observations', 'monitor_audit'), default='incidents')
+    if not conversational:
+        install = monitor.add_parser('install')
+        install.add_argument('--deliver', default='local')
+        monitor.add_parser('uninstall')
+        tick = monitor.add_parser('tick')
+        tick.add_argument('--force', action='store_true')
+        for name in ('pause', 'resume'):
+            sub = monitor.add_parser(name)
+            sub.add_argument('--request-id', required=True)
+            sub.add_argument('--reason', required=True)
+        observe = monitor.add_parser('observe')
+        observe.add_argument('--json-file', required=True)
     if conversational:
         focus = commands.add_parser('focus', help='Select a project for this session, or clear')
         focus.add_argument('project_id')
@@ -224,6 +251,8 @@ class Runtime:
             if 'expected_revision' in arguments and (type(arguments['expected_revision']) is not int or arguments['expected_revision'] < 0):
                 invalid('expected_revision')
             settings = self.settings()
+            if operation.startswith('watchdog_'):
+                return {'ok': True, 'data': self.monitor_read(operation.removeprefix('watchdog_'), arguments)}
             if operation in MUTATIONS:
                 storage = self.open(settings)
             else:
@@ -311,6 +340,8 @@ class Runtime:
 
     def cli(self, args):
         operation = vars(args).get('operation')
+        if operation == 'watchdog':
+            return self.monitor_cli(args)
         if operation is None:
             setup_parser(Parser(prog='hermes urgency')).print_help()
             return 2
@@ -339,6 +370,196 @@ class Runtime:
             return encode(self.error(LedgerError('INVALID_INPUT', 'unknown', 'arguments'), 'unknown'))
         result = self.run_request(args.get('operation'), args.get('arguments', {}), surface='tool', session_id=None)
         return self.render(result)
+
+    def monitor_config(self):
+        return monitor_settings({key: self.ctx.get_config(key, default) for key, default in WATCHDOG_DEFAULTS.items()})
+
+    def monitor_read(self, operation, arguments, *, active=False):
+        storage = Monitor.open(self.data_dir() / 'watchdog.db', clock=self.clock, readonly=True)
+        if storage is None:
+            return (dict(schema_version=1, storage='uninitialized', limitations=LIMITATIONS)
+                    if operation == 'health' else dict(schema_version=1, items=[], next=None, has_more=False))
+        with storage, storage.transaction(False):
+            return storage.health() if operation == 'health' else storage.page(operation, **arguments, active=active)
+
+    def monitor_cli(self, args):
+        operation = args.watchdog_operation
+        try:
+            cfg = self.monitor_config()
+            if operation in ('health', 'incidents', 'plans', 'export'):
+                table = args.table if operation == 'export' else operation
+                arguments = {key: vars(args)[key] for key in ('limit', 'after', 'project_id') if vars(args).get(key) is not None}
+                if table == 'monitor_audit' and 'after' in arguments:
+                    arguments['after'] = int(arguments['after'])
+                data = self.monitor_read(table, arguments)
+                if operation == 'export':
+                    data.update(table=table, retention_days=cfg['watchdog_retention_days'], limitations=LIMITATIONS)
+            else:
+                if operation == 'observe':
+                    with Path(args.json_file).open('rb') as stream:
+                        event = read_json(stream)
+                with Monitor.host(clock=self.clock) as monitor:
+                    if operation in ('pause', 'resume'):
+                        data = monitor.control(operation, args.request_id, args.reason)
+                    elif operation in ('install', 'uninstall'):
+                        data = self.monitor_install(monitor, operation, getattr(args, 'deliver', 'local'))
+                    elif operation == 'observe':
+                        data = monitor.observe(event, self.data_dir() / 'data.db', cfg)
+                    elif operation == 'tick':
+                        if not (cfg['watchdog_enabled'] or (monitor.meta('install') or {}).get('state') == 'installed'):
+                            return 0
+                        data = monitor.tick(self.data_dir() / 'data.db', cfg, args.force)
+                        if not data['notices']:
+                            return 0
+                        # Records retain full details; one bounded summary goes to cron.
+                        data = {'schema_version': 1, 'notices': data['notices'][:40],
+                                'more': len(data['notices']) > 40, 'emission': 'handed_to_cron_not_delivery_ack'}
+                    else:
+                        invalid('operation')
+            result = {'ok': True, 'data': data}
+        except LedgerError as exc:
+            result = self.error(exc, 'watchdog_' + operation)
+        except (OSError, ValueError, TypeError, UnicodeError, RecursionError):
+            result = self.error(LedgerError('INVALID_INPUT', 'watchdog_' + operation, side_effects='unknown'), 'watchdog_' + operation)
+        except Exception:
+            result = self.unexpected('watchdog_' + operation)
+        rendered = self.render(result)
+        ok = json.loads(rendered)['ok']
+        print(rendered, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+
+    def cron(self, action, **arguments):
+        # Plugin CLI commands do not otherwise initialize built-in tool discovery.
+        from tools.registry import discover_builtin_tools
+        discover_builtin_tools()
+        result = json.loads(self.ctx.dispatch_tool('cronjob_manage', {'action': action, **arguments}))
+        if not isinstance(result, dict) or result.get('success') is not True:
+            raise LedgerError('HOST_API_UNAVAILABLE', 'watchdog_cron', side_effects='unknown',
+                              next_action='Inspect the public cron list and plugin health before retrying; never create a duplicate.')
+        return result
+
+    def monitor_install(self, monitor, operation, deliver):
+        from hermes_constants import get_hermes_home
+        home = get_hermes_home().resolve()
+        script = home / 'scripts' / 'hermes-urgency-engine-watchdog.py'
+        content = (Path(__file__).resolve().parent.parent / 'scripts' / 'watchdog.py').read_bytes()
+        sha = hashlib.sha256(content).hexdigest()
+        if not isinstance(deliver, str) or not deliver or len(deliver) > 256 or any(ord(c) < 32 for c in deliver):
+            invalid('deliver')
+        def conflict(field):
+            raise LedgerError('INSTALL_CONFLICT', 'watchdog_' + operation, field, side_effects='unknown',
+                next_action='Inspect cron list and the owned launcher. Preserve edited/unrelated assets. Reconcile uncertain installation before retry.')
+        def jobs():
+            rows = self.cron('list', include_disabled=True).get('jobs')
+            if not isinstance(rows, list):
+                conflict('jobs')
+            return [j for j in rows if j.get('name') == 'hermes-urgency-engine-watchdog']
+        def exact(job):
+            return (job.get('no_agent') is True and isinstance(job.get('script'), str)
+                    and (home / 'scripts' / job['script']).resolve() == script and job.get('name') == 'hermes-urgency-engine-watchdog')
+        found = jobs()
+        receipt = monitor.meta('install')
+        if len(found) > 1 or (found and not exact(found[0])):
+            conflict('job')
+        if script.is_symlink() or (script.exists() and script.read_bytes() != content):
+            conflict('launcher')
+        if receipt and receipt.get('home') != str(home):
+            conflict('profile')
+        if operation == 'uninstall':
+            if not receipt:
+                if found or script.exists():
+                    conflict('ownership')
+                return {'state': 'uninstalled', 'retained_data': True}
+            if found and found[0]['job_id'] != receipt.get('job_id'):
+                conflict('job_id')
+            if found:
+                self.cron('remove', job_id=found[0]['job_id'])
+                if jobs():
+                    conflict('remove_readback')
+            if script.exists():
+                if script.read_bytes() != content:
+                    conflict('launcher')
+                script.unlink()
+            with monitor.transaction():
+                monitor.put('install', {'state': 'uninstalled', 'home': str(home)})
+                monitor.put('paused', True)
+                monitor.audit(uuid.uuid4().hex, 'uninstall', ['uninstall'], {'state': 'uninstalled'})
+            return {'state': 'uninstalled', 'retained_data': True}
+        if found:
+            if not receipt or (receipt.get('job_id') and receipt['job_id'] != found[0]['job_id']):
+                conflict('ownership')
+            if not script.exists():
+                conflict('launcher_missing')
+            job = found[0]
+        else:
+            # Reserve before external work. Unknown create outcomes are reconciled,
+            # never blindly repeated; no external call runs under a DB write lock.
+            with monitor.transaction():
+                current = monitor.meta('install')
+                if current and current.get('state') == 'installing':
+                    conflict('pending_install')
+                if script.exists() and not current:
+                    conflict('launcher_owner')
+                monitor.put('install', dict(state='installing', home=str(home), sha256=sha))
+            script.parent.mkdir(parents=True, exist_ok=True)
+            if not script.exists():
+                with script.open('xb') as stream:
+                    stream.write(content)
+            result = self.cron('create', schedule='every 1m', name='hermes-urgency-engine-watchdog',
+                               script=script.name, no_agent=True, deliver=deliver, enabled_toolsets=[])
+            found = jobs()
+            if len(found) != 1 or not exact(found[0]) or found[0]['job_id'] != result.get('job_id'):
+                conflict('create_readback')
+            job = found[0]
+        receipt = dict(state='installed', job_id=job['job_id'], home=str(home), sha256=sha,
+                       script=str(script), no_agent=True, deliver=deliver)
+        with monitor.transaction():
+            monitor.put('install', receipt)
+            monitor.put('paused', False)
+            monitor.audit(uuid.uuid4().hex, 'install', [operation, deliver], {'state': 'installed', 'job_id': job['job_id']})
+        return receipt
+
+    def post_tool_call(self, tool_name=None, result=None, duration=None, session_id=None, **kwargs):
+        # Project focus cannot identify a board task. Only explicit verified mappings
+        # supplied by the host adapter are admitted; task_id on this hook is a session.
+        try:
+            cfg = self.monitor_config()
+            storage = Monitor.open(self.data_dir() / 'watchdog.db', clock=self.clock, readonly=True)
+            if storage is not None:
+                with storage:
+                    enabled = cfg['watchdog_enabled'] or (storage.meta('install') or {}).get('state') == 'installed'
+                if not enabled:
+                    return
+            elif not cfg['watchdog_enabled']:
+                return
+            if duration is None and type(kwargs.get('duration_ms')) in (int, float):
+                duration = kwargs['duration_ms'] / 1000
+            mapping = kwargs.get('urgency_task')
+            if not isinstance(mapping, dict) or set(mapping) != {'project_id', 'board_id', 'task_id'}:
+                project_id = self.selected(session_id, self.settings())
+                if not project_id:
+                    return
+                mapping = dict(project_id=project_id, board_id=None, task_id=None)
+            if isinstance(result, str):
+                if len(result) > 16384:
+                    return
+                try:
+                    result = json.loads(result)
+                except ValueError:
+                    result = None
+            outcome = 'unknown'
+            if isinstance(result, dict):
+                if result.get('ok') is False or result.get('success') is False or result.get('error'):
+                    outcome = 'failure'
+                elif result.get('ok') is True or result.get('success') is True:
+                    outcome = 'success'
+            event = dict(request_id=uuid.uuid4().hex, reason='host tool outcome', **mapping, kind='tool_outcome',
+                         occurred_at=self.clock().isoformat(), data=dict(tool_name=tool_name, outcome=outcome,
+                         duration_seconds=duration if type(duration) in (int, float) else 0))
+            with Monitor.host(clock=self.clock) as monitor:
+                monitor.observe(event, self.data_dir() / 'data.db', cfg, source='host-post-tool-call')
+        except Exception:
+            return  # Optional telemetry never interrupts the host's tool result.
 
     @staticmethod
     def focus_key(session_id):
@@ -403,7 +624,10 @@ class Runtime:
             if not isinstance(raw_args, str) or len(raw_args) > MAX_INPUT_BYTES:
                 invalid('arguments')
             args = parser.parse_args(shlex.split(raw_args) or ['status'])
-            if args.operation == 'focus':
+            if args.operation == 'watchdog':
+                operation = 'watchdog_' + args.watchdog_operation
+                result = self.run_request(operation, arguments_from(args, operation), surface='slash', session_id=session_id)
+            elif args.operation == 'focus':
                 result = self.focus(args.project_id, session_id)
             else:
                 result = self.run_request(args.operation, arguments_from(args, args.operation), surface='slash', session_id=session_id)
@@ -463,6 +687,10 @@ class Runtime:
                 lines.append('Deadline: ' + encode({key: deadline[key] for key in ('deadline_id', 'kind', 'target_at', 'original_at', 'forecast_at', 'input', 'forecast')}))
             for task in tasks:
                 lines.append('Task: ' + encode({key: task[key] for key in ('board_id', 'task_id', 'goal', 'status', 'criteria')}))
+            plans = self.monitor_read('plans', {'project_id': project_id, 'limit': 3}, active=True)
+            for plan in plans['items']:
+                check_budget()
+                lines.append('Recovery recommendation: ' + encode(plan))
             lines.append('Blockers: ' + ('blocked task status present; cause unknown' if any(t['status'] == 'blocked' for t in tasks) else 'unknown'))
             if more_tasks:
                 lines.append('Task/criteria listing truncated; use urgency_query task for details.')
@@ -509,3 +737,4 @@ def register(ctx):
     ctx.register_hook('pre_llm_call', runtime.pre_llm_call)
     ctx.register_hook('on_session_end', runtime.session_end)
     ctx.register_hook('on_session_reset', runtime.session_reset)
+    ctx.register_hook('post_tool_call', runtime.post_tool_call)
