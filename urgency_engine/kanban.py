@@ -364,10 +364,28 @@ class Sync:
                 if not row:
                     self.db.execute('INSERT INTO sync_requests VALUES(?,?,?,?)', (request_id, payload, 'scan_pending', '{}'))
                 self.put('incomplete_scan', request_id)
-            result = self._scan(cfg, ledger, monitor, ledger_path, source,
-                                request_id=request_id, reason=reason)
+                self.put('last_attempt', self.clock().isoformat())
+                # Clear only pre-scan hints. Hints arriving during I/O survive.
+                self.put('dirty_bindings', [])
+            try:
+                result = self._scan(cfg, ledger, monitor, ledger_path, source,
+                                    request_id=request_id, reason=reason)
+            except Exception as exc:
+                code = exc.code if isinstance(exc, LedgerError) else 'SOURCE_ERROR'
+                with self.transaction():
+                    self.put('last_error', code)
+                    for row in self.db.execute('SELECT board_id,task_id,projection_json FROM sources').fetchall():
+                        projection = json.loads(row['projection_json'])
+                        projection['coverage'] = 'unknown'
+                        self.db.execute('UPDATE sources SET coverage=?,projection_json=? WHERE board_id=? AND task_id=?',
+                                        ('unknown', _json(projection), row['board_id'], row['task_id']))
+                raise
             with self.transaction():
                 self.put('incomplete_scan', None)
+                self.put('last_error', None)
+                self.put('last_result', result)
+                if result['state'] == 'complete':
+                    self.put('last_success', self.clock().isoformat())
                 self.db.execute("UPDATE sync_requests SET state='scan_complete',result_json=? WHERE request_id=?", (_json(result), request_id))
             return result
 
@@ -389,12 +407,31 @@ class Sync:
         cursor = self.meta('cursor')
         processed = 0
         total = 0
+        inventories = []
+        seen = set()
         for binding in sorted(cfg['kanban_bindings'], key=lambda b: (b['board'], b['tenant'])):
             ledger.get_project(binding['project_id'])
             rows = source.inventory(binding)
+            if not isinstance(rows, list):
+                fail('tasks')
             total += len(rows)
             if total > cfg['kanban_max_tasks']:
                 fail('tasks', 'SOURCE_LIMIT')
+            for row in rows:
+                if not isinstance(row, dict) or not isinstance(row.get('id'), str):
+                    fail('task_id')
+                _id(row['id'], 'task_id')
+                if row.get('tenant') != binding['tenant']:
+                    fail('tenant', 'SCOPE_CONFLICT')
+                key = binding['board'], row['id']
+                if key in seen:
+                    fail('duplicate_task')
+                seen.add(key)
+            inventories.append((binding, rows))
+        for row in self.db.execute('SELECT board_id,task_id FROM sources').fetchall():
+            if (row['board_id'], row['task_id']) not in seen:
+                self.mark_unknown((row['board_id'], row['task_id']), 'SOURCE_ABSENT')
+        for binding, rows in inventories:
             for row in sorted(rows, key=lambda r: r['id']):
                 task_id = _id(row.get('id'), 'task_id')
                 position = [binding['board'], binding['tenant'], task_id]
@@ -420,11 +457,14 @@ class Sync:
                     fail('task_id', 'SCOPE_CONFLICT')
                 key = binding['board'], task_id
                 existing = self.db.execute('SELECT * FROM sources WHERE board_id=? AND task_id=?', key).fetchone()
+                if existing and existing['source_updated_at'] and projection['source_updated_at']:
+                    if datetime.fromisoformat(projection['source_updated_at']) < datetime.fromisoformat(existing['source_updated_at']):
+                        self.mark_unknown(key, 'SOURCE_STALE')
+                        fail('source_updated_at', 'SOURCE_STALE')
                 if existing and existing['source_digest'] == projection['source_digest']:
                     with self.transaction():
-                        projection['coverage'] = existing['coverage']
-                        self.db.execute('UPDATE sources SET observed_at=?,projection_json=? WHERE board_id=? AND task_id=?',
-                                        (projection['observed_at'], _json(projection), *key))
+                        self.db.execute('UPDATE sources SET observed_at=?,coverage=?,projection_json=? WHERE board_id=? AND task_id=?',
+                                        (projection['observed_at'], projection['coverage'], _json(projection), *key))
                         self.put('cursor', position)
                     continue
                 if task and task['project_id'] != binding['project_id']:
@@ -512,8 +552,9 @@ class Sync:
                 (*key, projection['project_id'], projection['tenant'], projection['source_updated_at'],
                  projection['source_digest'], projection['status'], projection['assignee'],
                  projection['title'], projection['observed_at'], projection['coverage'], _json(projection), projection['source_digest']))
-            self.db.execute("UPDATE sync_requests SET state='applied' WHERE request_id=?", (identity,))
             self.put('ledger_path', str(ledger.connection.execute('PRAGMA database_list').fetchone()[2]))
         self.admit_facts(ledger, monitor, projection, identity)
+        with self.transaction():
+            self.db.execute("UPDATE sync_requests SET state='applied' WHERE request_id=?", (identity,))
 
 

@@ -410,8 +410,8 @@ class Runtime:
                         if operation in ('pause', 'resume'):
                             data = sync.control(operation, args.request_id, args.reason)
                         else:
-                            with self.open(self.settings()) as ledger:
-                                data = sync.scan(cfg, ledger, None, self.data_dir() / 'data.db', NativeSource(),
+                            with self.open(self.settings()) as ledger, Monitor.host(clock=self.clock) as monitor:
+                                data = sync.scan(cfg, ledger, monitor, self.data_dir() / 'data.db', NativeSource(),
                                                  request_id=args.request_id, reason=args.reason)
             result = {'ok': data.get('state') not in ('partial', 'conflict'), 'data': data}
         except LedgerError as exc:
@@ -434,7 +434,15 @@ class Runtime:
             if operation == 'tasks':
                 return sync.page(**arguments)
             with sync.transaction(False):
+                last_success = sync.meta('last_success')
+                age = ((self.clock() - datetime.fromisoformat(last_success)).total_seconds()
+                       if last_success else None)
                 return dict(storage='available', enabled=cfg['kanban_sync_enabled'],
+                            paused=sync.meta('paused', False), last_attempt=sync.meta('last_attempt'),
+                            last_success=last_success, last_error=sync.meta('last_error'),
+                            last_result=sync.meta('last_result'), age_seconds=age,
+                            stale=age is None or age < 0 or age > cfg['kanban_sync_seconds'],
+                            dirty_bindings=sync.meta('dirty_bindings', []),
                             incomplete_scan=sync.meta('incomplete_scan'), cursor=sync.meta('cursor'),
                             coverage='unknown')
 
@@ -601,6 +609,24 @@ class Runtime:
             monitor.put('paused', False)
             monitor.audit(uuid.uuid4().hex, 'install', [operation, deliver], {'state': 'installed', 'job_id': job['job_id']})
         return receipt
+
+    def kanban_hint(self, board=None, **kwargs):
+        # Lifecycle callbacks lack tenant coverage. Coalesce a binding refresh;
+        # never use hook timestamps, run IDs or bodies as source observations.
+        try:
+            cfg = self.kanban_config()
+            if not cfg['kanban_sync_enabled'] or not cfg['kanban_bindings']:
+                return
+            boards = {binding['board'] for binding in cfg['kanban_bindings']}
+            if board is not None:
+                if not isinstance(board, str) or board not in boards:
+                    return
+                boards = {board}
+            with Sync.host(clock=self.clock, redact=lambda text: self.ctx.redact_text(text, force=True)) as sync:
+                with sync.transaction():
+                    sync.put('dirty_bindings', sorted(set(sync.meta('dirty_bindings', [])) | boards))
+        except Exception:
+            return  # An optional hint must not interrupt a native transition.
 
     def post_tool_call(self, tool_name=None, result=None, duration=None, session_id=None, **kwargs):
         # Project focus cannot identify a board task. Only explicit verified mappings
@@ -821,3 +847,5 @@ def register(ctx):
     ctx.register_hook('on_session_end', runtime.session_end)
     ctx.register_hook('on_session_reset', runtime.session_reset)
     ctx.register_hook('post_tool_call', runtime.post_tool_call)
+    for hook in ('kanban_task_claimed', 'kanban_task_completed', 'kanban_task_blocked'):
+        ctx.register_hook(hook, runtime.kanban_hint)

@@ -62,6 +62,39 @@ class RuntimeTests(unittest.TestCase):
     def project(self, name='p'):
         return self.request('create_project', project_id=name, title='Objective SYNTHETIC_SECRET', request_id=name)
 
+    def test_lifecycle_hints_are_opt_in_coalesced_and_never_source_facts(self):
+        """protects=hint-only callbacks; fails_when=hook collects or refreshes heartbeat;
+        why_new=lifecycle integration; seam=registered callbacks/real store; no_claim=host dispatch.
+        """
+        from unittest.mock import patch
+        from urgency_engine.kanban import Sync, NativeSource
+        from urgency_engine.runtime import register
+        hooks = {}
+        self.ctx.register_cli_command = lambda *a, **k: None
+        self.ctx.register_command = lambda *a, **k: None
+        self.ctx.register_tool = lambda *a, **k: None
+        self.ctx.register_hook = lambda name, callback: hooks.update({name: callback})
+        register(self.ctx)
+        for name in ('kanban_task_claimed', 'kanban_task_completed', 'kanban_task_blocked'):
+            self.assertIn(name, hooks)
+        def store(**kwargs):
+            return Sync(sqlite3.connect(self.root / 'kanban.db'), **kwargs)
+        with patch.object(Sync, 'host', side_effect=store), \
+             patch.object(NativeSource, 'inventory', side_effect=AssertionError('inline source call')):
+            hooks['kanban_task_claimed'](task_id='task', board='demo')
+            self.assertFalse((self.root / 'kanban.db').exists())
+            self.ctx.settings.update(kanban_sync_enabled=True,
+                kanban_bindings=[dict(board='demo', tenant='synthetic', project_id='p')])
+            for name in ('kanban_task_completed', 'kanban_task_claimed', 'kanban_task_claimed'):
+                hooks[name](task_id='task', board='demo', run_id=42, body='PRIVATE')
+            hooks['kanban_task_blocked'](task_id='task', board='foreign')
+            hooks['kanban_task_blocked'](task_id='unknown')
+        with store(clock=lambda: self.now, redact=lambda text: text) as sync:
+            self.assertEqual(sync.meta('dirty_bindings'), ['demo'])
+            self.assertEqual(sync.page('p')['items'], [])
+            self.assertIsNone(sync.meta('last_success'))
+        self.assertNotIn(b'PRIVATE', (self.root / 'kanban.db').read_bytes())
+
     def test_kanban_local_cli_imports_and_controls_without_model_writes(self):
         """protects=operator-only sync; fails_when=CLI cannot import or model mutates;
         why_new=native command route; seam=source fixture and plugin storage replacement;
@@ -69,6 +102,7 @@ class RuntimeTests(unittest.TestCase):
         """
         from unittest.mock import patch
         from urgency_engine.kanban import Sync, NativeSource
+        from urgency_engine.watchdog import Monitor
         self.project()
         self.ctx.settings.update(kanban_sync_enabled=True,
                                  kanban_bindings=[dict(board='demo', tenant='synthetic', project_id='p')])
@@ -82,12 +116,22 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(code, 0, err.getvalue())
             return json.loads(out.getvalue())['data']
         with patch.object(Sync, 'host', side_effect=store), \
+             patch.object(Monitor, 'host', side_effect=lambda **kw: Monitor.open(self.root / 'watchdog.db', **kw)), \
              patch.object(NativeSource, 'inventory', return_value=[dict(id='task', tenant='synthetic')]), \
              patch.object(NativeSource, 'detail', return_value=dict(task=dict(id='task', tenant='synthetic', title='Deliver', status='ready'), parents=[])):
             self.assertEqual(command('kanban sync --request-id s --reason Fixture')['state'], 'complete')
             self.assertEqual(command('kanban tasks --project p')['items'][0]['task_id'], 'task')
+            health = command('kanban health')
+            self.assertEqual(health['last_success'], self.now.isoformat())
+            self.assertEqual(health['age_seconds'], 0)
+            self.assertFalse(health['stale'])
+            self.assertFalse(health['paused'])
+            self.assertEqual(health['last_result']['state'], 'complete')
             self.assertTrue(command('kanban pause --request-id pause --reason Fixture')['paused'])
             self.assertFalse(command('kanban resume --request-id resume --reason Fixture')['paused'])
+        self.assertTrue((self.root / 'watchdog.db').exists())
+        with Monitor.open(self.root / 'watchdog.db', clock=self.runtime.clock, readonly=True) as monitor:
+            self.assertEqual(monitor.page('observations')['items'][0]['source'], 'kanban-sync')
         self.assertIsNone(self.request('task', board_id='demo', task_id='task')['data']['remaining_seconds'])
         self.assertFalse(self.runtime.run_request('kanban_sync', {}, surface='tool')['ok'])
 

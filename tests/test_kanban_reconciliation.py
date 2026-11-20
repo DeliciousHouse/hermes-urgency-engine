@@ -52,6 +52,125 @@ class ReconciliationTests(unittest.TestCase):
         return self.sync.scan(self.cfg, self.ledger, None, self.root / 'data.db',
                               self.source, request_id=identity, reason='Fixture')
 
+    def test_ten_thousand_sources_finish_after_restart_and_key_churn(self):
+        """protects=bounded eventual coverage; fails_when=cursor starves late/new keys;
+        why_new=10000 source acceptance; seam=synthetic source/real stores;
+        no_claim=native CLI throughput or production latency.
+        """
+        import time
+        started = time.monotonic()
+        self.source.rows = [dict(id=f't{i:05d}', tenant='synthetic') for i in range(10000)]
+        self.assertEqual(self.scan('page0')['state'], 'partial')
+        # Replace an already-consumed key with a lower-sorting key, then restart.
+        self.source.rows[0] = dict(id='a-new', tenant='synthetic')
+        self.sync.db.close()
+        self.sync = kanban.Sync(sqlite3.connect(self.root / 'kanban.db'),
+                                clock=lambda: self.now, redact=lambda text: text)
+        self.addCleanup(self.sync.db.close)
+        for index in range(1, 101):
+            result = self.scan(f'page{index}')
+            self.assertLessEqual(result['count'], 100)
+            if result['state'] == 'complete':
+                break
+        self.assertEqual(result['state'], 'complete')
+        self.assertEqual(self.ledger.get_task('demo', 't09999')['goal'], 'Deliver')
+        with self.assertRaises(LedgerError) as caught:
+            self.scan('next-cycle')
+        self.assertEqual(caught.exception.field, 'tasks_capacity')
+        self.assertEqual(self.sync.db.execute('SELECT COUNT(*) FROM sources').fetchone()[0], 10000)
+        self.assertEqual(self.sync.db.execute("SELECT coverage FROM sources WHERE task_id='t00000'").fetchone()[0], 'unknown')
+        print(json.dumps(dict(benchmark='10000_canonical_sources', seconds=time.monotonic() - started,
+                              detail_calls=self.source.calls, final_cycle=index)))
+
+    def test_new_lower_key_is_visited_on_next_cycle_below_capacity(self):
+        """protects=cursor fairness; fails_when=new lower key never gets scanned;
+        why_new=source churn; seam=synthetic source; no_claim=unbounded growth.
+        """
+        self.source.rows = [dict(id=f't{i:03d}', tenant='synthetic') for i in range(101)]
+        self.assertEqual(self.scan()['state'], 'partial')
+        self.source.rows[0] = dict(id='a-new', tenant='synthetic')
+        self.assertEqual(self.scan('tail')['state'], 'complete')
+        self.assertEqual(self.scan('wrap')['state'], 'partial')
+        self.assertEqual(self.ledger.get_task('demo', 'a-new')['goal'], 'Deliver')
+        self.assertEqual(self.ledger.get_task('demo', 't100')['goal'], 'Deliver')
+
+    def test_absent_source_retains_local_scope_with_unknown_projection(self):
+        """protects=absence is not deletion; fails_when=missing source stays current;
+        why_new=complete empty inventory; seam=real stores; no_claim=remote deletion.
+        """
+        self.scan()
+        before = self.ledger.get_task('demo', 'task')
+        self.source.rows = []
+        self.assertEqual(self.scan('empty')['state'], 'complete')
+        self.assertEqual(self.ledger.get_task('demo', 'task'), before)
+        self.assertEqual(self.sync.page('project')['items'][0]['coverage'], 'unknown')
+        self.source.rows = [dict(id='task', tenant='synthetic')]
+        self.scan('return')
+        self.assertEqual(self.sync.page('project')['items'][0]['coverage'], 'partial')
+        self.assertEqual(self.ledger.get_task('demo', 'task'), before)
+
+    def test_invalid_inventory_is_rejected_before_any_task_is_applied(self):
+        """protects=whole collection validation; fails_when=late bad row partly applies;
+        why_new=inventory trust boundary; seam=synthetic transport; no_claim=native authorization.
+        """
+        for rows, code in [([dict(id='task', tenant='synthetic')] * 2, 'SOURCE_MALFORMED'),
+                           ([dict(id='task', tenant='foreign')], 'SCOPE_CONFLICT'),
+                           ([dict(id='task', tenant='synthetic'), {}], 'SOURCE_MALFORMED')]:
+            with self.subTest(rows=rows):
+                self.source.rows = rows
+                with self.assertRaises(LedgerError) as caught:
+                    self.scan('bad' + str(len(rows)))
+                self.assertEqual(caught.exception.code, code)
+                self.assertEqual(self.ledger.list_tasks('project'), [])
+                self.assertEqual(self.source.calls, 0)
+
+    def test_older_source_revision_cannot_overwrite_newer_projection(self):
+        """protects=source ordering; fails_when=delayed response rewinds state;
+        why_new=canonical revision boundary; seam=controlled responses; no_claim=hosts without revisions.
+        """
+        original = self.source.detail
+        stamp = [200]
+        def detail(binding, task_id):
+            document = original(binding, task_id)
+            document['task']['updated_at'] = stamp[0]
+            return document
+        self.source.detail = detail
+        self.scan()
+        before = self.ledger.get_task('demo', 'task')
+        stamp[0] = 100
+        self.source.title = 'Older'
+        with self.assertRaises(LedgerError) as caught:
+            self.scan('old')
+        self.assertEqual(caught.exception.code, 'SOURCE_STALE')
+        self.assertEqual(self.ledger.get_task('demo', 'task'), before)
+        self.assertEqual(self.sync.page('project')['items'][0]['title'], 'Deliver')
+        stamp[0] = 300
+        self.source.title = 'Newer'
+        self.scan('new')
+        self.assertEqual(self.ledger.get_task('demo', 'task')['goal'], 'Newer')
+
+    def test_scan_health_retains_error_and_success_without_polling_as_heartbeat(self):
+        """protects=durable health; fails_when=failed scan appears successful;
+        why_new=source diagnostics; seam=real storage; no_claim=source liveness.
+        """
+        with self.sync.transaction():
+            self.sync.put('dirty_bindings', ['demo'])
+        self.scan()
+        self.assertEqual(self.sync.meta('dirty_bindings'), [])
+        self.assertEqual(self.sync.meta('last_success'), self.now.isoformat())
+        self.now += timedelta(seconds=60)
+        self.source.fail = 'inventory'
+        with self.assertRaises(LedgerError):
+            self.scan('denied')
+        self.assertEqual(self.sync.meta('last_attempt'), self.now.isoformat())
+        self.assertEqual(self.sync.meta('last_error'), 'SOURCE_DENIED')
+        self.assertEqual(self.sync.meta('last_success'), NOW.isoformat())
+        self.assertEqual(self.sync.page('project')['items'][0]['coverage'], 'unknown')
+        self.source.fail = None
+        self.scan('recover')
+        self.assertIsNone(self.sync.meta('last_error'))
+        self.assertEqual(self.sync.page('project')['items'][0]['coverage'], 'partial')
+
     def test_unchanged_detail_refreshes_receipt_without_rewriting_ledger(self):
         """protects=truthful cached freshness; fails_when=valid reads stay stale;
         why_new=canonical observations; seam=real stores; no_claim=heartbeat refresh.
@@ -121,6 +240,26 @@ class ReconciliationTests(unittest.TestCase):
         result = self.scan()
         self.assertEqual(result['state'], 'complete')
         self.assertEqual(self.sync.page('project')['items'][0]['coverage'], 'partial')
+
+    def test_monitor_failure_replays_pending_application_without_duplicate_ledger_edit(self):
+        """protects=cross-store crash replay; fails_when=source ack precedes monitor;
+        why_new=second durable store; seam=real Monitor with admission fault; no_claim=atomic stores.
+        """
+        from unittest.mock import patch
+        from urgency_engine.watchdog import Monitor
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
+            with patch.object(monitor, 'observe', side_effect=RuntimeError('synthetic crash')):
+                with self.assertRaises(RuntimeError):
+                    self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
+                                   self.source, request_id='crash', reason='Fixture')
+            revision = self.ledger.get_task('demo', 'task')['revision']
+            self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
+                           self.source, request_id='crash', reason='Fixture')
+            observations = monitor.page('observations', project_id='project')['items']
+            self.assertEqual(len(observations), 1)
+            self.assertEqual(self.ledger.get_task('demo', 'task')['revision'], revision)
+            self.assertEqual(self.sync.db.execute(
+                "SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 0)
 
     def test_external_parent_stays_unknown_and_current_worker_is_admitted(self):
         """protects=mapped facts only; fails_when=missing parent becomes unreachable;
