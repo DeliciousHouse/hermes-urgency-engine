@@ -89,6 +89,54 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(self.tick()['notices'], [])
         self.assertEqual(original, self.ledger_path.read_bytes())
 
+    def test_unknown_availability_preserves_episode_without_reminding(self):
+        self.observe({'agent_available': False})
+        incident_id = self.tick()['notices'][0]['incident_id']
+        self.now += timedelta(seconds=300)
+        self.observe({'agent_available': None}, event='unknown')
+        self.assertEqual(self.tick()['notices'], [])
+        with self.monitor(True) as monitor:
+            incident, = monitor.page('incidents')['items']
+            plan, = monitor.page('plans')['items']
+        self.assertEqual((incident['incident_id'], incident['state'], incident['notice_count']),
+                         (incident_id, 'active', 1))
+        self.assertEqual((plan['incident_id'], plan['state']), (incident_id, 'recommended'))
+
+        self.observe({'agent_available': False}, event='unavailable-again')
+        self.assertEqual([n['incident_id'] for n in self.tick()['notices']], [incident_id])
+        self.observe({'agent_available': True}, event='available')
+        self.assertEqual(self.tick()['notices'], [])
+        with self.monitor(True) as monitor:
+            self.assertEqual(monitor.page('incidents')['items'][0]['state'], 'resolved')
+            self.assertEqual(monitor.page('plans')['items'][0]['state'], 'resolved')
+
+        self.observe({'agent_available': False}, event='recurrence')
+        self.assertNotEqual(self.tick()['notices'][0]['incident_id'], incident_id)
+        with self.monitor(True) as monitor:
+            self.assertEqual(sorted(i['episode'] for i in monitor.page('incidents')['items']), [1, 2])
+
+    def test_tick_notice_overflow_preserves_next_reminder(self):
+        with self.ledger() as ledger:
+            for n in range(41):
+                ledger.upsert_task('board', f'task-{n}', project_id='demo', goal='Deliver proof', status='running',
+                                   remaining_seconds=600, expected_revision=0, reason='fixture', request_id=f'task-{n}', actor='fixture')
+        with self.monitor() as monitor:
+            for n in range(41):
+                monitor.observe(dict(request_id=f'event-{n}', reason='fixture', project_id='demo', board_id='board',
+                    task_id=f'task-{n}', kind='task_signal', occurred_at=self.now.isoformat(), data={'agent_available': False}),
+                    self.ledger_path)
+        cfg = {**DEFAULTS, 'watchdog_notice_limit': 1}
+        with self.monitor() as monitor:
+            first = monitor.tick(self.ledger_path, cfg, force=True)
+            monitor.defer_notices([item['incident_id'] for item in first['notices'][40:]])
+        self.assertEqual(len(first['notices']), 41)
+        self.now += timedelta(seconds=300)
+        with self.monitor() as monitor:
+            second = monitor.tick(self.ledger_path, cfg, force=True)
+            rows = monitor.page('incidents', limit=500)['items']
+        self.assertEqual(len(second['notices']), 1)
+        self.assertTrue(all(item['notice_count'] == 1 for item in rows))
+
     def test_observation_replay_conflict_future_and_sparse(self):
         first = self.observe({'claim_at': self.now.isoformat()})
         self.assertEqual(first, self.observe({'claim_at': self.now.isoformat()}))

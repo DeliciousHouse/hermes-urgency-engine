@@ -95,8 +95,10 @@ not prove failed recovery: the detector requires outcomes tied to an incident.
 | `forecast_miss` | Previously retained completion estimate elapsed with required work unverified |
 | `ineffective_recovery` | At least three failed/no-improvement outcomes for the same still-active incident; improvement resets that count |
 
-A verified task closes task incidents. Verified progress closes its current episode;
-recurrence creates a new one. A new incident creates one plan with facts, unknowns,
+A verified task closes task incidents. Verified progress closes its current episode.
+Explicit null availability/dependency is insufficient evidence, not recovery: the
+existing episode stays active without a reminder, and recurrence creates a new one.
+A new incident creates one plan with facts, unknowns,
 objective, task IDs, required verification and stable ordered recommendations.
 Deadline plans refer to their ledger deadline; consult `hermes urgency explain ID`
 for complete commitment scope and evidence. Plans never execute commands, change
@@ -116,7 +118,8 @@ Ticks process at most 500 tasks and 500 deadlines per page, 100 incident transit
 and a 10000-node/50000-edge graph. Incomplete graph coverage never proves a missing
 dependency. Cursor and coverage expose incomplete scans. Evaluation has cooperative
 25/28-second checkpoints and a 100 ms SQLite busy wait; hardware/filesystem stalls
-are not a hard real-time guarantee. Notice output contains up to 40 entries.
+are not a hard real-time guarantee. Notice output contains up to 40 entries;
+entries beyond that cap keep their next reminder due instead of consuming it.
 A 10000-task board needs a larger row cap than the default because each task also
 has retained monitor metadata. Exceeding capacity rolls back the transaction.
 Old observations and resolved episodes expire by retention time; active records,

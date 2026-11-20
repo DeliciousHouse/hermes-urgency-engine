@@ -133,7 +133,7 @@ def setup_parser(parser, *, conversational=False):
         install = monitor.add_parser('install')
         install.add_argument('--deliver', default='local')
         monitor.add_parser('uninstall')
-        tick = monitor.add_parser('tick')
+        tick = monitor.add_parser('tick', help='Evaluate due incidents; output is capped at 40 notices')
         tick.add_argument('--force', action='store_true')
         for name in ('pause', 'resume'):
             sub = monitor.add_parser(name)
@@ -412,8 +412,12 @@ class Runtime:
                         if not data['notices']:
                             return 0
                         # Records retain full details; one bounded summary goes to cron.
-                        data = {'schema_version': 1, 'notices': data['notices'][:40],
-                                'more': len(data['notices']) > 40, 'emission': 'handed_to_cron_not_delivery_ack'}
+                        emitted, limit = data['notices'], 40
+                        selected, deferred = emitted[:limit], emitted[limit:]
+                        data = {'schema_version': 1, 'notices': selected, 'more': bool(deferred),
+                                'omitted': len(deferred), 'emission': 'handed_to_cron_not_delivery_ack'}
+                        if deferred:
+                            monitor.defer_notices([item['incident_id'] for item in deferred])
                     else:
                         invalid('operation')
             result = {'ok': True, 'data': data}

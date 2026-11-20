@@ -492,9 +492,12 @@ class Monitor:
                 first = previous.get('running_since') if previous.get('status') == 'running' else None
                 first = first or stamp(now)
                 facts = self.detect(task, signal, previous, first, now, cfg, cycles, graph_rows, existing, graph_complete)
+                unknown = set()
                 if task['status'] == 'verified' or changed:
                     facts = {}
-                spent, emitted = self.reconcile(task, facts, now, cfg, 100 - transitions)
+                elif signal.get('agent_available') is None:
+                    unknown.add('delegated_work_unavailable')
+                spent, emitted = self.reconcile(task, facts, now, cfg, 100 - transitions, unknown=unknown)
                 transitions += spent
                 notices.extend(emitted)
                 self.capacity(cfg, 1 if not previous else 0)
@@ -615,13 +618,20 @@ class Monitor:
             facts['ineffective_recovery'] = dict(incident_ids=failed)
         return facts
 
-    def reconcile(self, task, facts, now, cfg, budget, deadline_id=None):
+    def defer_notices(self, incident_ids):
+        with self.transaction():
+            rows = self.db.execute('SELECT incident_id,notice_count FROM incidents WHERE incident_id IN ({})'.format(','.join('?' * len(incident_ids))), incident_ids).fetchall()
+            if len(rows) != len(set(incident_ids)) or any(row['notice_count'] < 1 for row in rows):
+                fail('incident_id', effects='unknown')
+            self.db.executemany('UPDATE incidents SET notice_count=notice_count-1,next_notice_at=last_seen WHERE incident_id=?', [(row['incident_id'],) for row in rows])
+
+    def reconcile(self, task, facts, now, cfg, budget, deadline_id=None, *, unknown=()):
         entity = ['deadline', deadline_id] if deadline_id else ['task', task['board_id'], task['task_id']]
         prefix = digest(entity)
         rows = [dict(r) for r in self.db.execute('SELECT * FROM incidents WHERE fingerprint LIKE ? ORDER BY episode', (prefix + ':%',))]
         latest = {r['detector']: r for r in rows}
         transitions, notices = 0, []
-        for detector in sorted(set(latest) | set(facts)):
+        for detector in sorted((set(latest) | set(facts)).difference(unknown)):
             if transitions >= budget:
                 break
             old, detail = latest.get(detector), facts.get(detector)
@@ -658,11 +668,14 @@ class Monitor:
             prior = json.loads(old['explanation_json'])
             rising = detail.get('level', 0) > prior['facts'].get('level', 0)
             due = old['next_notice_at'] and instant(old['next_notice_at']) <= now
-            if old['notice_count'] < cfg['watchdog_notice_limit'] and (due or rising):
-                count = old['notice_count'] + 1
+            count = old['notice_count']
+            if count < cfg['watchdog_notice_limit'] and (due or rising):
+                count += 1
                 next_at = stamp(now + timedelta(seconds=min(3600, 300 * 2 ** (count - 1))))
-                self.db.execute('UPDATE incidents SET notice_count=?,next_notice_at=? WHERE incident_id=?', (count, next_at, old['incident_id']))
                 notices.append(dict(incident_id=old['incident_id'], detector=detector, emission='unknown_after_commit',
                                     next_action='Inspect watchdog plans; preserve verification and permissions.'))
-            self.db.execute('UPDATE incidents SET last_seen=?,explanation_json=? WHERE incident_id=?', (stamp(now), _json(explanation), old['incident_id']))
+            else:
+                next_at = old['next_notice_at']
+            self.db.execute('UPDATE incidents SET last_seen=?,notice_count=?,next_notice_at=?,explanation_json=? WHERE incident_id=?',
+                            (stamp(now), count, next_at, _json(explanation), old['incident_id']))
         return transitions, notices
