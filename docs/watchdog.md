@@ -98,6 +98,12 @@ not prove failed recovery: the detector requires outcomes tied to an incident.
 | `ineffective_recovery` | At least three failed/no-improvement outcomes for the same still-active incident; improvement resets that count |
 
 A verified task closes task incidents. Verified progress closes its current episode.
+For `dependency_cycle`, an incomplete graph leaves the existing incident and plan
+unchanged without sending or consuming a reminder. Once the graph is complete,
+the same episode resumes its reminder schedule if the cycle remains. A complete
+scan with no cycle for the task closes the episode. A later recurrence starts a
+new episode.
+
 For delegated-work unavailability, unknown availability leaves the existing episode
 active without a reminder. If unavailability is observed again, it is still the
 same episode. Only observed recovery (such as explicit availability or verified
@@ -127,9 +133,11 @@ Registration does no I/O. Explicit mutations open write storage; reads open exis
 storage read-only. SQLite can maintain WAL coordination files for an existing DB.
 
 Ticks process at most 500 tasks and 500 deadlines per page, 100 incident transitions,
-and a 10000-node/50000-edge graph. Incomplete graph coverage never proves a missing
-dependency. Cursor and coverage expose incomplete scans. Evaluation has cooperative
-25/28-second checkpoints and a 100 ms SQLite busy wait; hardware/filesystem stalls
+and a 10000-node/50000-edge graph. Exceeding either graph cap reports
+`coverage.graph_complete: false` in health. An incomplete graph cannot establish
+that a cycle has cleared or that a dependency is missing. Cursor and coverage
+expose incomplete scans. Evaluation has cooperative 25/28-second checkpoints
+and a 100 ms SQLite busy wait; hardware/filesystem stalls
 are not a hard real-time guarantee. Selection is capped at 40 before notice
 accounting, inside the tick transaction. Incidents beyond that cap keep their next
 reminder due instead of consuming it.

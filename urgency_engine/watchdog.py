@@ -497,6 +497,8 @@ class Monitor:
                 if task['status'] == 'verified' or changed:
                     facts = {}
                 else:
+                    if not graph_complete:
+                        unknown.add('dependency_cycle')
                     if signal.get('agent_available') is None:
                         unknown.add('delegated_work_unavailable')
                     if 'dependency_unreachable' not in facts and signal.get('dependency_state') != 'available':

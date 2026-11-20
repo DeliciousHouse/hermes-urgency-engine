@@ -296,6 +296,81 @@ class WatchdogTests(unittest.TestCase):
             monitor.control('resume', 'resume', 'fixture')
         self.assertEqual(len(self.tick()['notices']), 1)
 
+    def assert_cycle_survives_graph_limit(self, node_count, links):
+        self_edge = [['board', 'task']]
+        cfg = {**DEFAULTS, 'watchdog_max_rows': 100000}
+
+        def tick(graph_complete):
+            with self.monitor() as monitor:
+                result = monitor.tick(self.ledger_path, cfg, force=True)
+                self.assertTrue(result['evaluated'])
+                self.assertIs(monitor.health()['coverage']['graph_complete'], graph_complete)
+                self.assertEqual(result['omitted'], 0)
+                return result['notices']
+
+        def cycle_state():
+            with self.monitor(True) as monitor:
+                incidents = sorted((i for i in monitor.page('incidents')['items']
+                                    if i['detector'] == 'dependency_cycle'), key=lambda i: i['episode'])
+                plans = {p['incident_id']: p for p in monitor.page('plans')['items']}
+                return [(i, plans[i['incident_id']]) for i in incidents]
+
+        self.observe({'dependencies': self_edge, 'checkpoint_at': self.now.isoformat()})
+        first, = tick(True)
+        self.assertEqual(first['detector'], 'dependency_cycle')
+        incident_id = first['incident_id']
+        original, = cycle_state()
+        self.assertEqual((original[0]['episode'], original[0]['state'], original[0]['notice_count'],
+                          original[1]['state']), (1, 'active', 1, 'recommended'))
+
+        # Add valid graph endpoints in bulk, without making the fixture exercise ingestion.
+        nodes = [f'z{n:05d}' for n in range(node_count)]
+        with self.ledger() as ledger, ledger.connection:
+            db = ledger.connection
+            columns = [r[1] for r in db.execute('PRAGMA table_info(tasks)')]
+            row = list(db.execute('SELECT * FROM tasks').fetchone())
+            pos = columns.index('task_id')
+            db.executemany('INSERT INTO tasks VALUES(' + ','.join('?' for _ in row) + ')',
+                           (row[:pos] + [node] + row[pos + 1:] for node in nodes))
+        with self.monitor() as monitor, monitor.transaction():
+            monitor.db.executemany('INSERT INTO dependencies VALUES(?,?,?,?)',
+                                   (('board', src, 'board', dst) for src, dst in links(nodes)))
+        self.now += timedelta(seconds=300)
+        self.assertEqual([n['detector'] for n in tick(False)], ['missed_checkpoint'])
+        self.assertEqual(cycle_state(), [original], 'Incomplete graph changed the active cycle episode')
+
+        with self.monitor() as monitor, monitor.transaction():
+            monitor.db.execute("DELETE FROM dependencies WHERE task_id LIKE 'z%'")
+            monitor.put('cursor', None)  # Revisit the original task immediately after the capped page.
+        self.observe({'checkpoint_at': None}, event='clear-checkpoint')
+        self.assertEqual([n['incident_id'] for n in tick(True)], [incident_id])
+        renewed, = cycle_state()
+        self.assertEqual((renewed[0]['incident_id'], renewed[0]['notice_count'], renewed[1]),
+                         (incident_id, 2, original[1]))
+        self.assertNotEqual(renewed[0]['last_seen'], original[0]['last_seen'])
+
+        self.observe({'dependencies': []}, event='clear-cycle')
+        with self.monitor() as monitor, monitor.transaction():
+            monitor.put('cursor', None)
+        self.assertEqual(tick(True), [])
+        resolved, = cycle_state()
+        self.assertEqual((resolved[0]['incident_id'], resolved[0]['state'], resolved[1]['state']),
+                         (incident_id, 'resolved', 'resolved'))
+
+        self.observe({'dependencies': self_edge}, event='recurrence')
+        with self.monitor() as monitor, monitor.transaction():
+            monitor.put('cursor', None)
+        recurrence, = tick(True)
+        self.assertNotEqual(recurrence['incident_id'], incident_id)
+        self.assertEqual([(i['episode'], i['state'], p['state']) for i, p in cycle_state()],
+                         [(1, 'resolved', 'resolved'), (2, 'active', 'recommended')])
+
+    def test_cycle_episode_survives_node_cap(self):
+        self.assert_cycle_survives_graph_limit(10000, lambda nodes: ((node, 'task') for node in nodes))
+
+    def test_cycle_episode_survives_edge_cap(self):
+        self.assert_cycle_survives_graph_limit(224, lambda nodes: ((a, b) for a in nodes for b in nodes))
+
     def test_cycles_recovery_forecast_and_episode_backoff(self):
         self.observe({'dependencies': [['board', 'task']], 'agent_available': False})
         self.tick()
