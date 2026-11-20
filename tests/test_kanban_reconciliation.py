@@ -52,6 +52,48 @@ class ReconciliationTests(unittest.TestCase):
         return self.sync.scan(self.cfg, self.ledger, None, self.root / 'data.db',
                               self.source, request_id=identity, reason='Fixture')
 
+    def test_process_owner_death_releases_lock_without_erasing_pending_scan(self):
+        """protects=single owner/crash recovery; fails_when=parallel owner enters;
+        why_new=real process death; seam=disposable store/OS lock; no_claim=worker recovery execution.
+        """
+        import subprocess
+        import sys
+        import time
+        code = '''
+import sqlite3, sys
+from datetime import datetime, timezone
+from pathlib import Path
+from urgency_engine.kanban import Sync
+with Sync(sqlite3.connect(sys.argv[1]), clock=lambda: datetime.now(timezone.utc), redact=str) as sync:
+    with sync.owner():
+        with sync.transaction():
+            sync.put('incomplete_scan', 'process-owned')
+        Path(sys.argv[2]).write_text('locked')
+        sys.stdin.read()
+'''
+        marker = self.root / 'locked'
+        child = subprocess.Popen([sys.executable, '-c', code, str(self.root / 'kanban.db'), str(marker)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 10
+            while not marker.exists() and child.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(marker.exists(), 'child did not acquire lock')
+            with self.assertRaises(LedgerError) as caught:
+                with self.sync.owner():
+                    self.fail('second process entered owned scan')
+            self.assertEqual(caught.exception.code, 'STORE_BUSY')
+            child.kill()
+            child.communicate(timeout=10)
+            self.assertNotEqual(child.returncode, 0)
+            with self.sync.owner():
+                self.assertEqual(self.sync.meta('incomplete_scan'), 'process-owned')
+            self.assertEqual(self.scan('after-death')['state'], 'complete')
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=10)
+
     def test_ten_thousand_sources_finish_after_restart_and_key_churn(self):
         """protects=bounded eventual coverage; fails_when=cursor starves late/new keys;
         why_new=10000 source acceptance; seam=synthetic source/real stores;
@@ -256,10 +298,116 @@ class ReconciliationTests(unittest.TestCase):
             self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
                            self.source, request_id='crash', reason='Fixture')
             observations = monitor.page('observations', project_id='project')['items']
-            self.assertEqual(len(observations), 1)
+            self.assertEqual(len(observations), 2)
+            self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
+                           self.source, request_id='unchanged-after-crash', reason='Fixture')
+            self.assertEqual(len(monitor.page('observations', project_id='project')['items']), 2)
             self.assertEqual(self.ledger.get_task('demo', 'task')['revision'], revision)
             self.assertEqual(self.sync.db.execute(
                 "SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 0)
+
+    def test_graph_commit_crash_replays_original_event_after_clock_advance(self):
+        """protects=graph admission replay; fails_when=retry invents new timestamp;
+        why_new=second-pass crash; seam=real Monitor post-commit fault; no_claim=distributed transaction.
+        """
+        from unittest.mock import patch
+        from urgency_engine.watchdog import Monitor
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
+            original = monitor.observe
+            def crash(event, *args, **kwargs):
+                result = original(event, *args, **kwargs)
+                if event['request_id'].endswith(':mapped'):
+                    raise RuntimeError('after graph commit')
+                return result
+            with patch.object(monitor, 'observe', crash), self.assertRaises(RuntimeError):
+                self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
+                               self.source, request_id='graph-crash', reason='Fixture')
+            before = monitor.page('observations', project_id='project')['items']
+            self.now += timedelta(seconds=60)
+            self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
+                           self.source, request_id='graph-crash', reason='Fixture')
+            self.assertEqual(monitor.page('observations', project_id='project')['items'], before)
+            self.assertEqual(self.sync.meta('graph:["demo","task"]:pending'), None)
+
+    def test_failed_collection_preserves_edges_but_revokes_graph_coverage(self):
+        """protects=failed source is unknown; fails_when=old graph stays available;
+        why_new=partial admission; seam=real stores; no_claim=source recovery.
+        """
+        from urgency_engine.watchdog import Monitor
+        self.source.rows.append(dict(id='parent', tenant='synthetic'))
+        original = self.source.detail
+        def detail(binding, task_id):
+            document = original(binding, task_id)
+            document['parents'] = ['parent'] if task_id == 'task' else []
+            return document
+        self.source.detail = detail
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
+            self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
+                           self.source, request_id='first', reason='Fixture')
+            before = [tuple(row) for row in monitor.db.execute('SELECT * FROM dependencies')]
+            self.source.fail = 'inventory'
+            self.now += timedelta(seconds=60)
+            with self.assertRaises(LedgerError):
+                self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
+                               self.source, request_id='failed', reason='Fixture')
+            self.assertEqual([tuple(row) for row in monitor.db.execute('SELECT * FROM dependencies')], before)
+            self.assertEqual([row[0] for row in monitor.db.execute('SELECT dependency_state FROM task_signals')],
+                             ['unknown', 'unknown'])
+
+    def test_complete_graph_is_admitted_in_both_import_orders(self):
+        """protects=complete mapped edges; fails_when=later parent stays omitted;
+        why_new=two-pass graph; seam=real stores; no_claim=atomic source snapshot.
+        """
+        from urgency_engine.watchdog import Monitor
+        self.source.rows = [dict(id=name, tenant='synthetic') for name in ('a', 'z')]
+        original = self.source.detail
+        edges = {'a': ['z'], 'z': []}
+        def detail(binding, task_id):
+            document = original(binding, task_id)
+            document['parents'] = edges[task_id]
+            return document
+        self.source.detail = detail
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
+            for index, expected in enumerate((('a', 'z'), ('z', 'a'))):
+                self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
+                               self.source, request_id=f'graph{index}', reason='Fixture')
+                actual = [tuple(row) for row in monitor.db.execute(
+                    'SELECT task_id,depends_task FROM dependencies ORDER BY task_id')]
+                self.assertEqual(actual, [expected])
+                states = [row[0] for row in monitor.db.execute('SELECT dependency_state FROM task_signals')]
+                self.assertEqual(states, ['available', 'available'])
+                edges = {'a': [], 'z': ['a']}
+                self.now += timedelta(seconds=60)
+
+    def test_worker_claim_uses_source_times_and_null_removes_coverage(self):
+        """protects=actual claim timing; fails_when=poll time replaces source time;
+        why_new=Monitor claim admission; seam=real stores; no_claim=live worker health.
+        """
+        from urgency_engine.watchdog import Monitor
+        original = self.source.detail
+        present = [True]
+        def detail(binding, task_id):
+            document = original(binding, task_id)
+            if present[0]:
+                document['task'].update(current_run_id=4, started_at=100)
+                document.update(runs=[dict(id=4, status='running', started_at=100)],
+                                events=[dict(kind='heartbeat', run_id=4, created_at=150)])
+            return document
+        self.source.detail = detail
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
+            self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
+                           self.source, request_id='worker', reason='Fixture')
+            row = dict(monitor.db.execute('SELECT * FROM task_signals').fetchone())
+            self.assertEqual(row['claim_at'], kanban.timestamp(100))
+            self.assertEqual(row['heartbeat_at'], kanban.timestamp(150))
+            present[0] = False
+            self.now += timedelta(seconds=60)
+            self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
+                           self.source, request_id='absent-worker', reason='Fixture')
+            row = dict(monitor.db.execute('SELECT * FROM task_signals').fetchone())
+            self.assertIsNone(row['claim_at'])
+            self.assertIsNone(row['heartbeat_at'])
+            self.assertIsNone(row['agent_available'])
 
     def test_external_parent_stays_unknown_and_current_worker_is_admitted(self):
         """protects=mapped facts only; fails_when=missing parent becomes unreachable;
@@ -284,7 +432,7 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(result['state'], 'complete')
         with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now, readonly=True) as monitor:
             signal = monitor.page('observations', project_id='project')['items']
-        self.assertTrue(any(item['kind'] == 'task_signal' and item['payload']['data']['dependency_state'] == 'unknown' for item in signal))
+        self.assertTrue(any(item['kind'] == 'task_signal' and item['payload']['data'].get('dependency_state') == 'unknown' for item in signal))
 
 
 if __name__ == '__main__':

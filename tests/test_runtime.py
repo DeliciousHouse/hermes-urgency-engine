@@ -62,6 +62,32 @@ class RuntimeTests(unittest.TestCase):
     def project(self, name='p'):
         return self.request('create_project', project_id=name, title='Objective SYNTHETIC_SECRET', request_id=name)
 
+    def test_cached_tasks_show_age_and_exclude_removed_bindings_without_writes(self):
+        """protects=scoped fresh reads; fails_when=stale/rebound source looks current;
+        why_new=cached projection boundary; seam=real stores; no_claim=live source read.
+        """
+        from datetime import timedelta
+        from urgency_engine.kanban import Sync
+        from test_kanban_reconciliation import Source
+        self.project()
+        binding = dict(board='demo', tenant='synthetic', project_id='p')
+        self.ctx.settings.update(kanban_sync_enabled=True, kanban_bindings=[binding])
+        with Sync(sqlite3.connect(self.root / 'kanban.db'), clock=lambda: self.now, redact=str) as sync:
+            with self.runtime.open(self.runtime.settings()) as ledger:
+                sync.scan(self.runtime.kanban_config(), ledger, None, self.root / 'data.db',
+                          Source(), request_id='seed', reason='Fixture')
+        before = (self.root / 'kanban.db').read_bytes()
+        item = self.runtime.kanban_read('tasks', dict(project_id='p'))['items'][0]
+        self.assertEqual(item['age_seconds'], 0)
+        self.assertFalse(item['stale'])
+        self.now += timedelta(days=1)
+        item = self.runtime.kanban_read('tasks', dict(project_id='p'))['items'][0]
+        self.assertTrue(item['stale'])
+        self.assertEqual(item['coverage'], 'unknown')
+        self.ctx.settings['kanban_bindings'] = []
+        self.assertEqual(self.runtime.kanban_read('tasks', dict(project_id='p'))['items'], [])
+        self.assertEqual((self.root / 'kanban.db').read_bytes(), before)
+
     def test_lifecycle_hints_are_opt_in_coalesced_and_never_source_facts(self):
         """protects=hint-only callbacks; fails_when=hook collects or refreshes heartbeat;
         why_new=lifecycle integration; seam=registered callbacks/real store; no_claim=host dispatch.

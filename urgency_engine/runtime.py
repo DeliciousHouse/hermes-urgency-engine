@@ -432,7 +432,7 @@ class Runtime:
         connection = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=.1)
         with Sync(connection, clock=self.clock, redact=lambda text: self.ctx.redact_text(text, force=True), readonly=True) as sync:
             if operation == 'tasks':
-                return sync.page(**arguments)
+                return sync.page(**arguments, cfg=cfg)
             with sync.transaction(False):
                 last_success = sync.meta('last_success')
                 age = ((self.clock() - datetime.fromisoformat(last_success)).total_seconds()

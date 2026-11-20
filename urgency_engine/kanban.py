@@ -270,7 +270,7 @@ class Sync:
     def put(self, key, value):
         self.db.execute('INSERT INTO sync_meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json', (key, _json(value)))
 
-    def page(self, project_id, limit=100, after=None):
+    def page(self, project_id, limit=100, after=None, *, cfg=None):
         _id(project_id, 'project_id')
         _integer(limit, 'limit', 1, 500)
         if after is None:
@@ -284,9 +284,21 @@ class Sync:
                     _id(part, 'after')
             except (ValueError, TypeError):
                 fail('after', 'INVALID_INPUT')
+        scope, parameters = '', []
+        if cfg is not None:
+            cfg = settings(cfg)
+            bindings = [b for b in cfg['kanban_bindings'] if b['project_id'] == project_id]
+            scope = ' AND (' + (' OR '.join('(board_id=? AND tenant=?)' for _ in bindings) or '0') + ')'
+            parameters = [value for b in bindings for value in (b['board'], b['tenant'])]
         with self.transaction(False):
-            rows = self.db.execute('SELECT projection_json FROM sources WHERE project_id=? AND (board_id,task_id)>(?,?) ORDER BY board_id,task_id LIMIT ?', (project_id, *key, limit + 1)).fetchall()
+            rows = self.db.execute('SELECT projection_json FROM sources WHERE project_id=? AND (board_id,task_id)>(?,?)' + scope + ' ORDER BY board_id,task_id LIMIT ?', (project_id, *key, *parameters, limit + 1)).fetchall()
         items = [json.loads(r[0]) for r in rows[:limit]]
+        if cfg is not None:
+            for item in items:
+                age = (self.clock() - datetime.fromisoformat(item['observed_at'])).total_seconds()
+                item.update(age_seconds=age, stale=age < 0 or age > cfg['kanban_sync_seconds'])
+                if item['stale']:
+                    item['coverage'] = 'unknown'
         more = len(rows) > limit
         after = _json([items[-1]['board_id'], items[-1]['task_id']]).encode().hex() if more else None
         return dict(items=items, has_more=more, next=after)
@@ -374,11 +386,14 @@ class Sync:
                 code = exc.code if isinstance(exc, LedgerError) else 'SOURCE_ERROR'
                 with self.transaction():
                     self.put('last_error', code)
-                    for row in self.db.execute('SELECT board_id,task_id,projection_json FROM sources').fetchall():
+                    for row in (self.db.execute('SELECT board_id,task_id,projection_json FROM sources').fetchall()
+                                if isinstance(exc, LedgerError) else []):
                         projection = json.loads(row['projection_json'])
                         projection['coverage'] = 'unknown'
                         self.db.execute('UPDATE sources SET coverage=?,projection_json=? WHERE board_id=? AND task_id=?',
                                         ('unknown', _json(projection), row['board_id'], row['task_id']))
+                if code.startswith('SOURCE_') and code != 'SOURCE_ERROR':
+                    self.admit_graph(cfg, monitor, set(), ledger_path)
                 raise
             with self.transaction():
                 self.put('incomplete_scan', None)
@@ -494,9 +509,51 @@ class Sync:
                 with self.transaction():
                     self.put('cursor', position)
                 count += 1
+        self.admit_graph(cfg, monitor, seen, ledger_path)
         with self.transaction():
             self.put('cursor', None)
         return dict(state='complete', count=count)
+
+    def admit_graph(self, cfg, monitor, inventory, ledger_path):
+        if monitor is None:
+            return
+        bindings = {(b['board'], b['tenant'], b['project_id']) for b in cfg['kanban_bindings']}
+        rows = [json.loads(row[0]) for row in self.db.execute('SELECT projection_json FROM sources')]
+        scoped = {(p['board_id'], p['task_id']): p for p in rows
+                  if (p['board_id'], p['tenant'], p['project_id']) in bindings}
+        mapped = {key: p for key, p in scoped.items()
+                  if key in inventory and p['coverage'] != 'unknown'}
+        if sum(len(p['parents']) for p in mapped.values()) > 50000:
+            fail('edges', 'SOURCE_LIMIT')
+        complete = len(mapped) == len(inventory)
+        for key, projection in sorted(scoped.items()):
+            parents = [(key[0], parent) for parent in projection['parents']]
+            known = complete and key in mapped and all(parent in mapped and mapped[parent]['project_id'] == projection['project_id']
+                                     for parent in parents)
+            data: dict = dict(dependency_state='available' if known else 'unknown')
+            if known:
+                data['dependencies'] = [list(parent) for parent in parents]
+            cache_key = 'graph:' + _json(list(key))
+            saved = self.meta(cache_key)
+            if saved and saved['data'] == data:
+                continue
+            # Persist the complete event before admission: a crash must replay the
+            # exact timestamp and request, not rebuild it from the next poll.
+            pending_key = cache_key + ':pending'
+            event = self.meta(pending_key)
+            if event is None:
+                identity = hashlib.sha256(_json([key, data, self.clock().isoformat(), saved]).encode()).hexdigest()
+                event = dict(request_id=identity + ':mapped', project_id=projection['project_id'],
+                    board_id=key[0], task_id=key[1], kind='task_signal', occurred_at=self.clock().isoformat(),
+                    reason='Mapped canonical dependency coverage', data=data)
+                with self.transaction():
+                    self.put(pending_key, event)
+            monitor.observe(event, Path(ledger_path), source='kanban-sync')
+            with self.transaction():
+                self.put(cache_key, dict(data=event['data']))
+                self.put(pending_key, None)
+            if event['data'] != data:
+                fail('graph', 'SOURCE_STALE')
 
     def mark_unknown(self, key, code):
         with self.transaction():
@@ -513,23 +570,16 @@ class Sync:
     def admit_facts(self, ledger, monitor, projection, identity):
         if monitor is None:
             return
-        parents = []
-        for parent in projection['parents']:
-            try:
-                task = ledger.get_task(projection['board_id'], parent)
-            except LedgerError as exc:
-                if exc.code != 'NOT_FOUND':
-                    raise
-                task = None
-            if task and task['project_id'] == projection['project_id']:
-                parents.append([projection['board_id'], parent])
         occurred = projection['source_updated_at'] or projection['observed_at']
+        worker = projection['worker']
+        active = worker['state'] == 'running' and projection['status'] == 'running'
         monitor.observe(dict(request_id=identity + ':graph', project_id=projection['project_id'],
             board_id=projection['board_id'], task_id=projection['task_id'], kind='task_signal',
-            occurred_at=occurred, reason='Canonical dependency facts',
-            data=dict(dependency_state='unknown', dependencies=parents)),
+            occurred_at=occurred, reason='Canonical current worker timestamps',
+            data=dict(claim_at=worker['started_at'] if active else None,
+                      heartbeat_at=worker['heartbeat_at'] if active else None,
+                      agent_available=True if active else None)),
             Path(self.meta('ledger_path')), source='kanban-sync')
-        worker = projection['worker']
         if worker['run_id'] and worker['state'] in ('running', 'failed', 'exhausted', 'unavailable'):
             monitor.observe(dict(request_id=identity + ':worker', project_id=projection['project_id'],
                 board_id=projection['board_id'], task_id=projection['task_id'], kind='worker_outcome',
