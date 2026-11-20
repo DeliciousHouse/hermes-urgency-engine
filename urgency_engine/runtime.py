@@ -472,7 +472,9 @@ class Runtime:
                     elif operation == 'tick':
                         if not (cfg['watchdog_enabled'] or (monitor.meta('install') or {}).get('state') == 'installed'):
                             return 0
-                        data = monitor.tick(self.data_dir() / 'data.db', cfg, args.force)
+                        data = self.due_source_sync(monitor)
+                        if data is None:
+                            data = monitor.tick(self.data_dir() / 'data.db', cfg, args.force)
                         if not data['notices']:
                             return 0
                         # Records retain full details; one bounded summary goes to cron.
@@ -491,6 +493,23 @@ class Runtime:
         ok = json.loads(rendered)['ok']
         print(rendered, file=sys.stdout if ok else sys.stderr)
         return 0 if ok else 1
+
+    def due_source_sync(self, monitor):
+        cfg = self.kanban_config()
+        if not cfg['kanban_sync_enabled'] or not cfg['kanban_bindings']:
+            return None
+        with Sync.host(clock=self.clock, redact=lambda text: self.ctx.redact_text(text, force=True)) as sync:
+            if sync.meta('paused', False):
+                return None
+            last = sync.meta('last_attempt')
+            if last and (self.clock() - datetime.fromisoformat(last)).total_seconds() < cfg['kanban_sync_seconds']:
+                return None
+            with sync.transaction():
+                sync.put('last_attempt', self.clock().isoformat())
+            with self.open(self.settings()) as ledger:
+                result = sync.scan(cfg, ledger, monitor, self.data_dir() / 'data.db', NativeSource(),
+                                   request_id=uuid.uuid4().hex, reason='Existing watchdog tick')
+        return None if result['state'] == 'complete' else dict(notices=[], omitted=0, source=result)
 
     def cron(self, action, **arguments):
         # Plugin CLI commands do not otherwise initialize built-in tool discovery.

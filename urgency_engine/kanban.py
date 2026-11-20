@@ -7,6 +7,7 @@ import re
 import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import NoReturn
 
 from contextlib import contextmanager
@@ -384,7 +385,7 @@ class Sync:
             plan = json.loads(row['result_json'])
             if plan['binding'] != fingerprint:
                 fail('binding', 'SCOPE_CONFLICT')
-            self.apply_plan(row['request_id'], plan, ledger)
+            self.apply_plan(row['request_id'], plan, ledger, monitor)
         cursor = self.meta('cursor')
         processed = 0
         total = 0
@@ -408,7 +409,12 @@ class Sync:
                     if exc.code != 'NOT_FOUND':
                         raise
                     task = None
-                projection = project(source.detail(binding, task_id), binding, self.clock(), self.redact)
+                try:
+                    document = source.detail(binding, task_id)
+                except LedgerError as exc:
+                    self.mark_unknown(key, exc.code)
+                    raise
+                projection = project(document, binding, self.clock(), self.redact)
                 processed += 1
                 if projection['task_id'] != task_id:
                     fail('task_id', 'SCOPE_CONFLICT')
@@ -416,10 +422,15 @@ class Sync:
                 existing = self.db.execute('SELECT * FROM sources WHERE board_id=? AND task_id=?', key).fetchone()
                 if existing and existing['source_digest'] == projection['source_digest']:
                     with self.transaction():
+                        projection['coverage'] = existing['coverage']
+                        self.db.execute('UPDATE sources SET observed_at=?,projection_json=? WHERE board_id=? AND task_id=?',
+                                        (projection['observed_at'], _json(projection), *key))
                         self.put('cursor', position)
                     continue
                 if task and task['project_id'] != binding['project_id']:
                     fail('project_id', 'SCOPE_CONFLICT')
+                if task and task['status'] == 'verified' and projection['status'] not in ('done', 'archived') and not existing:
+                    fail('status', 'STATE_CONFLICT')
                 identity = hashlib.sha256(_json([request_id, key, projection['source_digest']]).encode()).hexdigest()
                 arguments = dict(board_id=key[0], task_id=key[1], project_id=binding['project_id'], goal=projection['title'],
                     assignee=projection['assignee'], status='running' if projection['status'] == 'running' else
@@ -439,7 +450,7 @@ class Sync:
                 with self.transaction():
                     self.db.execute('INSERT INTO sync_requests VALUES(?,?,?,?)',
                                     (identity, hashlib.sha256(_json(plan).encode()).hexdigest(), 'pending', _json(plan)))
-                self.apply_plan(identity, plan, ledger)
+                self.apply_plan(identity, plan, ledger, monitor)
                 with self.transaction():
                     self.put('cursor', position)
                 count += 1
@@ -447,7 +458,46 @@ class Sync:
             self.put('cursor', None)
         return dict(state='complete', count=count)
 
-    def apply_plan(self, identity, plan, ledger):
+    def mark_unknown(self, key, code):
+        with self.transaction():
+            row = self.db.execute('SELECT projection_json FROM sources WHERE board_id=? AND task_id=?', key).fetchone()
+            if not row:
+                return
+            projection = json.loads(row[0])
+            projection['coverage'] = 'unknown'
+            self.db.execute('UPDATE sources SET coverage=?,projection_json=? WHERE board_id=? AND task_id=?',
+                            ('unknown', _json(projection), *key))
+            self.db.execute('INSERT INTO sync_events(occurred_at,board_id,task_id,kind,detail_json) VALUES(?,?,?,?,?)',
+                            (self.clock().isoformat(), *key, 'source_error', _json(dict(code=code))))
+
+    def admit_facts(self, ledger, monitor, projection, identity):
+        if monitor is None:
+            return
+        parents = []
+        for parent in projection['parents']:
+            try:
+                task = ledger.get_task(projection['board_id'], parent)
+            except LedgerError as exc:
+                if exc.code != 'NOT_FOUND':
+                    raise
+                task = None
+            if task and task['project_id'] == projection['project_id']:
+                parents.append([projection['board_id'], parent])
+        occurred = projection['source_updated_at'] or projection['observed_at']
+        monitor.observe(dict(request_id=identity + ':graph', project_id=projection['project_id'],
+            board_id=projection['board_id'], task_id=projection['task_id'], kind='task_signal',
+            occurred_at=occurred, reason='Canonical dependency facts',
+            data=dict(dependency_state='unknown', dependencies=parents)),
+            Path(self.meta('ledger_path')), source='kanban-sync')
+        worker = projection['worker']
+        if worker['run_id'] and worker['state'] in ('running', 'failed', 'exhausted', 'unavailable'):
+            monitor.observe(dict(request_id=identity + ':worker', project_id=projection['project_id'],
+                board_id=projection['board_id'], task_id=projection['task_id'], kind='worker_outcome',
+                occurred_at=worker['heartbeat_at'] or worker['started_at'] or occurred,
+                reason='Canonical current worker', data=dict(state=worker['state'])),
+                Path(self.meta('ledger_path')), source='kanban-sync')
+
+    def apply_plan(self, identity, plan, ledger, monitor=None):
         projection = plan['projection']
         key = projection['board_id'], projection['task_id']
         if plan.get('reopen'):
@@ -463,5 +513,7 @@ class Sync:
                  projection['source_digest'], projection['status'], projection['assignee'],
                  projection['title'], projection['observed_at'], projection['coverage'], _json(projection), projection['source_digest']))
             self.db.execute("UPDATE sync_requests SET state='applied' WHERE request_id=?", (identity,))
+            self.put('ledger_path', str(ledger.connection.execute('PRAGMA database_list').fetchone()[2]))
+        self.admit_facts(ledger, monitor, projection, identity)
 
 
