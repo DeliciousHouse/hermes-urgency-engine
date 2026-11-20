@@ -1,6 +1,6 @@
 # Durable deadline and progress ledger
 
-Keep original commitments, revised targets and verified progress in one local SQLite database. This page describes the Python library; the [native plugin adapter](runtime.md) supplies CLI, slash/tool queries and advisory runtime hooks. Neither supplies a scheduler, Kanban synchronization, Desktop page or release integration.
+Keep original commitments, revised targets and verified progress in one local SQLite database. This page describes the Python library; the [native plugin adapter](runtime.md) supplies CLI, slash/tool queries and advisory runtime hooks. The native adapter also offers opt-in [Kanban synchronization](kanban.md); neither supplies a scheduler, Desktop page or release integration.
 
 - [Reference](#reference)
 - [Why commitments and evidence are separate](#why-commitments-and-evidence-are-separate)
@@ -109,6 +109,28 @@ Criteria are lists of **exactly** these keys:
 
 Weights must be positive; numeric durations must be nonnegative. Numbers are finite int/float, not bool, and at most `1e12`. Identifiers are 1–128 characters, with no path separators or control characters. Ordinary text is nonempty, at most 4096 characters, with no NUL or unpaired Unicode surrogate. Assignee uses identifier limits. Commands, after canonical JSON serialization, are capped at 256 KiB. Supported capacity is 10,000 tasks per project and 100 active criteria per task; excess produces `INVALID_INPUT` (task capacity field `tasks_capacity`). Queries use project, active-criterion, evidence and audit indexes. The ledger imposes no automatic audit retention; disk use grows with history.
 
+### Unknown remaining work and incomplete scope
+
+`upsert_task(..., remaining_seconds=None)` explicitly records unknown work. JSON
+operator requests use `null`. Reads return `remaining_seconds: null` and
+`remaining_known: false`; numeric zero remains known zero. Omitting the argument
+still defaults to known zero for legacy callers. Verification, deployment and
+actual durations still require finite nonnegative numbers. Canonical imports
+explicitly supply unknown work and preserve any later local estimate.
+
+If any scoped task has unknown work, or deadline scope is empty, forecast work,
+slack, projected completion and probability are null. Confidence is
+`insufficient_evidence`. Urgency is at least elevated, imminent near the target,
+and overdue after it; an existing higher level is not downgraded. Numeric samples
+cannot replace the absent estimate. Variance remains null unless actual verified
+completion supplies a comparison. Historical numeric snapshots remain historical
+evidence, not a current estimate.
+
+A project containing a task with no active criteria returns `percent: null`,
+`state: insufficient_evidence`, and an `unscoped_task_count`. It never treats an
+imported unscoped task as zero-weight completed work. Recorded baseline, current
+weight and verified weight remain visible and are not rewritten.
+
 ### Dates and evidence
 
 `kind` is `hard` or `soft`. `at` is RFC3339 with seconds and an explicit `Z` or `±HH:MM` offset, optionally 1–6 fractional digits. `timezone` is a valid IANA name. Its offset and wall time must agree with the timestamp at that instant. Spring-forward gaps and naive dates are rejected; a fall-back fold must specify one of the two valid offsets. Storage is normalized to UTC; named display timezone is retained.
@@ -119,7 +141,18 @@ An artifact name is a forward-slash relative path below the configured root. Abs
 
 Evidence proves **byte identity at verification time only**. It does not prove tests passed, code is correct, or a deployment is live. It does not monitor later file edits/deletions; accepted historical evidence remains until explicit reopen/scope replacement. The ledger never executes artifacts or fetches URLs. Files are not required to stay present for exact request replay. All active criteria must have evidence for task `actual_verified_at`; clock time alone never sets it.
 
-### Schema version 1
+### Schema versions 1 and 2
+
+Schema 2 adds `tasks.remaining_known INTEGER NOT NULL DEFAULT 1` constrained to
+0 or 1. Existing schema-1 durations retain their known meaning. Unknown work is
+stored as numeric zero plus flag 0, but public reads, new audit payloads and new
+forecasts project it as null. Never read the numeric compatibility column alone.
+Read-only opens accept schema 1 without migration. A write-open validates the
+schema and integrity before atomically adding the column and advancing the
+version; failure rolls back both. Historical audit and replay responses are not
+rewritten. Schema-1-only code refuses schema 2: rollback needs compatible code
+or a consistent pre-upgrade backup, not a forced version-number downgrade.
+
 
 ```text
 projects --< tasks --< criteria(revisions) --< evidence
@@ -145,7 +178,7 @@ Every successful mutation --> audit + operations (same transaction)
 | `operations` | `request_id` PK; payload_sha256, response_json |
 | `audit` | `sequence` PK; request_id, entity_type, entity_id, action, actor, reason, occurred_at, before_json, after_json |
 
-Initialization uses `PRAGMA user_version=1`, foreign keys and atomic `BEGIN IMMEDIATE`; mutation also uses `BEGIN IMMEDIATE` with a configurable busy timeout (5000 ms by default) and rollback on failure. Reads use `BEGIN`. A nonempty unknown database, future version, incomplete layout or failed integrity check is refused without repair/deletion. One active criterion per ID, one accepted evidence record per criterion revision, and one baseline per project are enforced by unique indexes. Internal bounded snapshots contain summaries, up to 100 criteria for scope changes, or at most 10,000 task revision tuples for forecasts. Retained audit JSON records and historical criteria allow reconstruction; do not delete history independently.
+New storage uses `PRAGMA user_version=2`, foreign keys and atomic `BEGIN IMMEDIATE`; mutation also uses `BEGIN IMMEDIATE` with a configurable busy timeout (5000 ms by default) and rollback on failure. Reads use `BEGIN`. A nonempty unknown database, future version, incomplete layout or failed integrity check is refused without repair/deletion. One active criterion per ID, one accepted evidence record per criterion revision, and one baseline per project are enforced by unique indexes. Internal bounded snapshots contain summaries, up to 100 criteria for scope changes, or at most 10,000 task revision tuples for forecasts. Retained audit JSON records and historical criteria allow reconstruction; do not delete history independently.
 
 ### Errors
 

@@ -76,8 +76,9 @@ without a board correlation. Such records never cause task failure incidents.
 The native `post_tool_call` observer recognizes structured `ok`/`success` booleans
 and errors; ambiguous output is unknown. It never stores tool arguments, results,
 prompts or exception text. Host session identity is not a Kanban task ID.
-This slice has no automatic Kanban lifecycle adapter: use explicit observations;
-missing worker/dependency telemetry stays unknown. Explicit availability/dependency
+Optional [Kanban synchronization](kanban.md) admits canonical worker/dependency
+facts on the existing tick. Lifecycle hooks only mark dirty bindings; missing
+worker/dependency telemetry stays unknown. Explicit availability/dependency
 facts retain their own observation time; unrelated telemetry does not refresh it.
 Compact admitted evidence watermarks survive raw-event pruning. Retention expiry
 makes current source coverage unknown; historical incident facts remain unchanged.
@@ -185,7 +186,7 @@ models, delegate, reclaim tasks, extend deadlines, remove criteria or spend mone
 ### Storage and bounds
 
 `plugin_db('hermes-urgency-engine', 'watchdog.db')` owns monitor schema 1 separately
-from unchanged ledger `data.db` schema 1. Tables: `monitor_meta` (cursor, generation,
+from ledger `data.db` schema 1/2 and optional source `kanban.db` schema 1. Tables: `monitor_meta` (cursor, generation,
 install/scan/forecast state, compact admitted source watermarks and pruned episode counters), `observations` (typed events), `task_signals`
 (current sparse metadata), `dependencies` (edges), `incidents` (episodes), `plans`
 (recommendations), `monitor_audit` (control/event replay hashes and results).

@@ -52,6 +52,59 @@ class ReconciliationTests(unittest.TestCase):
         return self.sync.scan(self.cfg, self.ledger, None, self.root / 'data.db',
                               self.source, request_id=identity, reason='Fixture')
 
+    def test_replay_capacity_refuses_new_writes_without_pruning_old_requests(self):
+        """protects=bounded durable replay; fails_when=capacity discards pending identities;
+        why_new=protected storage ceiling; seam=real store; no_claim=unlimited operation history.
+        """
+        self.sync.control('pause', 'original', 'Fixture')
+        self.sync.db.executemany('INSERT INTO sync_requests VALUES(?,?,?,?)',
+                                [(f'pending{i}', 'digest', 'pending', '{}') for i in range(49999)])
+        self.sync.db.commit()
+        with self.assertRaises(LedgerError) as caught:
+            self.sync.control('resume', 'overflow', 'Fixture')
+        self.assertEqual(caught.exception.code, 'SOURCE_LIMIT')
+        self.assertEqual(caught.exception.field, 'requests_capacity')
+        self.assertTrue(self.sync.meta('paused'))
+        self.assertTrue(self.sync.control('pause', 'original', 'Fixture')['paused'])
+        self.assertEqual(self.sync.db.execute('SELECT count(*) FROM sync_requests').fetchone()[0], 50000)
+        self.assertEqual(self.sync.db.execute("SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 49999)
+
+    def test_source_capacity_refuses_before_ledger_mutation(self):
+        """protects=bounded projection without orphaned local writes; fails_when=20001st source admitted;
+        why_new=store ceiling; seam=real stores with synthetic retained rows; no_claim=source throughput.
+        """
+        import copy
+        self.scan()
+        row = tuple(self.sync.db.execute('SELECT * FROM sources').fetchone())
+        self.sync.db.executemany('INSERT INTO sources VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                [(row[0], f'retained{i}', *row[2:]) for i in range(19999)])
+        self.sync.db.commit()
+        plan = json.loads(self.sync.db.execute("SELECT result_json FROM sync_requests WHERE state='applied'").fetchone()[0])
+        plan = copy.deepcopy(plan)
+        plan['projection']['task_id'] = 'overflow'
+        plan['arguments'].update(task_id='overflow', request_id='overflow:task', expected_revision=0)
+        with self.assertRaises(LedgerError) as caught:
+            self.sync.apply_plan('overflow', plan, self.ledger)
+        self.assertEqual(caught.exception.code, 'SOURCE_LIMIT')
+        self.assertEqual(caught.exception.field, 'sources_capacity')
+        self.assertEqual(len(self.ledger.list_tasks('project')), 1)
+        self.assertEqual(self.sync.db.execute('SELECT count(*) FROM sources').fetchone()[0], 20000)
+
+    def test_event_retention_prunes_age_and_count_without_touching_replay(self):
+        """protects=bounded audit with replay safety; fails_when=old events accumulate;
+        why_new=source retention; seam=real local store; no_claim=production retention timing.
+        """
+        old = (NOW - timedelta(days=31)).isoformat()
+        self.sync.db.executemany('INSERT INTO sync_events(occurred_at,kind,detail_json) VALUES(?,?,?)',
+                                [(old, 'old', '{}')] + [(NOW.isoformat(), 'recent', '{}')] * 10000)
+        self.sync.db.execute('INSERT INTO sync_requests VALUES(?,?,?,?)', ('pending-proof', 'digest', 'pending', '{}'))
+        self.sync.db.commit()
+        self.sync.control('pause', 'pause', 'Fixture')
+        self.assertEqual(self.sync.db.execute('SELECT count(*) FROM sync_events').fetchone()[0], 10000)
+        self.assertEqual(self.sync.db.execute("SELECT count(*) FROM sync_events WHERE kind='old'").fetchone()[0], 0)
+        self.assertEqual(self.sync.db.execute("SELECT result_json FROM sync_requests WHERE request_id='pending-proof'").fetchone()[0], '{}')
+        self.assertTrue(self.sync.control('pause', 'pause', 'Fixture')['paused'])
+
     def test_process_owner_death_releases_lock_without_erasing_pending_scan(self):
         """protects=single owner/crash recovery; fails_when=parallel owner enters;
         why_new=real process death; seam=disposable store/OS lock; no_claim=worker recovery execution.
@@ -353,6 +406,26 @@ with Sync(sqlite3.connect(sys.argv[1]), clock=lambda: datetime.now(timezone.utc)
             self.assertEqual([tuple(row) for row in monitor.db.execute('SELECT * FROM dependencies')], before)
             self.assertEqual([row[0] for row in monitor.db.execute('SELECT dependency_state FROM task_signals')],
                              ['unknown', 'unknown'])
+
+    def test_partial_scan_revokes_previous_complete_graph_until_tail_read(self):
+        """protects=partial graphs cannot certify health; fails_when=old available survives cap;
+        why_new=multi-tick refresh; seam=real stores; no_claim=atomic board snapshot.
+        """
+        from urgency_engine.watchdog import Monitor
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
+            self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
+                           self.source, request_id='small', reason='Fixture')
+            self.assertEqual(monitor.db.execute('SELECT dependency_state FROM task_signals').fetchone()[0], 'available')
+            self.source.rows.extend(dict(id=f'z{i:03d}', tenant='synthetic') for i in range(100))
+            self.now += timedelta(seconds=60)
+            result = self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
+                                    self.source, request_id='partial', reason='Fixture')
+            self.assertEqual(result['state'], 'partial')
+            self.assertEqual(set(row[0] for row in monitor.db.execute('SELECT dependency_state FROM task_signals')), {'unknown'})
+            self.now += timedelta(seconds=60)
+            self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
+                           self.source, request_id='tail', reason='Fixture')
+            self.assertEqual(set(row[0] for row in monitor.db.execute('SELECT dependency_state FROM task_signals')), {'available'})
 
     def test_complete_graph_is_admitted_in_both_import_orders(self):
         """protects=complete mapped edges; fails_when=later parent stays omitted;

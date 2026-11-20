@@ -1,5 +1,5 @@
 """Canonical Kanban facts, not verification or recovery authority."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
@@ -258,6 +258,13 @@ class Sync:
         try:
             self.db.execute('BEGIN IMMEDIATE' if write else 'BEGIN')
             yield
+            if write:
+                if self.db.execute('SELECT count(*) FROM sync_requests').fetchone()[0] > 50000:
+                    fail('requests_capacity', 'SOURCE_LIMIT')
+                self.db.execute('DELETE FROM sync_events WHERE occurred_at < ?',
+                                ((self.clock() - timedelta(days=30)).isoformat(),))
+                self.db.execute('DELETE FROM sync_events WHERE sequence IN '
+                                '(SELECT sequence FROM sync_events ORDER BY sequence DESC LIMIT -1 OFFSET 10000)')
             self.db.commit()
         except BaseException:
             self.db.rollback()
@@ -453,6 +460,7 @@ class Sync:
                 if cursor and position <= cursor:
                     continue
                 if processed == 100:
+                    self.admit_graph(cfg, monitor, set(), ledger_path)
                     return dict(state='partial', count=count, cursor=self.meta('cursor'))
                 key = binding['board'], task_id
                 try:
@@ -590,6 +598,9 @@ class Sync:
     def apply_plan(self, identity, plan, ledger, monitor=None):
         projection = plan['projection']
         key = projection['board_id'], projection['task_id']
+        if (not self.db.execute('SELECT 1 FROM sources WHERE board_id=? AND task_id=?', key).fetchone()
+                and self.db.execute('SELECT count(*) FROM sources').fetchone()[0] >= 20000):
+            fail('sources_capacity', 'SOURCE_LIMIT')
         if plan.get('reopen'):
             ledger.reopen_task(*key, expected_revision=plan['reopen_revision'],
                 request_id=identity + ':reopen', reason='Canonical task reopened', actor='kanban-sync')

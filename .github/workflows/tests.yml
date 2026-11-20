@@ -106,3 +106,9 @@ jobs:
           cp "$scratch/home/config.yaml" "$watchdog_home/config.yaml"
           "${clean[@]}" timeout 8m "$python" "$RUNNER_TEMP/plugin/tests/host_watchdog.py" \
             --hermes-root "$host" --installed-home "$watchdog_home"
+          kanban_home="$scratch/kanban-home"
+          mkdir "$kanban_home"
+          cp -r "$scratch/home/plugins" "$kanban_home/plugins"
+          cp "$scratch/home/config.yaml" "$kanban_home/config.yaml"
+          "${clean[@]}" timeout 8m "$python" "$RUNNER_TEMP/plugin/tests/host_kanban.py" \
+            --installed-home "$kanban_home"

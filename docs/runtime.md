@@ -4,7 +4,8 @@ This development plugin exposes the ledger through `hermes urgency`, `/urgency`
 and the read-only `urgency_query` tool. It adds advisory context before a model
 turn. An opt-in [independent watchdog](watchdog.md) records incidents and recommended
 plans through no-agent cron. It does not interrupt inference or coordinate workers,
-synchronize a board, control external services, or provide a Desktop dashboard.
+control external services, or provide a Desktop dashboard. Optional
+[canonical Kanban synchronization](kanban.md) imports explicitly bound board tasks.
 Byte identity is **not independent semantic quality acceptance**.
 
 ## Reference
@@ -119,8 +120,10 @@ Operator writes create the default artifact directory under
 artifact directories are never created automatically. Artifact paths in requests
 are relative; the ledger rejects escapes and symlinks. SQLite `data.db`, focus
 `state.json`, and diagnostic logs are plugin-owned persistent data, not files in
-the plugin install directory. The existing schema stays at version 1. Audit
-retention is not bounded by diagnostic-log rotation.
+the plugin install directory. Ledger writes atomically upgrade validated schema 1
+to schema 2 for unknown remaining work; reads support both without migration.
+See [schema compatibility](ledger.md#schema-versions-1-and-2). Audit retention is
+not bounded by diagnostic-log rotation.
 
 Focus requires a session ID. It stores a separate full-hash session key, expires
 after 24 hours, and is cleared by session end or reset (including the old session
@@ -181,7 +184,9 @@ surface that supplies a session ID, or configure a deliberate profile default.
 3. Install a reviewed revision, then run `hermes plugins enable hermes-urgency-engine`
    and `hermes urgency diagnose`. Read status/history to reconcile uncertain writes.
 
-Rollback changes plugin code only; this slice adds no schema migration. Do not
+After the first write upgrades the ledger, schema-1-only code cannot read it.
+Keep schema-2-compatible code or restore a consistent pre-upgrade backup while
+writes are stopped; never lower user_version or discard the unknown flag. Do not
 remove plugin-data to fix a load error. For a source checkout, validate only the
 plugin source directory, not a parent containing dependency caches or host copies:
 

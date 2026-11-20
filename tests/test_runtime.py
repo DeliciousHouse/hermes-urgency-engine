@@ -62,6 +62,43 @@ class RuntimeTests(unittest.TestCase):
     def project(self, name='p'):
         return self.request('create_project', project_id=name, title='Objective SYNTHETIC_SECRET', request_id=name)
 
+    def test_guidance_uses_scoped_cached_blockers_and_never_collects(self):
+        """protects=truthful scoped advisory; fails_when=canonical blocker absent/stale presented fresh;
+        why_new=pre-turn projection; seam=real stores and source fixture; no_claim=LLM action change.
+        """
+        from datetime import timedelta
+        from unittest.mock import patch
+        from urgency_engine.kanban import Sync, NativeSource
+        from test_kanban_reconciliation import Source
+        self.project()
+        self.project('other')
+        self.ctx.settings.update(kanban_sync_enabled=True, kanban_bindings=[
+            dict(board='demo', tenant='synthetic', project_id='p'),
+            dict(board='foreign', tenant='synthetic', project_id='other')])
+        source = Source()
+        source.status, source.title = 'blocked', 'Canonical blocker'
+        with Sync(sqlite3.connect(self.root / 'kanban.db'), clock=lambda: self.now, redact=str) as sync:
+            with self.runtime.open(self.runtime.settings()) as ledger:
+                sync.scan(self.runtime.kanban_config(), ledger, None, self.root / 'data.db',
+                          source, request_id='seed', reason='Fixture')
+        before = {p.name: p.read_bytes() for p in self.root.glob('*.db')}
+        with patch.object(NativeSource, 'inventory', side_effect=AssertionError('pre-turn collection')):
+            self.assertIsNone(self.runtime.pre_llm_call(session_id='empty'))
+            self.runtime.focus('p', 'session')
+            fresh = self.runtime.pre_llm_call(session_id='session')['context']
+            self.assertIn('Canonical blocker: inspect dependencies', fresh)
+            self.assertIn('"board_id":"demo"', fresh)
+            self.assertNotIn('"board_id":"foreign"', fresh)
+            self.assertIn('"stale":false', fresh)
+            self.now += timedelta(minutes=2)
+            stale = self.runtime.pre_llm_call(session_id='session')['context']
+            self.assertIn('Canonical coverage unknown: refresh source before diagnosing blockers.', stale)
+            self.assertNotIn('Canonical blocker: inspect dependencies', stale)
+            self.assertLessEqual(len(stale), self.runtime.settings()['context_max_chars'])
+            self.ctx.settings['kanban_bindings'] = []
+            self.assertNotIn('Canonical task:', self.runtime.pre_llm_call(session_id='session')['context'])
+        self.assertEqual({p.name: p.read_bytes() for p in self.root.glob('*.db')}, before)
+
     def test_cached_tasks_show_age_and_exclude_removed_bindings_without_writes(self):
         """protects=scoped fresh reads; fails_when=stale/rebound source looks current;
         why_new=cached projection boundary; seam=real stores; no_claim=live source read.

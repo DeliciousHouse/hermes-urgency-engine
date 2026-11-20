@@ -423,13 +423,15 @@ class Runtime:
         print(rendered, file=sys.stdout if ok else sys.stderr)
         return 0 if ok else 1
 
-    def kanban_read(self, operation, arguments):
+    def kanban_read(self, operation, arguments, *, deadline=None) -> dict:
         cfg = self.kanban_config()
         path = self.data_dir() / 'kanban.db'
         if not path.exists():
             return (dict(storage='uninitialized', enabled=cfg['kanban_sync_enabled'], coverage='unknown')
                     if operation == 'health' else dict(items=[], next=None, has_more=False))
         connection = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=.1)
+        if deadline is not None:
+            connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
         with Sync(connection, clock=self.clock, redact=lambda text: self.ctx.redact_text(text, force=True), readonly=True) as sync:
             if operation == 'tasks':
                 return sync.page(**arguments, cfg=cfg)
@@ -794,6 +796,20 @@ class Runtime:
                 lines.append('No deadline forecast: no active deadlines in this project.')
             for deadline in deadlines:
                 lines.append('Deadline: ' + encode({key: deadline[key] for key in ('deadline_id', 'kind', 'target_at', 'original_at', 'forecast_at', 'input', 'forecast')}))
+            source_cfg = self.kanban_config()
+            if source_cfg['kanban_sync_enabled'] and source_cfg['kanban_bindings']:
+                canonical = self.kanban_read('tasks', dict(project_id=project_id, limit=5), deadline=stop_at)
+                check_budget()
+                for task in canonical['items']:
+                    lines.append('Canonical task: ' + encode({key: task[key] for key in
+                        ('board_id', 'task_id', 'status', 'coverage', 'observed_at', 'age_seconds', 'stale')}))
+                    if task['stale'] or task['coverage'] == 'unknown':
+                        lines.append('Canonical coverage unknown: refresh source before diagnosing blockers.')
+                    elif task['status'] == 'blocked':
+                        lines.append('Canonical blocker: inspect dependencies for ' +
+                                     encode([task['board_id'], task['task_id']]) + '; cause not established by status.')
+                if canonical['has_more']:
+                    lines.append('Canonical task listing truncated; query kanban_tasks for the next page.')
             for task in tasks:
                 lines.append('Task: ' + encode({key: task[key] for key in ('board_id', 'task_id', 'goal', 'status', 'criteria')}))
             plans = self.monitor_read('plans', {'project_id': project_id, 'limit': 3}, active=True)
