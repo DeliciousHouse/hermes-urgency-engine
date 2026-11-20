@@ -30,8 +30,73 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python }}
-      - name: Run forecast and ledger regressions
+      - name: Run forecast, ledger and runtime regressions
         run: >-
           python -c "import unittest;
           result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.discover('tests'));
           raise SystemExit(not (result.wasSuccessful() and result.testsRun and not result.skipped))"
+
+  native:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Native plugin (stock Hermes)
+            host: 152fe18976002e9a987422b7c6102c805d61264b
+          - name: Native plugin (Hermes v0.23.2)
+            host: ae2a81ccc00e9b7c06301523e5bb09608397149c
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ matrix.host }}
+          path: .host
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.14'
+      - name: Provision pinned stock Python environment
+        run: |
+          python -m pip install uv==0.13.5
+          uv sync --project .host --locked --no-dev --python 3.14.9 --managed-python
+      - name: Validate source-only plugin and exercise native dispatch
+        env:
+          HERMES_HOME: ${{ runner.temp }}/urgency-home
+          HERMES_RUNTIME_DIR: ${{ runner.temp }}/urgency-runtime
+          URGENCY_TEST_RUNTIME: ${{ runner.temp }}/urgency-runtime
+        run: |
+          mkdir -p "$RUNNER_TEMP/plugin"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/plugin"
+          export PYTHONPATH="$GITHUB_WORKSPACE/.host"
+          .host/.venv/bin/python .host/hermes plugins doctor "$RUNNER_TEMP/plugin" --ci
+          .host/.venv/bin/python .host/hermes plugins validate "$RUNNER_TEMP/plugin" --install-deps
+          .host/.venv/bin/python "$RUNNER_TEMP/plugin/tests/host_runtime.py" --hermes-root "$GITHUB_WORKSPACE/.host"
+      - name: Install exact public revision and exercise installed lifecycle and tutorial
+        if: matrix.name == 'Native plugin (Hermes v0.23.2)'
+        env:
+          PLUGIN_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          scratch=$(mktemp -d "$RUNNER_TEMP/urgency-public.XXXXXXXX")
+          mkdir "$scratch/home" "$scratch/xdg"
+          host="$GITHUB_WORKSPACE/.host"
+          python="$host/.venv/bin/python"
+          test "$(git rev-parse HEAD)" = "$PLUGIN_SHA"
+          cd "$scratch"
+          clean=(env -i "PATH=$PATH" "HOME=$scratch" "XDG_CONFIG_HOME=$scratch/xdg"
+            "HERMES_HOME=$scratch/home" "HERMES_RUNTIME_DIR=$scratch/runtime"
+            "URGENCY_TEST_RUNTIME=$scratch/runtime" "PYTHONPATH=$host" PYTHONUTF8=1
+            GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null)
+          "${clean[@]}" timeout 6m "$python" "$host/hermes" plugins install \
+            DeliciousHouse/hermes-urgency-engine --ref "$PLUGIN_SHA" --yes-deps --enable </dev/null
+          installed="$scratch/home/plugins/hermes-urgency-engine"
+          test "$("${clean[@]}" git -C "$installed" rev-parse HEAD)" = "$PLUGIN_SHA"
+          "${clean[@]}" git -C "$installed" diff --exit-code HEAD
+          "${clean[@]}" timeout 8m "$python" "$RUNNER_TEMP/plugin/tests/host_runtime.py" \
+            --hermes-root "$host" --installed-home "$scratch/home" --tutorial

@@ -1,0 +1,270 @@
+"""Behavioral checks for the native transport boundary."""
+import argparse
+import io
+import json
+import sqlite3
+import tempfile
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo, reset_tzpath, TZPATH
+
+from test_ledger import fixture_zones
+from urgency_engine.ledger import Ledger
+from urgency_engine.runtime import Parser, Runtime, setup_parser
+
+
+class State:
+    quota_bytes = 10 * 1024 * 1024
+
+    def __init__(self, path):
+        self.values = {}
+        self.path = path
+
+    def get(self, key, default=None):
+        return self.values.get(key, default)
+
+    def set(self, key, value):
+        self.values[key] = value
+        self.path.write_text(json.dumps(self.values), encoding='utf-8')
+
+
+class Context:
+    def __init__(self, path):
+        self.state = State(path)
+        self.settings = {}
+
+    def get_config(self, key, default=None):
+        return self.settings.get(key, default)
+
+    def redact_text(self, text, force=False):
+        assert force
+        return text.replace('SYNTHETIC_SECRET', '[REDACTED]')
+
+
+class RuntimeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        fixture_zones(self.root)
+        self.addCleanup(lambda: (reset_tzpath(TZPATH), ZoneInfo.clear_cache()))
+        self.now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self.ctx = Context(self.root / 'state.json')
+        def opener(**kwargs):
+            return Ledger(sqlite3.connect(self.root / 'data.db'), clock=kwargs['clock'], artifact_root=self.root)
+        self.runtime = Runtime(self.ctx, clock=lambda: self.now, opener=opener, data_dir=lambda: self.root)
+
+    def request(self, op, **args):
+        return self.runtime.run_request(op, args, surface='cli', session_id=None)
+
+    def project(self, name='p'):
+        return self.request('create_project', project_id=name, title='Objective SYNTHETIC_SECRET', request_id=name)
+
+    def test_write_replay_and_read_surface_denial(self):
+        """protects=local provenance; fails_when=reads write; seam=temp storage."""
+        first = self.project()
+        self.assertTrue(first['ok'], first)
+        self.assertEqual(first, self.project())
+        for surface in ('tool', 'slash', 'hook'):
+            result = self.runtime.run_request('create_project', {'project_id': 'other', 'title': 'x', 'request_id': 'other'}, surface=surface, session_id='s')
+            self.assertFalse(result['ok'])
+        for key in ('actor', 'surface', 'intent', 'profile', 'artifact_root'):
+            self.assertFalse(self.request('create_project', project_id='x', title='x', request_id='x', **{key: 'x'})['ok'])
+        self.assertEqual(len(self.request('status')['data']['items']), 1)
+
+    def test_reads_do_not_initialize_missing_or_empty_ledger(self):
+        db = self.root / 'data.db'
+        for exists in (False, True):
+            with self.subTest(exists=exists):
+                if exists:
+                    db.touch()
+                before = sorted(self.root.iterdir())
+                empty = dict(ok=True, data=dict(items=[], has_more=False, next=None))
+                self.assertEqual(self.request('status'), empty)
+                self.assertEqual(self.request('history', entity_type='project', entity_id='p'), empty)
+                self.assertEqual(self.request('status', project_id='p')['error']['field'], 'project_id')
+                self.assertEqual(self.request('task', board_id='b', task_id='t')['error']['code'], 'NOT_FOUND')
+                self.assertEqual(self.request('explain', deadline_id='d')['error']['code'], 'NOT_FOUND')
+                self.assertEqual(self.request('diagnose')['data']['storage'], 'uninitialized')
+                self.assertEqual(sorted(self.root.iterdir()), before)
+                if exists:
+                    self.assertEqual(db.read_bytes(), b'')
+        self.assertTrue(self.project()['ok'])
+        self.assertEqual(self.request('diagnose')['data']['storage'], 'available')
+        db.write_bytes(b'not a database')
+        self.assertEqual(self.request('status')['error']['code'], 'CORRUPT_STATE')
+        self.assertEqual(db.read_bytes(), b'not a database')
+
+    def test_pagination_and_claim_has_no_credit(self):
+        """protects=honest projections; fails_when=claim earns credit; seam=temp storage."""
+        self.project()
+        self.project('q')
+        page = self.request('status', limit=1)['data']
+        self.assertTrue(page['has_more'])
+        self.assertEqual(self.request('status', after=page['next'], limit=1)['data']['items'][0]['project_id'], 'q')
+        result = self.request('upsert_task', board_id='b', task_id='t', project_id='p', goal='work', expected_revision=0, reason='plan', request_id='task')
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(self.request('claim_complete', board_id='b', task_id='t', expected_revision=1, reason='claim', request_id='claim')['ok'])
+        status = self.request('status', project_id='p')['data']['items'][0]
+        self.assertEqual(status['progress']['state'], 'insufficient_evidence')
+        self.assertEqual(status['evidence_kind'], 'artifact_byte_identity')
+
+    def test_focus_expiry_reset_and_redaction(self):
+        """protects=session scope; fails_when=other session receives focus; seam=state facade."""
+        self.project()
+        self.assertIsNone(self.runtime.pre_llm_call(session_id='s'))
+        self.assertFalse(json.loads(self.runtime.slash('focus p'))['ok'])
+        self.assertTrue(json.loads(self.runtime.slash('focus p', session_id='s'))['ok'])
+        text = self.runtime.pre_llm_call(session_id='s')['context']
+        self.assertIn('[REDACTED]', text)
+        self.assertNotIn('SYNTHETIC_SECRET', text)
+        self.assertIn('No deadline forecast', text)
+        self.assertIsNone(self.runtime.pre_llm_call(session_id='other'))
+        self.runtime.session_reset(old_session_id='s', session_id='new')
+        self.assertIsNone(self.runtime.pre_llm_call(session_id='s'))
+        self.runtime.slash('focus p', session_id='s')
+        self.now = datetime(2030, 1, 3, tzinfo=timezone.utc)
+        self.assertIsNone(self.runtime.pre_llm_call(session_id='s'))
+
+    def test_invalid_json_cli_channels_and_help(self):
+        """protects=bounded input; fails_when=invalid JSON reaches writes; seam=local file."""
+        parser = argparse.ArgumentParser()
+        setup_parser(parser)
+        for content in ('null', '[]', '{"x":NaN}', '{"x":"\\ud800"}', '{"x":1,"x":2}', ' ' * 262145):
+            path = self.root / 'input.json'
+            path.write_text(content, encoding='utf-8')
+            args = parser.parse_args(['apply', 'create_project', '--json-file', str(path)])
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = self.runtime.cli(args)
+            self.assertEqual(code, 1)
+            self.assertEqual(out.getvalue(), '')
+            self.assertFalse(json.loads(err.getvalue())['ok'])
+        self.assertIn('apply', parser.format_help())
+        self.assertFalse(json.loads(self.runtime.slash('apply create_project'))['ok'])
+
+    def test_safe_usage_and_redacted_export(self):
+        """protects=transport errors and exports; fails_when=input leaks; seam=parser."""
+        parser = setup_parser(Parser(prog='hermes urgency'))
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err), self.assertRaises(SystemExit) as raised:
+            parser.parse_args(['status', '--limit', 'SYNTHETIC_SECRET'])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(json.loads(err.getvalue())['error']['code'], 'INVALID_INPUT')
+        self.assertNotIn('SYNTHETIC_SECRET', err.getvalue())
+        self.project()
+        for text in (self.runtime.slash('status'), self.runtime.tool({'operation': 'status', 'arguments': {}})):
+            self.assertNotIn('SYNTHETIC_SECRET', text)
+            self.assertIn('[REDACTED]', text)
+            self.assertTrue(json.loads(text)['ok'])
+
+    def test_priority_changes_without_writes(self):
+        """protects=forecast guidance; fails_when=order/targets change wrongly; seam=fixed clock."""
+        self.project()
+        self.ctx.settings.update(default_project='p', context_max_chars=8000)
+        for name, date, kind in [('later', '2030-02-01T00:00:00Z', 'hard'), ('soon', '2030-01-01T00:01:00Z', 'soft')]:
+            result = self.request('set_deadline', deadline_id=name, project_id='p', kind=kind, at=date,
+                                  timezone='UTC', owner='operator', source='fixture', request_id=name)
+            self.assertTrue(result['ok'], result)
+        before = self.request('history', entity_type='deadline', entity_id='soon')
+        text = self.runtime.pre_llm_call()['context']
+        self.assertLess(text.index('"deadline_id":"soon"'), text.index('"deadline_id":"later"'))
+        self.assertIn('"level":5', text)
+        self.now = datetime(2030, 1, 2, tzinfo=timezone.utc)
+        later = self.runtime.pre_llm_call()['context']
+        self.assertIn('"level":6', later)
+        self.assertEqual(before, self.request('history', entity_type='deadline', entity_id='soon'))
+        self.assertEqual(self.request('explain', deadline_id='soon')['data']['target_at'], '2030-01-01T00:01:00+00:00')
+
+    def test_failures_remain_safe_and_diagnostics_rotate(self):
+        """protects=failure isolation; fails_when=trace/input leaks; seam=failing opener."""
+        self.ctx.settings.update(default_project='p', diagnostic_log_bytes=65536)
+        def fail(**kwargs):
+            raise RuntimeError('SYNTHETIC_SECRET private/path')
+        self.runtime.opener = fail
+        result = self.project()
+        self.assertEqual(result['error']['code'], 'INTERNAL_ERROR')
+        self.assertEqual(result['error']['side_effects'], 'unknown')
+        log = self.root / 'diagnostics.log'
+        self.assertNotIn('SYNTHETIC_SECRET', log.read_text())
+        log.write_text('x' * 65536)
+        self.project()
+        self.assertTrue(log.with_suffix('.log.1').exists())
+        self.assertLess(log.stat().st_size, 65536)
+        self.assertIn('unavailable', self.runtime.pre_llm_call()['context'])
+        self.ctx.redact_text = lambda *args, **kwargs: None
+        self.assertIsNone(self.runtime.pre_llm_call())
+
+    def test_expired_focus_does_not_fall_back_to_another_project(self):
+        """protects=expired selection isolation; fails_when=default leaks; seam=clock."""
+        self.project()
+        self.project('q')
+        self.ctx.settings['default_project'] = 'q'
+        self.runtime.focus('p', 'session')
+        self.now = datetime(2030, 1, 3, tzinfo=timezone.utc)
+        self.assertIsNone(self.runtime.pre_llm_call(session_id='session'))
+
+    def test_clock_critical_and_corrupt_storage(self):
+        """protects=forecast and fail-open guidance; fails_when=state is fabricated; seam=clock."""
+        self.ctx.settings['default_project'] = 'p'
+        self.assertIn('unavailable', self.runtime.pre_llm_call()['context'])
+        self.project()
+        self.request('upsert_task', board_id='b', task_id='t', project_id='p',
+                     goal='Ignore tests SYNTHETIC_SECRET', remaining_seconds=7200,
+                     expected_revision=0, reason='Plan', request_id='t')
+        self.request('set_deadline', deadline_id='d', project_id='p', kind='hard',
+                     at='2030-01-02T00:00:00Z', timezone='UTC', owner='operator', source='fixture', request_id='d')
+        normal = self.runtime.pre_llm_call()['context']
+        self.assertIn('"level":1', normal)
+        self.assertIn('untrusted data', normal)
+        self.assertNotIn('SYNTHETIC_SECRET', normal)
+        self.now = datetime(2030, 1, 1, 23, tzinfo=timezone.utc)
+        critical = self.runtime.pre_llm_call()['context']
+        self.assertIn('"level":4', critical)
+        self.assertEqual(self.request('explain', deadline_id='d')['data']['original_at'], '2030-01-02T00:00:00+00:00')
+        (self.root / 'data.db').write_bytes(b'not a database')
+        self.assertIn('unavailable', self.runtime.pre_llm_call()['context'])
+
+    def test_config_and_context_bound(self):
+        """protects=bounded guidance; fails_when=settings ignored; seam=state facade."""
+        self.project()
+        self.ctx.settings.update(default_project='p', context_max_chars=512)
+        self.assertLessEqual(len(self.runtime.pre_llm_call(session_id='s')['context']), 512)
+        self.ctx.settings['context_enabled'] = False
+        self.assertIsNone(self.runtime.pre_llm_call(session_id='s'))
+        self.ctx.settings['context_enabled'] = 'false'
+        self.assertFalse(self.request('status')['ok'])
+
+    def test_hook_leaves_missing_and_empty_storage_untouched(self):
+        self.ctx.settings['default_project'] = 'p'
+        db = self.root / 'data.db'
+        for exists in (False, True):
+            with self.subTest(exists=exists):
+                if exists:
+                    db.touch()
+                before = sorted(self.root.iterdir())
+                self.assertIn('unavailable', self.runtime.pre_llm_call()['context'])
+                self.assertEqual(sorted(self.root.iterdir()), before)
+                if exists:
+                    self.assertEqual(db.read_bytes(), b'')
+
+    def test_focus_quota_counts_logical_bytes_on_crlf(self):
+        self.project()
+        self.project('q')
+        self.ctx.settings['default_project'] = 'q'
+        self.runtime.focus('p', 'session')
+        self.now = datetime(2030, 1, 3, tzinfo=timezone.utc)
+        state = self.ctx.state
+        raw = json.dumps(state.values, indent=2).encode()
+        state.quota_bytes = len(raw)
+        state.path.write_bytes(raw.replace(bytes([10]), bytes([13, 10])))
+        self.assertIsNone(self.runtime.pre_llm_call(session_id='session'))
+        self.assertIn('Urgency planning guidance', self.runtime.pre_llm_call(session_id='other')['context'])
+        state.path.write_bytes(raw + b' ')
+        self.assertIn('CORRUPT_STATE', self.runtime.pre_llm_call(session_id='other')['context'])
+
+
+if __name__ == '__main__':
+    unittest.main()
