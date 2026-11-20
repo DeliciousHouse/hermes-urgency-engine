@@ -30,6 +30,8 @@ Read-only `/urgency watchdog health|incidents|plans` and `urgency_query` operati
 `watchdog_health`, `watchdog_incidents`, `watchdog_plans` share these envelopes.
 Tool filters use `project_id`, `limit`, `after`. Pre-turn guidance includes up to
 three active plans for the selected project within the existing guidance budget.
+Nonquiet `tick` output includes `notices` (at most 40), `omitted` (eligible notices
+that did not fit), and `more` (true when `omitted` is nonzero).
 
 ### Settings
 
@@ -96,8 +98,10 @@ not prove failed recovery: the detector requires outcomes tied to an incident.
 | `ineffective_recovery` | At least three failed/no-improvement outcomes for the same still-active incident; improvement resets that count |
 
 A verified task closes task incidents. Verified progress closes its current episode.
-Explicit null availability/dependency is insufficient evidence, not recovery: the
-existing episode stays active without a reminder, and recurrence creates a new one.
+For delegated-work unavailability, unknown availability leaves the existing episode
+active without a reminder. If unavailability is observed again, it is still the
+same episode. Only observed recovery (such as explicit availability or verified
+progress) closes it; a later detection of unavailability then opens a new episode.
 A new incident creates one plan with facts, unknowns,
 objective, task IDs, required verification and stable ordered recommendations.
 Deadline plans refer to their ledger deadline; consult `hermes urgency explain ID`
@@ -118,8 +122,9 @@ Ticks process at most 500 tasks and 500 deadlines per page, 100 incident transit
 and a 10000-node/50000-edge graph. Incomplete graph coverage never proves a missing
 dependency. Cursor and coverage expose incomplete scans. Evaluation has cooperative
 25/28-second checkpoints and a 100 ms SQLite busy wait; hardware/filesystem stalls
-are not a hard real-time guarantee. Notice output contains up to 40 entries;
-entries beyond that cap keep their next reminder due instead of consuming it.
+are not a hard real-time guarantee. Selection is capped at 40 before notice
+accounting, inside the tick transaction. Incidents beyond that cap keep their next
+reminder due instead of consuming it.
 A 10000-task board needs a larger row cap than the default because each task also
 has retained monitor metadata. Exceeding capacity rolls back the transaction.
 Old observations and resolved episodes expire by retention time; active records,
@@ -133,7 +138,7 @@ identity, cooldown and retry state across fresh processes. Ledger snapshots are 
 before the monitor write lock; source revisions detect intervening changes. This is
 not a transaction spanning both databases: later ledger changes are seen next tick.
 
-A new incident emits immediately; reminders wait 300, 600, 1200 seconds, capped at
+A new incident is eligible immediately; reminders wait 300, 600, 1200 seconds, capped at
 3600, and never exceed the configured episode total. Rising severity can advance a
 pending notice, not reset the cap. The forecast core retains urgency state/cooldown.
 Plans preserve verification and permissions even when the target is impossible.

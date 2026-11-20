@@ -16,6 +16,7 @@ from .forecast import ForecastInput, UrgencyLevel, UrgencyState, calculate_forec
 DEFAULTS = dict(watchdog_enabled=False, watchdog_normal_seconds=300, watchdog_risk_seconds=60,
                 watchdog_stall_seconds=1800, watchdog_claim_seconds=900, watchdog_notice_limit=3,
                 watchdog_retention_days=30, watchdog_max_rows=10000)
+TICK_NOTICE_LIMIT = 40
 LIMITATIONS = ['Plans are recommendations, not authorization or executed recovery.',
                'Byte identity is not semantic acceptance. Missing telemetry is unknown.',
                'Notice generation cannot prove stdout emission or remote delivery; reconcile unknown emissions.',
@@ -418,7 +419,7 @@ class Monitor:
         cfg = settings(cfg)
         now, started = self.clock(), time.monotonic()
         stamp(now)
-        empty = {'notices': [], 'evaluated': False}
+        empty = {'notices': [], 'omitted': 0, 'evaluated': False}
         with self.transaction(False):
             generation = self.meta('generation', 0)
             if self.meta('paused', False):
@@ -477,7 +478,7 @@ class Monitor:
                 self.put('coverage', 'stale_source_revisions; retry_next_tick')
                 return {**empty, 'reason': 'stale_source_revisions'}
             self.prune(cfg)
-            notices, transitions, high = [], 0, False
+            notices, omitted, transitions, high = [], 0, 0, False
             completed_tasks = []
             for task in snap['tasks']:
                 if transitions >= 100 or time.monotonic() - started >= 28:
@@ -497,9 +498,11 @@ class Monitor:
                     facts = {}
                 elif signal.get('agent_available') is None:
                     unknown.add('delegated_work_unavailable')
-                spent, emitted = self.reconcile(task, facts, now, cfg, 100 - transitions, unknown=unknown)
+                spent, emitted, overflow = self.reconcile(task, facts, now, cfg, 100 - transitions,
+                    notice_budget=TICK_NOTICE_LIMIT - len(notices), unknown=unknown)
                 transitions += spent
                 notices.extend(emitted)
+                omitted += overflow
                 self.capacity(cfg, 1 if not previous else 0)
                 self.put(memory_key, dict(status=task['status'], progress=progress, running_since=first))
                 completed_tasks.append(task)
@@ -525,9 +528,11 @@ class Monitor:
                 entity = dict(project_id=deadline['project_id'], board_id=deadline['board_id'], task_id=deadline['task_id'],
                               deadline_id=deadline['deadline_id'], objective=deadline['objective'], required_criteria=deadline['required_criteria'],
                               affected_tasks=deadline['affected_tasks'], verification_truncated=deadline['verification_truncated'], revision=deadline['revision'])
-                spent, emitted = self.reconcile(entity, facts, now, cfg, 100 - transitions, deadline_id=deadline['deadline_id'])
+                spent, emitted, overflow = self.reconcile(entity, facts, now, cfg, 100 - transitions,
+                    notice_budget=TICK_NOTICE_LIMIT - len(notices), deadline_id=deadline['deadline_id'])
                 transitions += spent
                 notices.extend(emitted)
+                omitted += overflow
                 self.capacity(cfg, 1 if not previous else 0)
                 self.put(memory_key, dict(forecast_at=previous.get('forecast_at', deadline['forecast_at']),
                     urgency=dict(level=int(forecast.level), changed_at=stamp(forecast.changed_at))))
@@ -551,7 +556,7 @@ class Monitor:
                      scan_complete=complete, graph_complete=graph_complete, source_revisions=snap['revisions'],
                      missing_signals='insufficient_evidence', source_consistency='two snapshots; subsequent changes observed next tick'))
             self.put('next_due', stamp(now + timedelta(seconds=cfg['watchdog_risk_seconds'] if high else cfg['watchdog_normal_seconds'])))
-            return dict(notices=notices, evaluated=True, transitions=transitions, scan_complete=complete)
+            return dict(notices=notices, omitted=omitted, evaluated=True, transitions=transitions, scan_complete=complete)
 
     def detect(self, task, signal, previous, first, now, cfg, cycles, edges, existing, graph_complete):
         facts, key = {}, (task['board_id'], task['task_id'])
@@ -618,19 +623,12 @@ class Monitor:
             facts['ineffective_recovery'] = dict(incident_ids=failed)
         return facts
 
-    def defer_notices(self, incident_ids):
-        with self.transaction():
-            rows = self.db.execute('SELECT incident_id,notice_count FROM incidents WHERE incident_id IN ({})'.format(','.join('?' * len(incident_ids))), incident_ids).fetchall()
-            if len(rows) != len(set(incident_ids)) or any(row['notice_count'] < 1 for row in rows):
-                fail('incident_id', effects='unknown')
-            self.db.executemany('UPDATE incidents SET notice_count=notice_count-1,next_notice_at=last_seen WHERE incident_id=?', [(row['incident_id'],) for row in rows])
-
-    def reconcile(self, task, facts, now, cfg, budget, deadline_id=None, *, unknown=()):
+    def reconcile(self, task, facts, now, cfg, budget, *, notice_budget, deadline_id=None, unknown=()):
         entity = ['deadline', deadline_id] if deadline_id else ['task', task['board_id'], task['task_id']]
         prefix = digest(entity)
         rows = [dict(r) for r in self.db.execute('SELECT * FROM incidents WHERE fingerprint LIKE ? ORDER BY episode', (prefix + ':%',))]
         latest = {r['detector']: r for r in rows}
-        transitions, notices = 0, []
+        transitions, notices, omitted = 0, [], 0
         for detector in sorted((set(latest) | set(facts)).difference(unknown)):
             if transitions >= budget:
                 break
@@ -669,13 +667,17 @@ class Monitor:
             rising = detail.get('level', 0) > prior['facts'].get('level', 0)
             due = old['next_notice_at'] and instant(old['next_notice_at']) <= now
             count = old['notice_count']
+            next_at = old['next_notice_at']
             if count < cfg['watchdog_notice_limit'] and (due or rising):
-                count += 1
-                next_at = stamp(now + timedelta(seconds=min(3600, 300 * 2 ** (count - 1))))
-                notices.append(dict(incident_id=old['incident_id'], detector=detector, emission='unknown_after_commit',
-                                    next_action='Inspect watchdog plans; preserve verification and permissions.'))
-            else:
-                next_at = old['next_notice_at']
+                if len(notices) < notice_budget:
+                    count += 1
+                    next_at = stamp(now + timedelta(seconds=min(3600, 300 * 2 ** (count - 1))))
+                    notices.append(dict(incident_id=old['incident_id'], detector=detector, emission='unknown_after_commit',
+                                        next_action='Inspect watchdog plans; preserve verification and permissions.'))
+                else:
+                    omitted += 1
+                    if not due:
+                        next_at = stamp(now)  # Preserve eligibility after recording the higher severity.
             self.db.execute('UPDATE incidents SET last_seen=?,notice_count=?,next_notice_at=?,explanation_json=? WHERE incident_id=?',
                             (stamp(now), count, next_at, _json(explanation), old['incident_id']))
-        return transitions, notices
+        return transitions, notices, omitted

@@ -412,12 +412,8 @@ class Runtime:
                         if not data['notices']:
                             return 0
                         # Records retain full details; one bounded summary goes to cron.
-                        emitted, limit = data['notices'], 40
-                        selected, deferred = emitted[:limit], emitted[limit:]
-                        data = {'schema_version': 1, 'notices': selected, 'more': bool(deferred),
-                                'omitted': len(deferred), 'emission': 'handed_to_cron_not_delivery_ack'}
-                        if deferred:
-                            monitor.defer_notices([item['incident_id'] for item in deferred])
+                        data = {'schema_version': 1, 'notices': data['notices'], 'more': bool(data['omitted']),
+                                'omitted': data['omitted'], 'emission': 'handed_to_cron_not_delivery_ack'}
                     else:
                         invalid('operation')
             result = {'ok': True, 'data': data}

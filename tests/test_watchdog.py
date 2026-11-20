@@ -1,11 +1,16 @@
 """protects=durable truthful monitoring; fails_when=unknown becomes failure;
 why_new=independent watchdog; seam=fixed clock/disposable SQLite; no_claim=remote delivery.
 """
+import argparse
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
+import io
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from zoneinfo import ZoneInfo, reset_tzpath, TZPATH
 from test_ledger import fixture_zones
 
@@ -115,27 +120,67 @@ class WatchdogTests(unittest.TestCase):
         with self.monitor(True) as monitor:
             self.assertEqual(sorted(i['episode'] for i in monitor.page('incidents')['items']), [1, 2])
 
-    def test_tick_notice_overflow_preserves_next_reminder(self):
+    def seed_unavailable_tasks(self, count):
         with self.ledger() as ledger:
-            for n in range(41):
+            for n in range(count):
                 ledger.upsert_task('board', f'task-{n}', project_id='demo', goal='Deliver proof', status='running',
                                    remaining_seconds=600, expected_revision=0, reason='fixture', request_id=f'task-{n}', actor='fixture')
         with self.monitor() as monitor:
-            for n in range(41):
+            for n in range(count):
                 monitor.observe(dict(request_id=f'event-{n}', reason='fixture', project_id='demo', board_id='board',
                     task_id=f'task-{n}', kind='task_signal', occurred_at=self.now.isoformat(), data={'agent_available': False}),
                     self.ledger_path)
-        cfg = {**DEFAULTS, 'watchdog_notice_limit': 1}
+
+    def notice_counts(self):
+        with self.monitor(True) as monitor:
+            return {row['incident_id']: row['notice_count'] for row in monitor.page('incidents')['items']}
+
+    def test_tick_commits_only_selected_notice_counts(self):
+        self.seed_unavailable_tasks(40)
+        with self.ledger() as ledger:
+            ledger.set_deadline('hard', project_id='demo', kind='hard', at=self.now.isoformat(), timezone='UTC',
+                                owner='fixture', source='fixture', request_id='deadline', actor='fixture')
+        self.now += timedelta(seconds=1)
         with self.monitor() as monitor:
-            first = monitor.tick(self.ledger_path, cfg, force=True)
-            monitor.defer_notices([item['incident_id'] for item in first['notices'][40:]])
-        self.assertEqual(len(first['notices']), 41)
-        self.now += timedelta(seconds=300)
-        with self.monitor() as monitor:
-            second = monitor.tick(self.ledger_path, cfg, force=True)
-            rows = monitor.page('incidents', limit=500)['items']
-        self.assertEqual(len(second['notices']), 1)
-        self.assertTrue(all(item['notice_count'] == 1 for item in rows))
+            tick = monitor.tick(self.ledger_path, {**DEFAULTS, 'watchdog_notice_limit': 1}, force=True)
+        counts = self.notice_counts()
+        self.assertEqual(sorted(counts.values()), [0] + [1] * 40)
+        self.assertEqual({notice['incident_id'] for notice in tick['notices']},
+                         {identity for identity, count in counts.items() if count})
+        self.assertEqual(tick['omitted'], 1)
+
+    def test_cli_emits_overflow_incident_on_next_due_tick(self):
+        from urgency_engine.runtime import Runtime, setup_parser
+
+        class Ctx:
+            def get_config(self, key, default=None):
+                return {'watchdog_notice_limit': 1, 'watchdog_enabled': True}.get(key, default)
+
+            def redact_text(self, text, force=False):
+                return text
+
+        self.seed_unavailable_tasks(41)
+        runtime = Runtime(Ctx(), clock=self.clock, data_dir=lambda: self.root)
+        args = setup_parser(argparse.ArgumentParser()).parse_args(['watchdog', 'tick'])
+
+        def cli_tick():
+            out = io.StringIO()
+            with patch.object(Monitor, 'host', side_effect=lambda *, clock: Monitor.open(self.path, clock=clock)), redirect_stdout(out):
+                self.assertEqual(runtime.cli(args), 0)
+            return json.loads(out.getvalue())['data']
+
+        first = cli_tick()
+        self.assertEqual(len(first['notices']), 40)
+        counts = self.notice_counts()
+        emitted = {notice['incident_id'] for notice in first['notices']}
+        omitted, = set(counts) - emitted
+        self.assertEqual(counts, {identity: int(identity in emitted) for identity in counts})
+        self.assertEqual((first['more'], first['omitted']), (True, 1))
+        self.now += timedelta(seconds=DEFAULTS['watchdog_risk_seconds'])
+        second = cli_tick()
+        self.assertEqual([notice['incident_id'] for notice in second['notices']], [omitted])
+        self.assertEqual((second['more'], second['omitted']), (False, 0))
+        self.assertEqual(self.notice_counts(), dict.fromkeys(counts, 1))
 
     def test_observation_replay_conflict_future_and_sparse(self):
         first = self.observe({'claim_at': self.now.isoformat()})
