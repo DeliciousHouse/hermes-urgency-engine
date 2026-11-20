@@ -180,6 +180,27 @@ class WatchdogTests(unittest.TestCase):
                     monitor.capacity({**DEFAULTS, 'watchdog_max_rows': 1})
             self.assertIsNone(monitor.meta('must_rollback'))
 
+    def test_unrelated_observations_do_not_refresh_source_freshness(self):
+        self.observe({'dependency_state': 'unreachable', 'agent_available': False}, event='source')
+        source_time = self.now
+        self.now += timedelta(seconds=120)
+        self.observe({'tool_name': 'read', 'outcome': 'unknown', 'duration_seconds': 0}, kind='tool_outcome', event='chatter')
+        self.tick()
+        with self.monitor(True) as monitor:
+            incidents = monitor.page('incidents')['items']
+        selected = [i for i in incidents if i['detector'] in ('dependency_unreachable', 'delegated_work_unavailable')]
+        self.assertEqual(len(selected), 2)
+        for incident in selected:
+            self.assertEqual(datetime.fromisoformat(incident['explanation']['facts']['observed_at']), source_time)
+        self.now += timedelta(days=31)
+        self.tick()
+        with self.monitor(True) as monitor:
+            selected = [i for i in monitor.page('incidents')['items'] if i['detector'] in ('dependency_unreachable', 'delegated_work_unavailable')]
+        self.assertEqual(len(selected), 2)
+        for incident in selected:
+            self.assertIsNone(incident['explanation']['facts']['observed_at'])
+            self.assertEqual(incident['explanation']['facts']['freshness'], 'unknown_source_pruned')
+
     def test_deadline_and_checkpoint_without_target_rewrite(self):
         with self.ledger() as ledger:
             ledger.set_deadline('hard', project_id='demo', kind='hard', at=self.now.isoformat(), timezone='UTC',

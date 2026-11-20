@@ -74,7 +74,10 @@ The native `post_tool_call` observer recognizes structured `ok`/`success` boolea
 and errors; ambiguous output is unknown. It never stores tool arguments, results,
 prompts or exception text. Host session identity is not a Kanban task ID.
 This slice has no automatic Kanban lifecycle adapter: use explicit observations;
-missing worker/dependency telemetry stays unknown. A recovery counter alone does
+missing worker/dependency telemetry stays unknown. Explicit availability/dependency
+facts retain their own observation time; unrelated telemetry does not refresh it.
+If retention prunes that source event, freshness is `unknown_source_pruned`, not
+current. A recovery counter alone does
 not prove failed recovery: the detector requires outcomes tied to an incident.
 
 ### Deterministic detectors

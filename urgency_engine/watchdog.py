@@ -563,13 +563,24 @@ class Monitor:
             facts['missed_checkpoint'] = dict(checkpoint_at=signal['checkpoint_at'])
         if key in cycles:
             facts['dependency_cycle'] = dict(component=cycles[key])
+        source_times = {}
+        if signal.get('agent_available') == 0 or signal.get('dependency_state') == 'unreachable':
+            for row in self.db.execute("SELECT kind,occurred_at,payload_json FROM observations WHERE board_id=? AND task_id=? AND kind IN ('task_signal','worker_outcome') ORDER BY occurred_at DESC,rowid DESC", key):
+                payload = json.loads(row['payload_json'])
+                if payload['out_of_order']:
+                    continue
+                for field in ('agent_available', 'dependency_state'):
+                    if field in payload['data'] or (field == 'agent_available' and row['kind'] == 'worker_outcome'):
+                        source_times.setdefault(field, row['occurred_at'])
+                if len(source_times) == 2:
+                    break
         if signal.get('agent_available') == 0:
-            facts['delegated_work_unavailable'] = dict(source='explicit_unavailable', observed_at=signal['observed_at'])
+            facts['delegated_work_unavailable'] = dict(source='explicit_unavailable', observed_at=source_times.get('agent_available'), freshness='retained_source' if 'agent_available' in source_times else 'unknown_source_pruned')
         claim = signal.get('heartbeat_at') or signal.get('claim_at')
         if elapsed(claim, cfg['watchdog_claim_seconds']):
             facts['stale_claim'] = dict(since=claim, action='inspect_only')
         if signal.get('dependency_state') == 'unreachable':
-            facts['dependency_unreachable'] = dict(source='explicit_signal', observed_at=signal['observed_at'])
+            facts['dependency_unreachable'] = dict(source='explicit_signal', observed_at=source_times.get('dependency_state'), freshness='retained_source' if 'dependency_state' in source_times else 'unknown_source_pruned')
         elif graph_complete:
             missing = [list(r[2:]) for r in edges if tuple(r[:2]) == key and tuple(r[2:]) not in existing]
             if missing:
