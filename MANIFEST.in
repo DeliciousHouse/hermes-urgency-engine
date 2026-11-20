@@ -4,3 +4,6 @@ include docs/runtime.md
 include plugin.yaml
 include __init__.py
 include tests/host_runtime.py
+include tests/host_watchdog.py
+include docs/watchdog.md
+recursive-include scripts *.py
