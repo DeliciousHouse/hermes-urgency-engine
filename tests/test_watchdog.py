@@ -6,6 +6,8 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from zoneinfo import ZoneInfo, reset_tzpath, TZPATH
+from test_ledger import fixture_zones
 
 from urgency_engine.ledger import Ledger, LedgerError
 from urgency_engine.watchdog import Monitor, DEFAULTS, snapshot
@@ -16,6 +18,8 @@ class WatchdogTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        fixture_zones(self.root)
+        self.addCleanup(lambda: (reset_tzpath(TZPATH), ZoneInfo.clear_cache()))
         self.now = datetime(2030, 1, 1, tzinfo=timezone.utc)
         self.clock = lambda: self.now
         self.ledger_path = self.root / 'data.db'
