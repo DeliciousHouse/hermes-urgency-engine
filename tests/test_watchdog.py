@@ -4,6 +4,7 @@ why_new=independent watchdog; seam=fixed clock/disposable SQLite; no_claim=remot
 import argparse
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 import io
 import json
 from pathlib import Path
@@ -22,7 +23,7 @@ class WatchdogTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve(strict=True)
         fixture_zones(self.root)
         self.addCleanup(lambda: (reset_tzpath(TZPATH), ZoneInfo.clear_cache()))
         self.now = datetime(2030, 1, 1, tzinfo=timezone.utc)
@@ -119,6 +120,84 @@ class WatchdogTests(unittest.TestCase):
         self.assertNotEqual(self.tick()['notices'][0]['incident_id'], incident_id)
         with self.monitor(True) as monitor:
             self.assertEqual(sorted(i['episode'] for i in monitor.page('incidents')['items']), [1, 2])
+
+    def test_unknown_dependency_coverage_preserves_episode_without_reminding(self):
+        self.observe({'dependency_state': 'unreachable'})
+        first, = self.tick()['notices']
+        self.assertEqual(first['detector'], 'dependency_unreachable')
+        incident_id = first['incident_id']
+        with self.monitor(True) as monitor:
+            original_incident, = monitor.page('incidents')['items']
+            original_plan, = monitor.page('plans')['items']
+        self.assertEqual((original_incident['state'], original_incident['notice_count']), ('active', 1))
+        self.assertEqual((original_plan['incident_id'], original_plan['state']), (incident_id, 'recommended'))
+
+        self.now += timedelta(seconds=300)
+        self.observe({'dependency_state': 'unknown'}, event='unknown')
+        self.assertEqual(self.tick()['notices'], [])
+        with self.monitor(True) as monitor:
+            self.assertEqual(monitor.page('incidents')['items'], [original_incident])
+            self.assertEqual(monitor.page('plans')['items'], [original_plan])
+
+        self.observe({'dependency_state': None}, event='clear-coverage')
+        self.observe({}, event='sparse')
+        self.assertEqual(self.tick()['notices'], [])
+        with self.monitor(True) as monitor:
+            self.assertEqual(monitor.page('incidents')['items'], [original_incident])
+            self.assertEqual(monitor.page('plans')['items'], [original_plan])
+
+        self.observe({'dependency_state': 'unreachable'}, event='unreachable-again')
+        self.assertEqual([n['incident_id'] for n in self.tick()['notices']], [incident_id])
+        self.assertEqual(self.notice_counts(), {incident_id: 2})
+
+        self.observe({'dependency_state': 'available'}, event='available')
+        self.assertEqual(self.tick()['notices'], [])
+        with self.monitor(True) as monitor:
+            incident, = monitor.page('incidents')['items']
+            plan, = monitor.page('plans')['items']
+        self.assertEqual((incident['incident_id'], incident['state']), (incident_id, 'resolved'))
+        self.assertEqual((plan['incident_id'], plan['state']), (incident_id, 'resolved'))
+
+        self.observe({'dependency_state': 'unreachable'}, event='recurrence')
+        recurrence, = self.tick()['notices']
+        self.assertNotEqual(recurrence['incident_id'], incident_id)
+        with self.monitor(True) as monitor:
+            self.assertEqual(sorted((i['episode'], i['state']) for i in monitor.page('incidents')['items']),
+                             [(1, 'resolved'), (2, 'active')])
+
+    def test_missing_graph_target_is_positive_even_without_explicit_coverage(self):
+        # Model a previously registered edge whose target is now absent.
+        with self.monitor() as monitor, monitor.transaction():
+            monitor.db.execute('INSERT INTO dependencies VALUES(?,?,?,?)', ('board', 'task', 'board', 'missing'))
+        notice, = self.tick()['notices']
+        self.assertEqual(notice['detector'], 'dependency_unreachable')
+        self.observe({'dependency_state': 'available'})
+        self.now += timedelta(seconds=300)
+        self.assertEqual([n['incident_id'] for n in self.tick()['notices']], [notice['incident_id']])
+        with self.monitor(True) as monitor:
+            incident, = monitor.page('incidents')['items']
+        self.assertEqual(incident['explanation']['facts'],
+                         {'missing': [['board', 'missing']], 'source': 'complete_known_graph'})
+
+    def test_verified_task_closes_dependency_episode_with_unknown_coverage(self):
+        self.observe({'dependency_state': 'unreachable'})
+        first, = self.tick()['notices']
+        self.observe({'dependency_state': None}, event='clear-coverage')
+        artifact = b'verified fixture'
+        (self.root / 'artifact').write_bytes(artifact)
+        with self.ledger() as ledger:
+            task = ledger.set_criteria('board', 'task', [dict(criterion_id='proof', description='Proof',
+                weight=1, required=True, expected_sha256=sha256(artifact).hexdigest())], expected_revision=1,
+                reason='fixture', request_id='criterion', actor='fixture')
+            ledger.verify_artifact('board', 'task', 'proof', 'artifact', expected_revision=task['revision'],
+                                   reason='fixture', request_id='verification', actor='fixture')
+            self.assertEqual(ledger.get_task('board', 'task')['status'], 'verified')
+        self.assertEqual(self.tick()['notices'], [])
+        with self.monitor(True) as monitor:
+            incident, = monitor.page('incidents')['items']
+            plan, = monitor.page('plans')['items']
+        self.assertEqual((incident['incident_id'], incident['state'], plan['state']),
+                         (first['incident_id'], 'resolved', 'resolved'))
 
     def seed_unavailable_tasks(self, count):
         with self.ledger() as ledger:

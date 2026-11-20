@@ -496,8 +496,11 @@ class Monitor:
                 unknown = set()
                 if task['status'] == 'verified' or changed:
                     facts = {}
-                elif signal.get('agent_available') is None:
-                    unknown.add('delegated_work_unavailable')
+                else:
+                    if signal.get('agent_available') is None:
+                        unknown.add('delegated_work_unavailable')
+                    if 'dependency_unreachable' not in facts and signal.get('dependency_state') != 'available':
+                        unknown.add('dependency_unreachable')
                 spent, emitted, overflow = self.reconcile(task, facts, now, cfg, 100 - transitions,
                     notice_budget=TICK_NOTICE_LIMIT - len(notices), unknown=unknown)
                 transitions += spent

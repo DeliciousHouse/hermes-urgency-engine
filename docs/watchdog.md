@@ -102,6 +102,14 @@ For delegated-work unavailability, unknown availability leaves the existing epis
 active without a reminder. If unavailability is observed again, it is still the
 same episode. Only observed recovery (such as explicit availability or verified
 progress) closes it; a later detection of unavailability then opens a new episode.
+
+For `dependency_unreachable`, an explicit `unreachable` signal or a missing target
+in a complete graph is positive evidence. Without either, `unknown`, null, or
+absent dependency state leaves the incident and its plan unchanged. No reminder
+is sent or consumed while coverage is unknown, and renewed evidence uses the same
+episode. An explicit `available` signal closes the episode if no missing target is
+detected. Verified progress or completion still closes task episodes.
+
 A new incident creates one plan with facts, unknowns,
 objective, task IDs, required verification and stable ordered recommendations.
 Deadline plans refer to their ledger deadline; consult `hermes urgency explain ID`
