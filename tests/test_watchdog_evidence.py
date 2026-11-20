@@ -189,6 +189,40 @@ class EvidenceTests(unittest.TestCase):
         f.tick()
         self.assertEqual(len(self.state('delegated_work_unavailable')), 2)
 
+    def test_older_heartbeat_cannot_reopen_resolved_episode(self):
+        # Older heartbeat timestamps in newer envelopes must not change persisted plans or notices.
+        f = self.f
+        stale = (f.now - timedelta(seconds=901)).isoformat()
+        self.signal(heartbeat_at=stale)
+        f.tick()
+        self.assertEqual(self.state('stale_claim')[0][2:5], ('active', 'recommended', 1))
+        self.advance(1)
+        self.signal(heartbeat_at=f.now.isoformat())
+        f.tick()
+        resolved = self.state('stale_claim')
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(resolved[0][2:5], ('resolved', 'resolved', 1))
+        for missing in (False, True):
+            if missing:
+                self.advance(1)
+                self.signal(heartbeat_at=None)
+                self.advance(900)
+                self.assertFalse(any(n['detector'] == 'stale_claim' for n in f.tick()['notices']))
+            self.advance(1)
+            self.assertFalse(self.signal(heartbeat_at=stale)['out_of_order'])
+            self.assertFalse(any(n['detector'] == 'stale_claim' for n in f.tick()['notices']))
+            self.assertEqual(self.state('stale_claim'), resolved)
+        self.advance(1)
+        self.signal(heartbeat_at=f.now.isoformat())
+        f.tick()
+        self.assertEqual(self.state('stale_claim'), resolved)
+        self.advance(900)
+        notices = [n for n in f.tick()['notices'] if n['detector'] == 'stale_claim']
+        self.assertEqual(len(notices), 1)
+        final = self.state('stale_claim')
+        self.assertEqual(final[0], resolved[0])
+        self.assertEqual((final[1][0], *final[1][2:5]), (2, 'active', 'recommended', 1))
+
     def test_null_heartbeat_cannot_reveal_an_older_healthy_claim(self):
         f = self.f
         self.signal(heartbeat_at=(f.now - timedelta(seconds=901)).isoformat(), claim_at=f.now.isoformat())

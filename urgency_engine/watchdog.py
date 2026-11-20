@@ -612,7 +612,15 @@ class Monitor:
             proof = dict(at=row['occurred_at'], revision=row['sequence'], task_revision=payload.get('source_revision'))
             if kind == 'task_signal':
                 for field, value in data.items():
-                    records[field] = dict(value=value, **proof)
+                    if field == 'heartbeat_at':
+                        prior = records.get(field, {})
+                        latest = prior.get('latest_value', prior.get('value'))
+                        if latest is not None and value is not None and instant(value) < instant(latest):
+                            continue
+                        # Null removes coverage, not the latest heartbeat timestamp.
+                        records[field] = dict(value=value, latest_value=value if value is not None else latest, **proof)
+                    else:
+                        records[field] = dict(value=value, **proof)
                 if 'tool_failures' in data:
                     failures = [proof] * min(3, data['tool_failures'])
                     records['tools'] = dict(value=data['tool_failures'], reset=data['tool_failures'] < 3, **proof)

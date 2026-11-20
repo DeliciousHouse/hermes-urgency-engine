@@ -150,9 +150,11 @@ Older monitor explanations remain readable without a schema migration. Sources
 without retained provenance remain unresolved until relevant positive evidence
 establishes recovery; absence never fills the gap. Unknown initial inputs do not
 create incidents. Source ordering follows observation time and audit sequence for
-equal timestamps; older events cannot replace current evidence. Unrelated traffic
-cannot refresh source time. Protected evidence is retained rather than discarded
-to satisfy a quota.
+equal timestamps; older events cannot replace current evidence. An admitted event
+with an older `heartbeat_at` does not replace the latest heartbeat, even after a
+null removes current heartbeat coverage. A recovered heartbeat can still age
+into a new stale-claim episode. Unrelated traffic cannot refresh source time.
+Protected evidence is retained rather than discarded to satisfy a quota.
 
 A new incident creates one plan with facts, unknowns,
 objective, task IDs, required verification and stable ordered recommendations.
