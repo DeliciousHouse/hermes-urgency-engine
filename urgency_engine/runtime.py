@@ -15,6 +15,7 @@ import uuid
 
 from .ledger import Ledger, LedgerError, open_hermes_ledger, open_readonly_ledger
 from .watchdog import Monitor, DEFAULTS as WATCHDOG_DEFAULTS, LIMITATIONS, settings as monitor_settings
+from .kanban import Sync, NativeSource, DEFAULTS as KANBAN_DEFAULTS, settings as kanban_settings
 
 
 PLUGIN_ID = 'hermes-urgency-engine'
@@ -31,6 +32,8 @@ READ_FIELDS = {
     'watchdog_health': ({}, {}),
     'watchdog_incidents': ({}, {'project_id': str, 'limit': int, 'after': str}),
     'watchdog_plans': ({}, {'project_id': str, 'limit': int, 'after': str}),
+    'kanban_health': ({}, {}),
+    'kanban_tasks': ({'project_id': str}, {'limit': int, 'after': str}),
 }
 # Explicit signature allowlists, not reflection into the Ledger or host.
 MUTATIONS = {
@@ -119,6 +122,18 @@ def setup_parser(parser, *, conversational=False):
     status.add_argument('--limit', type=int, default=100)
     status.add_argument('--after')
     commands.add_parser('diagnose', help='Read storage health; no repairs')
+    kanban = commands.add_parser('kanban', help='Cached canonical source facts; sync may recompute native readiness')
+    source = kanban.add_subparsers(dest='kanban_operation', required=True)
+    source.add_parser('health')
+    tasks = source.add_parser('tasks')
+    tasks.add_argument('--project', dest='project_id', required=True)
+    tasks.add_argument('--limit', type=int, default=100)
+    tasks.add_argument('--after')
+    if not conversational:
+        for name in ('sync', 'pause', 'resume'):
+            sub = source.add_parser(name)
+            sub.add_argument('--request-id', required=True)
+            sub.add_argument('--reason', required=True)
     watchdog = commands.add_parser('watchdog', help='Independent monitor and recovery plans')
     monitor = watchdog.add_subparsers(dest='watchdog_operation', required=True)
     monitor.add_parser('health')
@@ -253,6 +268,8 @@ class Runtime:
             settings = self.settings()
             if operation.startswith('watchdog_'):
                 return {'ok': True, 'data': self.monitor_read(operation.removeprefix('watchdog_'), arguments)}
+            if operation.startswith('kanban_'):
+                return {'ok': True, 'data': self.kanban_read(operation.removeprefix('kanban_'), arguments)}
             if operation in MUTATIONS:
                 storage = self.open(settings)
             else:
@@ -295,7 +312,7 @@ class Runtime:
                     has_more = bool(items and ledger.history(arguments['entity_type'], arguments['entity_id'], 1, items[-1]['sequence']))
                     data = dict(items=items, has_more=has_more, next=items[-1]['sequence'] if has_more else None)
                 else:
-                    data = dict(storage='available', schema=1, context_enabled=settings['context_enabled'], **EVIDENCE)
+                    data = dict(storage='available', schema=ledger.schema_version, context_enabled=settings['context_enabled'], **EVIDENCE)
             check_json(data)
             return {'ok': True, 'data': data}
         except LedgerError as exc:
@@ -342,6 +359,8 @@ class Runtime:
         operation = vars(args).get('operation')
         if operation == 'watchdog':
             return self.monitor_cli(args)
+        if operation == 'kanban':
+            return self.kanban_cli(args)
         if operation is None:
             setup_parser(Parser(prog='hermes urgency')).print_help()
             return 2
@@ -373,6 +392,51 @@ class Runtime:
 
     def monitor_config(self):
         return monitor_settings({key: self.ctx.get_config(key, default) for key, default in WATCHDOG_DEFAULTS.items()})
+
+    def kanban_config(self):
+        return kanban_settings({key: self.ctx.get_config(key, default) for key, default in KANBAN_DEFAULTS.items()})
+
+    def kanban_cli(self, args):
+        operation = args.kanban_operation
+        try:
+            if operation in ('health', 'tasks'):
+                data = self.kanban_read(operation, arguments_from(args, 'kanban_' + operation))
+            else:
+                cfg = self.kanban_config()
+                if not cfg['kanban_sync_enabled'] or not cfg['kanban_bindings']:
+                    data = dict(state='disabled')
+                else:
+                    with Sync.host(clock=self.clock, redact=lambda text: self.ctx.redact_text(text, force=True)) as sync:
+                        if operation in ('pause', 'resume'):
+                            data = sync.control(operation, args.request_id, args.reason)
+                        else:
+                            with self.open(self.settings()) as ledger:
+                                data = sync.scan(cfg, ledger, None, self.data_dir() / 'data.db', NativeSource(),
+                                                 request_id=args.request_id, reason=args.reason)
+            result = {'ok': data.get('state') not in ('partial', 'conflict'), 'data': data}
+        except LedgerError as exc:
+            result = self.error(exc, 'kanban_' + operation)
+        except Exception:
+            result = self.unexpected('kanban_' + operation)
+        rendered = self.render(result)
+        ok = json.loads(rendered)['ok']
+        print(rendered, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+
+    def kanban_read(self, operation, arguments):
+        cfg = self.kanban_config()
+        path = self.data_dir() / 'kanban.db'
+        if not path.exists():
+            return (dict(storage='uninitialized', enabled=cfg['kanban_sync_enabled'], coverage='unknown')
+                    if operation == 'health' else dict(items=[], next=None, has_more=False))
+        connection = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=.1)
+        with Sync(connection, clock=self.clock, redact=lambda text: self.ctx.redact_text(text, force=True), readonly=True) as sync:
+            if operation == 'tasks':
+                return sync.page(**arguments)
+            with sync.transaction(False):
+                return dict(storage='available', enabled=cfg['kanban_sync_enabled'],
+                            incomplete_scan=sync.meta('incomplete_scan'), cursor=sync.meta('cursor'),
+                            coverage='unknown')
 
     def monitor_read(self, operation, arguments, *, active=False):
         storage = Monitor.open(self.data_dir() / 'watchdog.db', clock=self.clock, readonly=True)
@@ -624,8 +688,8 @@ class Runtime:
             if not isinstance(raw_args, str) or len(raw_args) > MAX_INPUT_BYTES:
                 invalid('arguments')
             args = parser.parse_args(shlex.split(raw_args) or ['status'])
-            if args.operation == 'watchdog':
-                operation = 'watchdog_' + args.watchdog_operation
+            if args.operation in ('watchdog', 'kanban'):
+                operation = args.operation + '_' + getattr(args, args.operation + '_operation')
                 result = self.run_request(operation, arguments_from(args, operation), surface='slash', session_id=session_id)
             elif args.operation == 'focus':
                 result = self.focus(args.project_id, session_id)

@@ -28,7 +28,7 @@ class UrgencyPolicy:
 @dataclass(frozen=True)
 class ForecastInput:
     deadline: datetime
-    remaining_work_seconds: float
+    remaining_work_seconds: float | None
     verification_buffer_seconds: float = 0
     deployment_buffer_seconds: float = 0
     completion_samples_seconds: tuple[float, ...] = ()
@@ -43,8 +43,8 @@ class UrgencyState:
 @dataclass(frozen=True)
 class Forecast:
     time_remaining_seconds: float
-    deadline_slack_seconds: float
-    effective_slack_seconds: float
+    deadline_slack_seconds: float | None
+    effective_slack_seconds: float | None
     p50_seconds: float | None
     p90_seconds: float | None
     on_time_probability: float | None
@@ -126,7 +126,7 @@ def calculate_forecast(
         if elapsed < 0:
             raise ValueError("previous.changed_at must not be later than now")
     _validate_policy(policy)
-    work = _nonnegative(task.remaining_work_seconds, "remaining_work_seconds")
+    work = None if task.remaining_work_seconds is None else _nonnegative(task.remaining_work_seconds, "remaining_work_seconds")
     verification = _nonnegative(task.verification_buffer_seconds, "verification_buffer_seconds")
     deployment = _nonnegative(task.deployment_buffer_seconds, "deployment_buffer_seconds")
     durations = task.completion_samples_seconds
@@ -136,6 +136,16 @@ def calculate_forecast(
         _nonnegative(sample, f"completion_samples_seconds[{i}]")
         for i, sample in enumerate(durations)
     ]
+    if work is None:
+        raw = (UrgencyLevel.OVERDUE_RECOVERY_REQUIRED if time_left <= 0 else
+               UrgencyLevel.DEADLINE_IMMINENT if time_left <= policy.imminent_seconds else
+               UrgencyLevel.ELEVATED)
+        level, changed_at = raw, now
+        if previous is not None and previous.level >= raw:
+            level, changed_at = previous.level, previous.changed_at
+        return Forecast(time_left, None, None, None, None, None, len(samples),
+                        'insufficient_evidence', raw, level, changed_at,
+                        ('Remaining work is unknown; samples cannot replace a missing estimate.',))
     slack = time_left - work - verification
     effective = slack - deployment
     count = len(samples)

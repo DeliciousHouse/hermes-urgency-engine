@@ -62,6 +62,65 @@ class RuntimeTests(unittest.TestCase):
     def project(self, name='p'):
         return self.request('create_project', project_id=name, title='Objective SYNTHETIC_SECRET', request_id=name)
 
+    def test_kanban_local_cli_imports_and_controls_without_model_writes(self):
+        """protects=operator-only sync; fails_when=CLI cannot import or model mutates;
+        why_new=native command route; seam=source fixture and plugin storage replacement;
+        no_claim=installed native journey.
+        """
+        from unittest.mock import patch
+        from urgency_engine.kanban import Sync, NativeSource
+        self.project()
+        self.ctx.settings.update(kanban_sync_enabled=True,
+                                 kanban_bindings=[dict(board='demo', tenant='synthetic', project_id='p')])
+        def store(**kwargs):
+            return Sync(sqlite3.connect(self.root / 'kanban.db'), **kwargs)
+        parser = setup_parser(Parser())
+        def command(text):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = self.runtime.cli(parser.parse_args(text.split()))
+            self.assertEqual(code, 0, err.getvalue())
+            return json.loads(out.getvalue())['data']
+        with patch.object(Sync, 'host', side_effect=store), \
+             patch.object(NativeSource, 'inventory', return_value=[dict(id='task', tenant='synthetic')]), \
+             patch.object(NativeSource, 'detail', return_value=dict(task=dict(id='task', tenant='synthetic', title='Deliver', status='ready'), parents=[])):
+            self.assertEqual(command('kanban sync --request-id s --reason Fixture')['state'], 'complete')
+            self.assertEqual(command('kanban tasks --project p')['items'][0]['task_id'], 'task')
+            self.assertTrue(command('kanban pause --request-id pause --reason Fixture')['paused'])
+            self.assertFalse(command('kanban resume --request-id resume --reason Fixture')['paused'])
+        self.assertIsNone(self.request('task', board_id='demo', task_id='task')['data']['remaining_seconds'])
+        self.assertFalse(self.runtime.run_request('kanban_sync', {}, surface='tool')['ok'])
+
+    def test_diagnose_reports_actual_schema_after_unknown_work_write(self):
+        """protects=upgrade diagnostics; fails_when=schema1 reported for schema2;
+        why_new=migration; seam=real Runtime; no_claim=installed upgrade.
+        """
+        self.project()
+        result = self.request('upsert_task', board_id='b', task_id='t', project_id='p', goal='Unknown',
+                              remaining_seconds=None, expected_revision=0, reason='Fixture', request_id='t')
+        self.assertTrue(result['ok'], result)
+        self.assertIsNone(result['data']['remaining_seconds'])
+        self.assertEqual(self.request('diagnose')['data']['schema'], 2)
+
+    def test_kanban_cached_reads_do_not_initialize_or_collect(self):
+        """protects=opt-in read boundary; fails_when=reads collect/create storage;
+        why_new=canonical commands; seam=Runtime temp home; no_claim=native installation.
+        """
+        from unittest.mock import patch
+        from urgency_engine.kanban import NativeSource
+        with patch.object(NativeSource, 'inventory', side_effect=AssertionError('unexpected collection')):
+            for surface in ('cli', 'tool', 'slash', 'hook'):
+                health = self.runtime.run_request('kanban_health', {}, surface=surface)
+                self.assertTrue(health['ok'], health)
+                self.assertEqual(health['data']['storage'], 'uninitialized')
+                tasks = self.runtime.run_request('kanban_tasks', {'project_id': 'p'}, surface=surface)
+                self.assertTrue(tasks['ok'], tasks)
+                self.assertEqual(tasks['data']['items'], [])
+        self.assertFalse((self.root / 'kanban.db').exists())
+        self.assertFalse((self.root / 'data.db').exists())
+        self.assertFalse(json.loads(self.runtime.slash('kanban sync --request-id x --reason x'))['ok'])
+        self.assertTrue(json.loads(self.runtime.slash('kanban health'))['ok'])
+
     def test_watchdog_empty_reads_and_safe_native_observation(self):
         """protects=private telemetry; fails_when=body retained; seam=host-shaped hook."""
         from unittest.mock import patch
