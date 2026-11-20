@@ -100,3 +100,9 @@ jobs:
           "${clean[@]}" git -C "$installed" diff --exit-code HEAD
           "${clean[@]}" timeout 8m "$python" "$RUNNER_TEMP/plugin/tests/host_runtime.py" \
             --hermes-root "$host" --installed-home "$scratch/home" --tutorial
+          watchdog_home="$scratch/watchdog-home"
+          mkdir "$watchdog_home"
+          cp -r "$scratch/home/plugins" "$watchdog_home/plugins"
+          cp "$scratch/home/config.yaml" "$watchdog_home/config.yaml"
+          "${clean[@]}" timeout 8m "$python" "$RUNNER_TEMP/plugin/tests/host_watchdog.py" \
+            --hermes-root "$host" --installed-home "$watchdog_home"

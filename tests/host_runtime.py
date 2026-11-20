@@ -159,6 +159,7 @@ def journey(host, home, installed=False, tutorial=False):
         for name in ('__init__.py', 'plugin.yaml', 'pyproject.toml', 'README.md', 'LICENSE'):
             shutil.copy2(ROOT / name, target / name)
         shutil.copytree(ROOT / 'urgency_engine', target / 'urgency_engine', ignore=shutil.ignore_patterns('__pycache__'))
+        shutil.copytree(ROOT / 'scripts', target / 'scripts', ignore=shutil.ignore_patterns('__pycache__'))
         # Synthetic test config only; installed-public mode uses installer-produced config.
         (home / 'config.yaml').write_text('plugins:\n  enabled:\n    - hermes-urgency-engine\n', encoding='utf-8')
     if tutorial:
