@@ -628,9 +628,10 @@ class Monitor:
                         prior = records.get(field, {})
                         sample = prior.get('sample_at')
                         if value is None:
-                            # A coverage gap is ordered by delivery, not by sample time.
-                            records[field] = dict(prior or proof, value=None, sample_at=sample,
-                                                  gap_sequence=sequence)
+                            # Date the loss of coverage, not each report of continued absence.
+                            if not prior or prior['value'] is not None:
+                                records[field] = dict(prior or proof, value=None, sample_at=sample,
+                                                      gap_sequence=sequence)
                         elif sample is None or instant(value) > instant(sample):
                             sample = stamp(instant(value))
                             known = instant(proof['at']) >= cutoff

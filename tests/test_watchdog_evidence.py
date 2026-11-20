@@ -306,6 +306,47 @@ class EvidenceTests(unittest.TestCase):
                 self.signal(**{alternate: (sample + timedelta(seconds=1)).isoformat()})
                 self.assertIn('stale_claim', [n['detector'] for n in f.tick()['notices']])
 
+    def test_repeated_null_does_not_move_cross_field_coverage_gap(self):
+        # protects=episode/plan/notice continuity; fails_when=repeated null moves the gap;
+        # why_new=repeat after alternate replay and after valid fallback; seam=SQLite; no_claim=delivery.
+        for primary, alternate in (('claim_at', 'heartbeat_at'), ('heartbeat_at', 'claim_at')):
+            with self.subTest(primary=primary):
+                self.setUp()
+                f = self.f
+                self.signal(**{primary: (f.now - timedelta(seconds=901)).isoformat()})
+                self.assertEqual([n['detector'] for n in f.tick()['notices']], ['stale_claim'])
+                self.advance(1)
+                sample = f.now.isoformat()
+                self.signal(**{primary: sample})
+                f.tick()
+                resolved = self.state('stale_claim')
+                self.assertEqual(len(resolved), 1)
+                self.assertEqual(resolved[0][2:5], ('resolved', 'resolved', 1))
+
+                self.advance(1)
+                self.signal(**{primary: None})
+                self.assertEqual(f.tick()['notices'], [])
+                self.advance(900)
+                self.signal(**{alternate: sample})
+                self.assertEqual(f.tick()['notices'], [])
+                for _ in range(2):
+                    self.advance(1)
+                    self.signal(**{primary: None})
+                    self.assertEqual(f.tick()['notices'], [])
+                    self.assertEqual(self.state('stale_claim'), resolved)
+
+                self.advance(1)
+                self.signal(**{alternate: f.now.isoformat()})
+                self.assertEqual(f.tick()['notices'], [])
+                self.advance(900)
+                self.signal(**{primary: None})
+                notices = [n for n in f.tick()['notices'] if n['detector'] == 'stale_claim']
+                self.assertEqual(len(notices), 1)
+                final = self.state('stale_claim')
+                self.assertEqual(len(final), 2)
+                self.assertEqual(final[0], resolved[0])
+                self.assertEqual((final[1][0], *final[1][2:5]), (2, 'active', 'recommended', 1))
+
     def test_timestamp_coverage_does_not_reappear_after_retention(self):
         # protects=retained identity without retained coverage; fails_when=raw pruning permits replay;
         # why_new=retention with no intervening tick; seam=clock/reopened SQLite; no_claim=disk quota.

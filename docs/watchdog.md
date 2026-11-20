@@ -153,10 +153,12 @@ normalized UTC timestamp in the payload is the sample identity and watermark.
 Equal/older samples never replace the watermark or refresh coverage. A known,
 uninterrupted sample still ages at the configured threshold, without new traffic.
 Null, retention expiry, or verified scope end can remove coverage without erasing
-the watermark. Sparse updates do not renew the source. After a gap, an older or
-equal sample stays unknown even in a new delivery; a cached claim cannot fill a
-heartbeat gap. An alternate sample offered after loss must be newer than the lost
-sample, not just delivered later. Continuity survives monitor reopen and pruning.
+the watermark. Sparse updates do not renew the source. Repeated null reports
+record continued absence without moving the start of the gap. An alternate
+sample offered after loss must be newer than the lost sample, not just delivered
+later. Repeating null neither makes an equal replay eligible nor interrupts a
+newer alternate sample that is still known. Continuity survives monitor reopen
+and pruning.
 
 Task progress and scope use the authoritative task revision; commitments use the
 deadline revision and audited replan when needed. Tool and recovery outcomes use
