@@ -372,6 +372,50 @@ class EvidenceTests(unittest.TestCase):
                 self.assertEqual([n['detector'] for n in f.tick()['notices'] if n['detector'] == 'stale_claim'],
                                  ['stale_claim'])
 
+    def test_recurrence_keeps_distinct_incident_and_plan_ids_after_retention(self):
+        for field, prune_on_observe in (('claim_at', True), ('heartbeat_at', False)):
+            with self.subTest(field=field):
+                self.setUp()
+                f = self.f
+
+                def notices():
+                    return [n['incident_id'] for n in f.tick()['notices'] if n['detector'] == 'stale_claim']
+
+                def plans():
+                    monitor = f.monitor(True)
+                    assert monitor is not None
+                    with monitor:
+                        items = monitor.page('plans')['items']
+                        assert isinstance(items, list)
+                        return items
+
+                seen = set()
+                for episode in (1, 2, 3):
+                    self.signal(**{field: (f.now - timedelta(seconds=901)).isoformat()})
+                    identity, = notices()
+                    active, = self.state('stale_claim')
+                    self.assertNotIn(identity, seen)
+                    self.assertEqual(active[:5], (episode, identity, 'active', 'recommended', 1))
+                    plan, = [p for p in plans() if p['incident_id'] == identity]
+                    self.assertEqual(plan['plan_id'], identity)
+                    seen.add(identity)
+                    self.assertEqual(notices(), [])
+
+                    self.advance(1)
+                    recovered = f.now.isoformat()
+                    self.signal(**{field: recovered})
+                    notices()
+                    resolved, = self.state('stale_claim')
+                    self.assertEqual(resolved[:5], (episode, identity, 'resolved', 'resolved', 1))
+                    self.advance(31 * 86400)
+                    if not prune_on_observe:
+                        self.assertEqual(notices(), [])
+                    self.signal(**{field: None})
+                    self.signal(**{field: recovered})
+                    self.assertEqual(notices(), [])
+                    self.assertEqual(self.state('stale_claim'), [])
+                    self.assertFalse(any(p['incident_id'] in seen for p in plans()))
+
     def test_atomic_claim_family_delivery_matrix(self):
         # protects=episode/plan/notice stability; fails_when=delivery order mints evidence;
         # why_new=combined and split null/replay permutations; seam=clock/reopened SQLite;

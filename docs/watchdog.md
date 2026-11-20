@@ -132,6 +132,8 @@ Unknown coverage preserves incident/plan identity, episode, last-seen time,
 pending sources, notice count and next reminder time, and emits no repeated
 reminder. Returning fault evidence resumes the same episode and notice budget.
 A new episode follows actual recovery and a later fault, not missing telemetry.
+Its episode number advances and its incident and plan IDs are distinct, even if
+retention has removed the previous resolved records.
 Positive partial recovery can update source evidence without sending a notice;
 other pending sources still keep the incident active. Graph and explicit signals
 are independent sources. Explicit failure counts and correlated tool outcomes
@@ -184,7 +186,7 @@ models, delegate, reclaim tasks, extend deadlines, remove criteria or spend mone
 
 `plugin_db('hermes-urgency-engine', 'watchdog.db')` owns monitor schema 1 separately
 from unchanged ledger `data.db` schema 1. Tables: `monitor_meta` (cursor, generation,
-install/scan/forecast state and compact admitted source watermarks), `observations` (typed events), `task_signals`
+install/scan/forecast state, compact admitted source watermarks and pruned episode counters), `observations` (typed events), `task_signals`
 (current sparse metadata), `dependencies` (edges), `incidents` (episodes), `plans`
 (recommendations), `monitor_audit` (control/event replay hashes and results).
 Registration does no I/O. Explicit mutations open write storage; reads open existing
@@ -203,8 +205,11 @@ accounting, inside the tick transaction. Incidents beyond that cap keep their ne
 reminder due instead of consuming it.
 A 10000-task board needs a larger row cap than the default because each task also
 has retained monitor metadata. Exceeding capacity rolls back the transaction.
-Old observations and resolved episodes expire by retention time; active records,
-control replay and ledger audit are not silently evicted. Disk quota is not guaranteed.
+Old observations and resolved episodes expire by retention time. One counter per
+entity and detector with pruned history counts toward the row cap and prevents
+ID reuse. It cannot recover episode numbers already pruned by earlier code.
+Active records, control replay and ledger audit are not silently evicted.
+Disk quota is not guaranteed.
 
 ## Why detection and delivery are separate
 

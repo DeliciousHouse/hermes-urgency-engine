@@ -22,7 +22,7 @@ CLAIM_SOURCES = ('heartbeat_at', 'claim_at')
 LIMITATIONS = ['Plans are recommendations, not authorization or executed recovery.',
                'Byte identity is not semantic acceptance. Missing telemetry is unknown.',
                'Notice generation cannot prove stdout emission or remote delivery; reconcile unknown emissions.',
-               'Retention never prunes active incidents, control replay or ledger audit; disk quota is not guaranteed.']
+               'Retention never prunes active incidents, episode counters, control replay or ledger audit; disk quota is not guaranteed.']
 SCHEMA = (
     'CREATE TABLE monitor_meta(key TEXT PRIMARY KEY, value_json TEXT NOT NULL)',
     'CREATE TABLE observations(event_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, board_id TEXT, task_id TEXT, kind TEXT NOT NULL, occurred_at TEXT NOT NULL, received_at TEXT NOT NULL, source TEXT NOT NULL, payload_json TEXT NOT NULL)',
@@ -391,6 +391,12 @@ class Monitor:
             (task_id IS NULL OR EXISTS (SELECT 1 FROM monitor_meta m JOIN monitor_audit a
              ON a.request_id=o.event_id WHERE m.key='evidence:' || json_array(o.board_id,o.task_id)
              AND json_extract(m.value_json,'$.sequence')>=a.sequence))''', (cutoff,))
+        # Keep one episode high-water mark per fingerprint, not the expired rows.
+        self.db.execute('''INSERT INTO monitor_meta(key,value_json)
+            SELECT 'episode:' || fingerprint, CAST(MAX(episode) AS TEXT)
+            FROM incidents WHERE state='resolved' AND last_seen<? GROUP BY fingerprint
+            ON CONFLICT(key) DO UPDATE SET value_json=CAST(MAX(
+                CAST(monitor_meta.value_json AS INTEGER), CAST(excluded.value_json AS INTEGER)) AS TEXT)''', (cutoff,))
         self.db.execute("DELETE FROM plans WHERE incident_id IN (SELECT incident_id FROM incidents WHERE state='resolved' AND last_seen<?)", (cutoff,))
         self.db.execute("DELETE FROM incidents WHERE state='resolved' AND last_seen<?", (cutoff,))
 
@@ -835,8 +841,8 @@ class Monitor:
             new = not old or old['state'] == 'resolved'
             if new:
                 self.capacity(cfg, 2)
-                episode = old['episode'] + 1 if old else 1
                 fingerprint = prefix + ':' + detector
+                episode = 1 + max(old['episode'] if old else 0, self.meta('episode:' + fingerprint, 0))
                 identity = digest([fingerprint, episode])
                 self.db.execute('INSERT INTO incidents VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                     (identity, task['project_id'], task['board_id'], task['task_id'], detector, episode, 'active', stamp(now), stamp(now), stamp(now), 0, fingerprint, _json(explanation)))
