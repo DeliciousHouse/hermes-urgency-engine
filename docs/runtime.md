@@ -2,7 +2,8 @@
 
 This development plugin exposes the ledger through `hermes urgency`, `/urgency`
 and the read-only `urgency_query` tool. It adds advisory context before a model
-turn. It does not interrupt inference, run a watchdog, coordinate workers,
+turn. An opt-in [independent watchdog](watchdog.md) records incidents and recommended
+plans through no-agent cron. It does not interrupt inference or coordinate workers,
 synchronize a board, control external services, or provide a Desktop dashboard.
 Byte identity is **not independent semantic quality acceptance**.
 
