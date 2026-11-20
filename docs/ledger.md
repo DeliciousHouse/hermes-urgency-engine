@@ -25,7 +25,7 @@ Both return a context manager. `connection` is a dedicated `sqlite3.Connection`,
 
 `clock` is a callable returning an aware `datetime`. `artifact_root` is an existing directory configured by trusted application code, never supplied by an agent's command payload. Keep that root and its ancestors under operator control. Do not point it at a filesystem writable by an adversary.
 
-`open_hermes_ledger` lazily calls the documented `plugins.plugin_storage.plugin_db('hermes-urgency-engine')` on **every open**, following the active Hermes profile without caching a connection. This is the sole production opener. Offline callers inject their own temporary connection. No Hermes modules are needed merely to import the library. See the [Hermes plugin documentation](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/).
+`open_hermes_ledger` lazily calls the documented `plugins.plugin_storage.plugin_db('hermes-urgency-engine')` on **every open**, following the active Hermes profile without caching a connection. Mutations use this opener. Native read-only queries and the pre-turn hook use `open_readonly_ledger` to read an existing database without initializing one. Offline callers inject their own temporary connection. No Hermes modules are needed merely to import the library. See the [Hermes plugin documentation](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/).
 
 `busy_timeout_ms` is an integer from 0 to 5000 (not bool). The default retains the library wait budget; the native hook uses 100 ms to fail open promptly under a held write lock.
 
