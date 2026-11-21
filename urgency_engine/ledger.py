@@ -615,6 +615,10 @@ class Ledger:
             raise LedgerError('NOT_FOUND', 'read', 'deadline_id')
         return dict(row)
 
+    def get_deadline(self, deadline_id):
+        with self._transaction('get_deadline'):
+            return self._deadline(deadline_id)
+
     @_command
     def set_deadline(self, deadline_id, *, project_id, kind, at, timezone, owner, source,
                      request_id, actor, board_id=None, task_id=None, milestone_id=None):

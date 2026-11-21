@@ -6,8 +6,11 @@ This development plugin exposes a local deadline/progress ledger and advisory pr
 
 The optional watchdog uses Hermes no-agent cron to record incidents and recommend next steps. It does not execute recovery actions or treat missing telemetry as proof of health.
 
+In supervised mode, a local operator can change a bound Kanban task's priority, revise its remaining estimate, or move a soft target. Recovery-card creation and autonomous execution are unavailable.
+
 - [Canonical Kanban synchronization, scope and operating guide](docs/kanban.md)
 - [Independent watchdog, incidents, plans and no-agent tutorial](docs/watchdog.md)
+- [Supervised interventions, outcomes and rollback](docs/interventions.md)
 - [Native installation, commands, configuration and executable tutorial](docs/runtime.md)
 - [Ledger API, evidence limits and temporary-database tutorial](docs/ledger.md)
 - [Forecast API and policy](docs/forecast.md#forecast-api)

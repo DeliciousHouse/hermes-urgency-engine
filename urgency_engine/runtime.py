@@ -11,11 +11,13 @@ import sqlite3
 import sys
 import time
 import traceback
+from typing import NoReturn
 import uuid
 
 from .ledger import Ledger, LedgerError, open_hermes_ledger, open_readonly_ledger
 from .watchdog import Monitor, DEFAULTS as WATCHDOG_DEFAULTS, LIMITATIONS, settings as monitor_settings
 from .kanban import Sync, NativeSource, DEFAULTS as KANBAN_DEFAULTS, settings as kanban_settings
+from . import interventions
 
 
 PLUGIN_ID = 'hermes-urgency-engine'
@@ -55,7 +57,7 @@ DEFAULTS = dict(context_enabled=True, context_max_chars=4000, default_project=''
                 artifact_root='', diagnostic_log_bytes=1048576)
 
 
-def invalid(field=None, code='INVALID_INPUT'):
+def invalid(field=None, code='INVALID_INPUT') -> NoReturn:
     raise LedgerError(code, 'runtime', field)
 
 
@@ -163,6 +165,19 @@ def setup_parser(parser, *, conversational=False):
         focus = commands.add_parser('focus', help='Select a project for this session, or clear')
         focus.add_argument('project_id')
     else:
+        actions = commands.add_parser('interventions', help='Inspect or run supervised local interventions')
+        intervention = actions.add_subparsers(dest='intervention_operation', required=True)
+        intervention.add_parser('apply').add_argument('--json-file', required=True)
+        history = intervention.add_parser('list')
+        history.add_argument('--project', required=True)
+        history.add_argument('--limit', type=int, default=100)
+        history.add_argument('--after')
+        for name in ('show', 'reconcile'):
+            intervention.add_parser(name).add_argument('action_id')
+        for name in ('pause', 'resume'):
+            sub = intervention.add_parser(name)
+            sub.add_argument('--request-id', required=True)
+            sub.add_argument('--reason', required=True)
         apply = commands.add_parser('apply', help='Local operator writes; see docs/runtime.md for JSON fields')
         apply.add_argument('mutation', choices=tuple(MUTATIONS))
         apply.add_argument('--json-file', required=True, help='UTF-8 object file, or - for stdin; at most 256 KiB')
@@ -368,24 +383,192 @@ class Runtime:
             setup_parser(Parser(prog='hermes urgency')).print_help()
             return 2
         try:
-            if operation == 'apply':
-                operation = args.mutation
+            if operation == 'interventions' and args.intervention_operation in ('show', 'reconcile'):
+                operation = 'interventions_' + args.intervention_operation
+                path = self.data_dir() / 'interventions.db'
+                store = interventions.Actions.read(path, self.clock)
+                if store is None:
+                    invalid('action_id', 'NOT_FOUND')
+                with store, store.transaction(False):
+                    data = store.display(store.get(args.action_id))
+                if args.intervention_operation == 'reconcile':
+                    interventions.operator_only()
+                    with interventions.Actions.host(self.clock) as store:
+                        data = interventions.reconcile(store, args.action_id, self.intervention_observe)
+                    result = self.intervention_result(data, operation)
+                else:
+                    result = {'ok': True, 'data': data}
+            elif operation == 'interventions' and args.intervention_operation in ('pause', 'resume'):
+                operation = 'interventions_' + args.intervention_operation
+                from .ledger import _id, _text
+                interventions.operator_only()
+                _id(args.request_id, 'request_id')
+                _text(args.reason, 'reason', 1024)
+                if any(self.ctx.redact_text(v, force=True) != v for v in (args.request_id, args.reason)):
+                    invalid('arguments', 'REDACTION_REFUSED')
+                with interventions.Actions.host(self.clock) as store:
+                    result = {'ok': True, 'data': store.control(args.intervention_operation, args.request_id, args.reason)}
+            elif operation == 'interventions' and args.intervention_operation == 'list':
+                operation = 'interventions_list'
+                from .ledger import _id, _integer
+                _id(args.project, 'project_id')
+                _integer(args.limit, 'limit', 1, 500)
+                if args.after is not None:
+                    _id(args.after, 'after')
+                store = interventions.Actions.read(self.data_dir() / 'interventions.db', self.clock)
+                if store is None:
+                    data = dict(items=[], next=None, has_more=False)
+                else:
+                    with store, store.transaction(False):
+                        data = store.page(args.project, args.limit, args.after)
+                result = {'ok': True, 'data': data}
+            elif operation in ('apply', 'interventions'):
+                operation = args.mutation if operation == 'apply' else 'interventions_apply'
                 if args.json_file == '-':
                     arguments = read_json(sys.stdin.buffer)
                 else:
                     with Path(args.json_file).open('rb') as stream:
                         arguments = read_json(stream)
+                if operation == 'interventions_apply':
+                    result = self.intervention_apply(arguments)
+                else:
+                    result = self.run_request(operation, arguments, surface='cli', session_id=None)
             else:
-                arguments = arguments_from(args, operation)
-            result = self.run_request(operation, arguments, surface='cli', session_id=None)
+                result = self.run_request(operation, arguments_from(args, operation), surface='cli', session_id=None)
         except LedgerError as exc:
             result = self.error(exc, operation)
         except (OSError, ValueError, UnicodeError, RecursionError):
             result = self.error(LedgerError('INVALID_INPUT', operation, 'json_file'), operation)
+        except Exception:
+            result = self.unexpected(operation)
         rendered = self.render(result)
         ok = json.loads(rendered)['ok']
         print(rendered, file=sys.stdout if ok else sys.stderr)
         return 0 if ok else 1
+
+    def intervention_apply(self, payload):
+        interventions.validate(payload, lambda text: self.ctx.redact_text(text, force=True))
+        if payload['kind'] == 'create_recovery_task':
+            interventions.refuse_recovery()
+        interventions.operator_only()
+        interventions.host_stop()
+        mode = self.ctx.get_config('intervention_mode', 'advisory')
+        if mode not in ('advisory', 'supervised', 'autonomous'):
+            invalid('intervention_mode', 'INVALID_CONFIG')
+        if mode != 'supervised':
+            raise LedgerError('CAPABILITY_UNAVAILABLE' if mode == 'autonomous' else 'READ_ONLY',
+                              'interventions_apply', 'intervention_mode',
+                              next_action='Use supervised mode for explicit local interventions.')
+        with interventions.Actions.host(self.clock) as store:
+            data = interventions.execute(store, payload, self.intervention_preflight,
+                                         self.intervention_effect, self.intervention_observe)
+        return self.intervention_result(data, 'interventions_apply')
+
+    def intervention_result(self, data, operation):
+        if data['state'] == 'applied':
+            return {'ok': True, 'data': data}
+        uncertain = data['state'] in ('in_flight', 'unknown', 'observed')
+        result = self.error(LedgerError(data['last_error'] or 'OUTCOME_UNKNOWN', operation,
+                                      side_effects='unknown' if uncertain else 'none'), operation)
+        if data['next_action']:
+            result['error']['next_action'] = data['next_action']
+        result['data'] = data
+        return result
+
+    def intervention_binding(self, payload):
+        cfg = self.kanban_config()
+        matches = [b for b in cfg['kanban_bindings'] if (b['board'], b['project_id']) ==
+                   (payload['board_id'], payload['project_id'])]
+        if not cfg['kanban_sync_enabled'] or len(matches) != 1:
+            invalid('binding', 'SOURCE_DENIED')
+        return cfg, matches[0]
+
+    def intervention_preflight(self, payload):
+        from .kanban import project
+        cfg, binding = self.intervention_binding(payload)
+        key = payload['board_id'], payload['task_id']
+        source = project(NativeSource().detail(binding, key[1]), binding, self.clock(),
+                         lambda text: self.ctx.redact_text(text, force=True))
+        if source['task_id'] != key[1] or source['status'] not in ('todo', 'ready', 'blocked') or source['worker']['run_id']:
+            invalid('status', 'SOURCE_DENIED')
+        path = self.data_dir() / 'kanban.db'
+        if not path.exists():
+            invalid('coverage', 'SOURCE_UNAVAILABLE')
+        db = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=.1)
+        with Sync(db, clock=self.clock, redact=str, readonly=True) as sync:
+            if not sync.action_scope(binding, key[1], source, cfg['kanban_sync_seconds']):
+                invalid('coverage', 'SOURCE_UNAVAILABLE')
+        storage = Monitor.open(self.data_dir() / 'watchdog.db', clock=self.clock, readonly=True)
+        if storage is None:
+            invalid('incident_id', 'NOT_FOUND')
+        with storage, storage.transaction(False):
+            health = storage.health()
+            if health['paused'] or not (self.monitor_config()['watchdog_enabled'] or
+                                        (health['installed'] or {}).get('state') == 'installed'):
+                invalid('incident_id', 'SOURCE_DENIED')
+            scope = storage.action_scope(payload['incident_id'], payload['plan_id'])
+        if (scope is None or scope[0]['project_id'] != payload['project_id'] or
+                list(key) not in scope[1]['affected_tasks'] or
+                scope[0]['task_id'] is not None and (scope[0]['board_id'], scope[0]['task_id']) != key):
+            invalid('incident_id', 'SCOPE_CONFLICT')
+        with open_readonly_ledger(self.data_dir() / 'data.db', clock=self.clock) as ledger:
+            task = ledger.get_task(*key)
+            if payload['kind'] == 'replan_soft_deadline':
+                params = payload['parameters']
+                deadline = ledger.get_deadline(params['deadline_id'])
+                bound = (deadline['board_id'], deadline['task_id']) == key or (
+                    deadline['board_id'] is None and scope[1]['deadline'] == deadline['deadline_id'])
+                if deadline['project_id'] != payload['project_id'] or deadline['kind'] != 'soft' or not bound:
+                    invalid('deadline_id', 'SCOPE_CONFLICT')
+                if deadline['revision'] != params['expected_deadline_revision']:
+                    invalid('expected_deadline_revision', 'REVISION_CONFLICT')
+        if task['project_id'] != payload['project_id'] or task['status'] not in ('planned', 'blocked'):
+            invalid('task_id', 'SOURCE_DENIED')
+        if task['revision'] != payload['expected_revision']:
+            invalid('expected_revision', 'REVISION_CONFLICT')
+        return task
+
+    def intervention_effect(self, payload, action_id, task):
+        interventions.host_stop()
+        if payload['kind'] == 'set_priority':
+            _, binding = self.intervention_binding(payload)
+            return NativeSource().assign_priority(binding, payload['task_id'], payload['parameters']['priority'])
+        with self.open(self.settings()) as ledger:
+            if payload['kind'] == 'replan_soft_deadline':
+                params = payload['parameters']
+                result = ledger.revise_deadline(params['deadline_id'], at=params['at'], timezone=params['timezone'],
+                    expected_revision=params['expected_deadline_revision'], intent='operator', reason=payload['reason'],
+                    actor='local-operator', request_id=action_id + ':intervention')
+                return interventions.deadline_effect(result)
+            result = ledger.upsert_task(payload['board_id'], payload['task_id'],
+                **{k: task[k] for k in ('project_id', 'goal', 'assignee', 'status', 'verification_seconds',
+                                       'deployment_seconds', 'actual_seconds')},
+                **payload['parameters'], expected_revision=payload['expected_revision'],
+                reason=payload['reason'], actor='local-operator', request_id=action_id + ':intervention')
+        return interventions.task_effect(result)
+
+    def intervention_observe(self, payload, receipt):
+        if payload['kind'] == 'set_priority':
+            _, binding = self.intervention_binding(payload)
+            row = NativeSource().detail(binding, payload['task_id']).get('task')
+            if (not isinstance(row, dict) or row.get('id') != payload['task_id'] or
+                    row.get('tenant') != binding['tenant'] or type(row.get('priority')) is not int):
+                invalid('task_id', 'SOURCE_MALFORMED')
+            effect = {'priority': row['priority']}
+            return effect, effect == payload['parameters'] and (receipt is None or receipt == effect)
+        with open_readonly_ledger(self.data_dir() / 'data.db', clock=self.clock) as ledger:
+            if payload['kind'] == 'replan_soft_deadline':
+                from .ledger import _date
+                params = payload['parameters']
+                deadline = ledger.get_deadline(params['deadline_id'])
+                effect = interventions.deadline_effect(deadline)
+                matches = (effect == receipt if receipt is not None else
+                           (effect['target_at'], effect['timezone']) == (_date(params['at'], params['timezone']), params['timezone']))
+                return effect, deadline['project_id'] == payload['project_id'] and deadline['kind'] == 'soft' and matches
+            task = ledger.get_task(payload['board_id'], payload['task_id'])
+        effect = interventions.task_effect(task)
+        return effect, task['project_id'] == payload['project_id'] and (
+            effect == receipt if receipt is not None else effect['remaining_seconds'] == payload['parameters']['remaining_seconds'])
 
     def tool(self, args, **kwargs):
         if not isinstance(args, dict) or set(args) - {'operation', 'arguments'}:

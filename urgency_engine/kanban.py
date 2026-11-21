@@ -38,7 +38,7 @@ def fail(field, code='SOURCE_MALFORMED') -> NoReturn:
     raise LedgerError(code, 'kanban', field)
 
 
-def read_process(argv, *, timeout=20, limit=16 * 1024 * 1024):
+def read_process(argv, *, timeout=20, limit=16 * 1024 * 1024, receipt=None):
     """Bound stdout in memory; retain no stderr or native private task bodies."""
     output = bytearray()
     overflow = threading.Event()
@@ -74,6 +74,9 @@ def read_process(argv, *, timeout=20, limit=16 * 1024 * 1024):
         if reader.is_alive():
             fail('transport', 'SOURCE_TIMEOUT')
         if child.returncode:
+            if receipt is not None:
+                # The edit CLI has no structured no-effect refusal receipt.
+                raise LedgerError('NATIVE_EDIT_FAILED', 'kanban', side_effects='unknown')
             fail('transport', 'SOURCE_DENIED')
     finally:
         if child.poll() is None:
@@ -82,6 +85,10 @@ def read_process(argv, *, timeout=20, limit=16 * 1024 * 1024):
         if reader.ident is not None:
             reader.join(timeout)
         child.stdout.close()
+    if receipt is not None:
+        if output.strip() != receipt:
+            raise LedgerError('SOURCE_MALFORMED', 'kanban', side_effects='unknown')
+        return True
     try:
         def pairs(items):
             result = {}
@@ -136,6 +143,16 @@ class NativeSource:
         if not isinstance(rows, list):
             fail('tasks')
         return rows
+
+    def assign_priority(self, binding, task_id, priority):
+        import sys
+        self._check_board(binding)
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', task_id):
+            fail('task_id', 'INVALID_INPUT')
+        _integer(priority, 'priority', -(2**63 - 1), 2**63 - 1)
+        self.run([sys.executable, '-m', 'hermes_cli.main', 'kanban', '--board', binding['board'],
+                  'edit', task_id, '--priority', str(priority)], receipt=f'Edited {task_id}'.encode())
+        return {'priority': priority}
 
 
 def settings(values):
@@ -345,6 +362,25 @@ class Sync:
         more = len(rows) > limit
         after = _json([items[-1]['board_id'], items[-1]['task_id']]).encode().hex() if more else None
         return dict(items=items, has_more=more, next=after)
+
+    def action_scope(self, binding, task_id, source, max_age):
+        """Require fresh unchanged facts and complete retained dependency coverage."""
+        key = binding['board'], task_id
+        with self.transaction(False):
+            if self.meta('paused', False) or self.meta('incomplete_scan') or self.meta('dirty_bindings'):
+                return False
+            row = self.db.execute('SELECT projection_json FROM sources WHERE board_id=? AND task_id=? '
+                                  'AND project_id=? AND tenant=?', (*key, binding['project_id'], binding['tenant'])).fetchone()
+            if not row:
+                return False
+            item = json.loads(row[0])
+            age = (self.clock() - datetime.fromisoformat(item['observed_at'])).total_seconds()
+            graph_key = 'graph:' + _json(list(key))
+            graph = self.meta(graph_key) or {}
+            return (0 <= age <= max_age and item['coverage'] != 'unknown' and
+                    item['source_digest'] == source['source_digest'] and
+                    not self.meta(graph_key + ':pending') and not self.meta(graph_key + ':desired') and
+                    graph.get('data', {}).get('dependency_state') == 'available')
 
     def control(self, action, request_id, reason):
         _id(request_id, 'request_id')
