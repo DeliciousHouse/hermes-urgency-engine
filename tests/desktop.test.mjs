@@ -48,6 +48,64 @@ test('portfolio renders authoritative project names and risk without status-deri
   assert.match(text, /table/);
 });
 
+test('command sender retains exact payload after lost reply and refuses another intent', async () => {
+  const {api} = await load();
+  const sent = [];
+  const sender = api.commandSender({rest: async (path, options) => {
+    sent.push(options.body);
+    if (sent.length === 1) throw new Error('lost reply');
+    return {ok: true, data: {project_id: 'a'}};
+  }}, {connection: 'local', profile: 'default', epoch: 1});
+  await assert.rejects(sender.send('create_project', {project_id: 'a', title: 'Alpha'}), /lost reply/);
+  await assert.rejects(sender.send('create_project', {project_id: 'b', title: 'Beta'}), /Reconcile/);
+  await sender.reconcile();
+  assert.equal(sent.length, 2);
+  assert.equal(sent[0], sent[1]);
+  assert.equal(sent[0].arguments.project_id, 'a');
+});
+
+test('open legacy gateway without a registry id is not labeled disconnected', async () => {
+  const {api} = await load();
+  assert.equal(api.connectionLabel(null, 'open'), 'Active gateway (connection identity unavailable)');
+  assert.equal(api.connectionLabel('remote-a', 'open'), 'remote-a');
+  assert.equal(api.connectionLabel(null, 'closed'), 'Gateway disconnected');
+});
+
+test('project form exposes named fields and never accepts an actor', async () => {
+  const {api} = await load();
+  const tree = JSON.stringify(api.ProjectForm({sender: {}, onSaved() {}, disabled: false}));
+  assert.match(tree, /Project ID/);
+  assert.match(tree, /Project name/);
+  assert.match(tree, /Create project/);
+  assert.doesNotMatch(tree, /actor/);
+});
+
+test('timeline exposes distinct target forecast actual and original labels', async () => {
+  const {api} = await load();
+  const tree = JSON.stringify(api.Timeline({commitments: [{deadline_id: 'd', kind: 'hard',
+    original_at: '2030-01-01T00:00:00Z', target_at: '2030-01-02T00:00:00Z',
+    forecast_at: '2030-01-03T00:00:00Z', actual_verified_at: null}],
+    start: '2030-01-01T00:00:00Z', end: '2030-01-04T00:00:00Z', now: '2030-01-02T00:00:00Z', onSelect() {}}));
+  for (const label of ['Original', 'Hard target', 'Forecast', 'Current time']) assert.match(tree, new RegExp(label));
+  assert.doesNotMatch(tree, /Actual completion/);
+});
+
+test('registered page mounts creation controls and native reads', async () => {
+  const {api} = await load();
+  const contributions = [];
+  const ctx = {register: c => contributions.push(c), onEvent() {}, onDispose() {}};
+  api.default.register(ctx);
+  function expand(node) {
+    if (Array.isArray(node)) return node.map(expand);
+    if (!node || typeof node !== 'object') return node;
+    if (typeof node.type === 'function') return expand(node.type(node.props));
+    return {...node, props: {...node.props, children: expand(node.props?.children)}};
+  }
+  const tree = JSON.stringify(expand(contributions.find(c => c.area === 'routes').render()));
+  assert.match(tree, /Create project/);
+  assert.match(tree, /Loading verified measurements/);
+});
+
 test('unified plugin registers page, sidebar, palette and status', async () => {
   const {api, navigate} = await load();
   const contributions = [];

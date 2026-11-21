@@ -51,14 +51,21 @@ def respond(action):
 def read_view(action):
     from hermes_constants import get_hermes_home
     path = get_hermes_home() / 'plugin-data' / 'hermes-urgency-engine' / 'data.db'
-    with _ledger.open_readonly_ledger(path, clock=clock) as ledger:
+    try:
+        storage = _ledger.open_readonly_ledger(path, clock=clock)
+    except _ledger.LedgerError as exc:
+        if exc.code != 'NOT_FOUND':
+            raise
+        import sqlite3
+        storage = _ledger.Ledger(sqlite3.connect(':memory:'), clock=clock, artifact_root=path.parent)
+    with storage as ledger:
         return action(_desktop.Views(ledger, clock=clock))
 
 
-def page_arguments(request):
+def page_arguments(request, extra=()):
     # No path/home/profile payload can select storage. `profile` is consumed by
     # the host's authenticated routing dependency, never by this adapter.
-    if set(request.query_params) - {'limit', 'after', 'profile'}:
+    if set(request.query_params) - {'limit', 'after', 'profile'} - set(extra):
         raise _ledger.LedgerError('INVALID_INPUT', 'desktop', 'query')
     if any(len(request.query_params.getlist(key)) != 1 for key in request.query_params):
         raise _ledger.LedgerError('INVALID_INPUT', 'desktop', 'query')
@@ -79,6 +86,86 @@ def portfolio(request: Request):
 @router.get('/projects/{project_id}')
 def project(project_id: str):
     return respond(lambda: read_view(lambda view: view.project(project_id)))
+
+
+@router.get('/projects/{project_id}/timeline')
+def timeline(project_id: str, request: Request):
+    def read():
+        arguments = page_arguments(request, ('start', 'end'))
+        return read_view(lambda view: view.timeline(project_id, start=request.query_params.get('start'),
+                                                    end=request.query_params.get('end'), **arguments))
+    return respond(read)
+
+
+@router.get('/projects/{project_id}/history')
+def history(project_id: str, request: Request):
+    def read():
+        arguments = page_arguments(request)
+        after = arguments['after']
+        if after is not None:
+            if not after.isascii() or not after.isdecimal() or len(after) > 18:
+                raise _ledger.LedgerError('INVALID_INPUT', 'desktop', 'after')
+            arguments['after'] = int(after)
+        def records(view):
+            view.ledger.get_project(project_id)
+            rows = view.ledger.history('project', project_id, **arguments)
+            more = bool(rows and view.ledger.history('project', project_id, 1, rows[-1]['sequence']))
+            return {'items': rows, 'has_more': more, 'next': rows[-1]['sequence'] if more else None}
+        return read_view(records)
+    return respond(read)
+
+
+def scoped_runtime():
+    from hermes_cli.plugins import PluginContext, PluginManifest, get_plugin_manager
+    ctx = PluginContext(PluginManifest(name='hermes-urgency-engine'), get_plugin_manager())
+    return _runtime.Runtime(ctx)
+
+
+@router.get('/projects/{project_id}/milestones')
+def milestones(project_id: str, request: Request):
+    def read():
+        arguments = page_arguments(request)
+        def records(view):
+            rows = view.ledger.list_milestones(project_id, **arguments)
+            more = bool(rows and view.ledger.list_milestones(project_id, 1, rows[-1]['milestone_id']))
+            return {'items': rows, 'has_more': more, 'next': rows[-1]['milestone_id'] if more else None}
+        return read_view(records)
+    return respond(read)
+
+
+@router.get('/projects/{project_id}/source-tasks')
+def source_tasks(project_id: str, request: Request):
+    def read():
+        arguments = page_arguments(request)
+        if arguments['after'] is None:
+            del arguments['after']
+        read_view(lambda view: view.ledger.get_project(project_id))
+        runtime = scoped_runtime()
+        data = runtime.kanban_read('tasks', {'project_id': project_id, **arguments})
+        data['sync_health'] = runtime.kanban_read('health', {})
+        data['sync_seconds'] = runtime.kanban_config()['kanban_sync_seconds']
+        return data
+    return respond(read)
+
+
+@router.get('/projects/{project_id}/interventions')
+def interventions(project_id: str, request: Request):
+    def read():
+        arguments = page_arguments(request)
+        if arguments['after'] is not None:
+            _ledger._id(arguments['after'], 'after')
+        read_view(lambda view: view.ledger.get_project(project_id))
+        runtime = scoped_runtime()
+        store = _runtime.interventions.Actions.read(runtime.data_dir() / 'interventions.db', clock)
+        if store is None:
+            data = dict(items=[], next=None, has_more=False)
+        else:
+            with store, store.transaction(False):
+                data = store.page(project_id, arguments['limit'], arguments['after'])
+        data['recovery_creation'] = 'CAPABILITY_UNAVAILABLE'
+        data['next_action'] = 'Use the supported local hermes urgency interventions commands for supervised actions.'
+        return data
+    return respond(read)
 
 
 def execute_command(raw):
