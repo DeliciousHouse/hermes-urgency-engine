@@ -5,15 +5,16 @@ import {readFile} from 'node:fs/promises';
 import test from 'node:test';
 import vm from 'node:vm';
 
-async function load() {
+async function load(overrides = {}) {
   const context = vm.createContext({URLSearchParams, Date, JSON, Math, Number, String, Error, crypto: globalThis.crypto});
   const navigate = [];
-  const atom = value => ({get: () => value});
+  const atom = value => ({get: () => value, set: next => {value = next;}});
   const sdk = {host: {state: {profile: atom('default'), connectionId: atom('local'), gateway: atom('open')}, navigate: path => navigate.push(path)},
     ROUTES_AREA: 'routes', SIDEBAR_NAV_AREA: 'nav', PALETTE_AREA: 'palette', STATUSBAR_AREAS: {right: 'status'},
     Button: 'button', Input: 'input', useValue: atom => atom.get(), gatewayActivationEpoch: () => 1,
     useGatewayActivationEpoch: () => 1, useQuery: () => ({isPending: true}), useQueryClient: () => ({invalidateQueries() {}})};
   const react = {useState: value => [typeof value === 'function' ? value() : value, () => {}], useEffect: () => {}, useRef: value => ({current: value})};
+  Object.assign(react, overrides);
   const jsx = (type, props, key) => ({type, props: props || {}, key});
   const modules = {'@hermes/plugin-sdk': sdk, react, 'react/jsx-runtime': {jsx, jsxs: jsx}};
   const source = new vm.SourceTextModule(await readFile(new URL('../desktop/plugin.js', import.meta.url), 'utf8'), {context});
@@ -104,6 +105,29 @@ test('registered page mounts creation controls and native reads', async () => {
   const tree = JSON.stringify(expand(contributions.find(c => c.area === 'routes').render()));
   assert.match(tree, /Create project/);
   assert.match(tree, /Loading verified measurements/);
+});
+
+test('edit form waits for loaded data and pins its draft revision across refresh', async () => {
+  const values = []; let index = 0;
+  const {api} = await load({useState(initial) {
+    const slot = index++;
+    if (!(slot in values)) values[slot] = typeof initial === 'function' ? initial() : initial;
+    return [values[slot], value => {values[slot] = value;}];
+  }});
+  assert.equal(api.ProjectEditor({selected: 'a', project: undefined}), null);
+  const sent = [];
+  const props = {sender: {send: async (op, args) => {sent.push(args); return args;}}, onSaved() {},
+    project: {project_id: 'a', title: 'Loaded title', revision: 4}};
+  let tree = api.ProjectForm(props);
+  const name = tree.props.children.find(n => n?.type === 'label' && n.props.children[0] === 'Project name').props.children[1];
+  assert.equal(name.props.value, 'Loaded title');
+  name.props.onChange({target: {value: 'My draft'}});
+  index = 0;
+  tree = api.ProjectForm({...props, project: {...props.project, title: 'Other editor', revision: 5}});
+  tree.props.onSubmit({preventDefault() {}});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(sent[0].title, 'My draft');
+  assert.equal(sent[0].expected_revision, 4);
 });
 
 test('unified plugin registers page, sidebar, palette and status', async () => {

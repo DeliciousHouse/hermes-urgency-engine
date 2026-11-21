@@ -91,7 +91,13 @@ export function Portfolio({items, onSelect}) {
     ]}, item.project_id))})]})});
 }
 
+export function ProjectEditor({selected, project, ...props}) {
+  if (selected && !project) return null;
+  return jsx(ProjectForm, {...props, project}, selected || 'new');
+}
+
 export function ProjectForm({sender, project, onSaved, disabled}) {
+  const [base, setBase] = useState(project);
   const [title, setTitle] = useState(project?.title || '');
   const [id, setId] = useState('');
   const [reason, setReason] = useState('');
@@ -103,7 +109,8 @@ export function ProjectForm({sender, project, onSaved, disabled}) {
     lock.current = true; setPending(true);
     try {
       const result = reconcile ? await sender.reconcile() : await sender.send(project ? 'edit_project' : 'create_project', project ?
-        {project_id: project.project_id, title, expected_revision: project.revision, reason} : {project_id: id, title});
+        {project_id: base.project_id, title, expected_revision: base.revision, reason} : {project_id: id, title});
+      if (project) setBase(result);
       setMessage('Saved. Reading current state…'); onSaved(result);
     } catch (error) {
       setMessage(`Save not confirmed. ${error.message}. Read current state before reconciling the same request.`);
@@ -173,7 +180,7 @@ function ScopedPage({ctx, scope, sender}) {
     jsx('style', {children: styles}), jsx('h1', {children: 'Urgency Engine'}),
     jsx('p', {children: `${connectionLabel(scope.connection, gateway)} / ${scope.profile} · ${gateway}`}),
     jsxs('details', {children: [jsx('summary', {children: selected ? 'Edit project' : 'Create project'}),
-      jsx(ProjectForm, {sender, project: selected ? query.data : null, disabled: gateway !== 'open' || query.isPending || query.isError,
+      jsx(ProjectEditor, {selected, sender, project: selected ? query.data : null, disabled: gateway !== 'open' || query.isPending || query.isError,
         onSaved: () => query.refetch()}, selected || 'new')]}),
     selected && jsx(Button, {onClick: () => setSelected(null), children: 'Back to portfolio'}),
     query.isPending ? jsx('p', {role: 'status', children: 'Loading verified measurements…'}) : null,

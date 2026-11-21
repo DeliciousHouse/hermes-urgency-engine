@@ -68,12 +68,15 @@ class Views:
             # inspector pages tasks separately rather than duplicating it per marker.
             explanation.pop('input_revisions')
             commitments.append(explanation)
+        if self.ledger.get_project(project_id)['revision'] != project['revision']:
+            raise LedgerError('REVISION_CONFLICT', 'desktop', next_action='Reload the changed project.')
         active = [d for d in commitments if d['actual_verified_at'] is None]
         urgent = max(active, key=lambda d: d['forecast']['level'], default=None)
         return {**project, 'progress': progress, **EVIDENCE,
                 'commitments': commitments, 'commitments_has_more': more,
                 'commitments_next': deadlines[-1]['deadline_id'] if more else None,
-                'urgency': urgent['forecast'] if urgent else None,
+                'urgency': urgent['forecast'] if urgent and not more else None,
+                'risk_coverage': 'partial' if more else 'recorded_commitments',
                 'observed_at': self.clock().isoformat(), 'coverage': 'local_ledger_only'}
 
     def timeline(self, project_id, *, start, end, limit=100, after=None):

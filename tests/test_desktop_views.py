@@ -69,6 +69,35 @@ class DesktopViewTests(unittest.TestCase):
         self.assertNotIn('input_revisions', later['commitments'][0])
         self.assertEqual(len(self.ledger.history('deadline', 'd')), 2, 'views must not persist forecasts')
 
+    def test_capped_commitments_do_not_claim_complete_project_risk(self):
+        from urgency_engine.desktop import Views
+        from test_ledger import fixture_zones, TZPATH, reset_tzpath, ZoneInfo
+        fixture_zones(self.root)
+        self.addCleanup(lambda: (reset_tzpath(TZPATH), ZoneInfo.clear_cache()))
+        for index in range(101):
+            self.ledger.set_deadline(f'd{index:03}', project_id='a', kind='hard',
+                at='2030-01-02T00:00:00Z', timezone='UTC', owner='operator', source='Plan',
+                request_id=f'date{index}', actor='operator')
+        data = Views(self.ledger, clock=lambda:self.now).project('a')
+        self.assertTrue(data['commitments_has_more'])
+        self.assertIsNone(data['urgency'])
+        self.assertEqual(data['risk_coverage'], 'partial')
+
+    def test_project_refuses_a_mixed_revision_measurement(self):
+        from urgency_engine.desktop import Views
+        from urgency_engine.ledger import LedgerError
+        from unittest.mock import patch
+        original = self.ledger.progress
+        def changed(project_id):
+            progress = original(project_id)
+            self.ledger.edit_project(project_id, title='Concurrent title', expected_revision=progress['revision'],
+                reason='Concurrent edit', request_id='concurrent', actor='operator')
+            return progress
+        with patch.object(self.ledger, 'progress', side_effect=changed):
+            with self.assertRaises(LedgerError) as caught:
+                Views(self.ledger, clock=lambda:self.now).project('a')
+        self.assertEqual(caught.exception.code, 'REVISION_CONFLICT')
+
     def test_timeline_pages_tasks_without_inventing_execution_dates(self):
         from urgency_engine.desktop import Views
         from urgency_engine.ledger import LedgerError
