@@ -515,7 +515,8 @@ class Sync:
                     request_id=identity + ':task', reason='Canonical source metadata', actor='kanban-sync')
                 reopen = bool(existing and existing['source_status'] in ('done', 'archived')
                               and projection['status'] not in ('done', 'archived') and task)
-                plan = dict(binding=fingerprint, projection=projection, arguments=arguments, reopen=reopen)
+                plan = dict(binding=fingerprint, projection=projection, arguments=arguments,
+                            reopen=reopen, cursor=position)
                 if reopen:
                     plan['reopen_revision'] = arguments['expected_revision']
                     arguments['expected_revision'] += 1
@@ -523,8 +524,6 @@ class Sync:
                     self.db.execute('INSERT INTO sync_requests VALUES(?,?,?,?)',
                                     (identity, hashlib.sha256(_json(plan).encode()).hexdigest(), 'pending', _json(plan)))
                 self.apply_plan(identity, plan, ledger, monitor)
-                with self.transaction():
-                    self.put('cursor', position)
                 count += 1
         self.admit_graph(cfg, monitor, seen, ledger_path)
         with self.transaction():
@@ -593,19 +592,20 @@ class Sync:
         occurred = projection['source_updated_at'] or projection['observed_at']
         worker = projection['worker']
         active = worker['state'] == 'running' and projection['status'] == 'running'
+        ledger_path = Path(ledger.connection.execute('PRAGMA database_list').fetchone()[2])
         monitor.observe(dict(request_id=identity + ':graph', project_id=projection['project_id'],
             board_id=projection['board_id'], task_id=projection['task_id'], kind='task_signal',
             occurred_at=occurred, reason='Canonical current worker timestamps',
             data=dict(claim_at=worker['started_at'] if active else None,
                       heartbeat_at=worker['heartbeat_at'] if active else None,
                       agent_available=True if active else None)),
-            Path(self.meta('ledger_path')), source='kanban-sync')
+            ledger_path, source='kanban-sync')
         if worker['run_id'] and worker['state'] in ('running', 'failed', 'exhausted', 'unavailable'):
             monitor.observe(dict(request_id=identity + ':worker', project_id=projection['project_id'],
                 board_id=projection['board_id'], task_id=projection['task_id'], kind='worker_outcome',
                 occurred_at=worker['heartbeat_at'] or worker['started_at'] or occurred,
                 reason='Canonical current worker', data=dict(state=worker['state'])),
-                Path(self.meta('ledger_path')), source='kanban-sync')
+                ledger_path, source='kanban-sync')
 
     def apply_plan(self, identity, plan, ledger, monitor=None):
         projection = plan['projection']
@@ -620,14 +620,17 @@ class Sync:
         if projection['status'] == 'done':
             ledger.claim_complete(*key, expected_revision=task['revision'],
                 request_id=identity + ':claim', reason='Canonical completion claim', actor='kanban-sync')
+        self.admit_facts(ledger, monitor, projection, identity)
+        # Keep the intent pending through both stores. Publish the projection,
+        # acknowledgment and cursor together only after their replay-safe calls.
         with self.transaction():
             self.db.execute('INSERT OR REPLACE INTO sources VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 (*key, projection['project_id'], projection['tenant'], projection['source_updated_at'],
                  projection['source_digest'], projection['status'], projection['assignee'],
                  projection['title'], projection['observed_at'], projection['coverage'], _json(projection), projection['source_digest']))
             self.put('ledger_path', str(ledger.connection.execute('PRAGMA database_list').fetchone()[2]))
-        self.admit_facts(ledger, monitor, projection, identity)
-        with self.transaction():
             self.db.execute("UPDATE sync_requests SET state='applied' WHERE request_id=?", (identity,))
+            if 'cursor' in plan:
+                self.put('cursor', plan['cursor'])
 
 

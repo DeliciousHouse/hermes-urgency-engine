@@ -52,6 +52,82 @@ class ReconciliationTests(unittest.TestCase):
         return self.sync.scan(self.cfg, self.ledger, None, self.root / 'data.db',
                               self.source, request_id=identity, reason='Fixture')
 
+    def test_changed_task_uses_only_intent_and_final_projection_commits(self):
+        """protects=bounded durable write cost; fails_when=ack/cursor commit separately;
+        why_new=measured Windows commit bottleneck; seam=real disk SQL trace;
+        no_claim=hosted latency guarantee or cross-store atomicity.
+        """
+        statements = []
+        self.sync.db.set_trace_callback(statements.append)
+        self.source.rows = [dict(id=f't{i}', tenant='synthetic') for i in range(5)]
+        self.scan()
+        # Scan reservation, per-task intent/finalization, cursor reset, receipt.
+        self.assertEqual(statements.count('COMMIT'), 2 * 5 + 3)
+        self.assertEqual(len(self.ledger.list_tasks('project')), 5)
+        self.assertEqual(self.sync.db.execute("SELECT count(*) FROM sync_requests WHERE state='applied'").fetchone()[0], 5)
+        self.assertIsNone(self.sync.meta('cursor'))
+
+    def test_intent_and_final_commit_faults_replay_without_duplicate_effects(self):
+        """protects=write-ahead intent and atomic final cursor/projection/ack;
+        fails_when=commit faults lose work or replay changes timestamps/revisions;
+        why_new=coalesced final commit; seam=real stores with commit-boundary faults;
+        no_claim=distributed atomicity or power-loss simulation.
+        """
+        from urgency_engine.watchdog import Monitor
+        from unittest.mock import patch
+
+        class FaultConnection(sqlite3.Connection):
+            armed = False
+            def commit(db):
+                row = db.execute("SELECT state FROM sync_requests WHERE state IN ('pending','applied')").fetchone()
+                fault = db.armed and row and row[0] == boundary
+                if fault:
+                    db.armed = False
+                    if not after:
+                        raise RuntimeError('before commit')
+                super().commit()
+                if fault:
+                    raise RuntimeError('after commit')
+
+        for boundary in ('pending', 'applied'):
+            for after in (False, True):
+                with self.subTest(boundary=boundary, after=after), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    clock = [NOW]
+                    with Ledger(sqlite3.connect(root / 'ledger.db'), clock=lambda: clock[0], artifact_root=root) as ledger, \
+                            Monitor.open(root / 'monitor.db', clock=lambda: clock[0]) as monitor:
+                        ledger.create_project('project', 'Project', request_id='p', actor='test')
+                        with kanban.Sync(sqlite3.connect(root / 'sync.db', factory=FaultConnection),
+                                         clock=lambda: clock[0], redact=str) as sync:
+                            sync.db.armed = True
+                            observe = monitor.observe
+                            def unlocked_observe(*args, **kwargs):
+                                self.assertFalse(sync.db.in_transaction)
+                                return observe(*args, **kwargs)
+                            with patch.object(monitor, 'observe', unlocked_observe), self.assertRaises(RuntimeError):
+                                sync.scan(self.cfg, ledger, monitor, root / 'ledger.db',
+                                          Source(), request_id='scan', reason='Fixture')
+                            published = boundary == 'applied' and after
+                            self.assertEqual(len(sync.page('project')['items']), int(published))
+                            self.assertEqual(sync.meta('cursor'), ['demo', 'synthetic', 'task'] if published else None)
+                            state = sync.db.execute("SELECT state FROM sync_requests WHERE state IN ('pending','applied')").fetchone()
+                            self.assertEqual(state[0] if state else None,
+                                             'applied' if published else 'pending' if boundary == 'applied' or after else None)
+                            before = monitor.page('observations', project_id='project')['items']
+                        clock[0] += timedelta(seconds=1)
+                        with kanban.Sync(sqlite3.connect(root / 'sync.db'), clock=lambda: clock[0], redact=str) as sync:
+                            result = sync.scan(self.cfg, ledger, monitor, root / 'ledger.db',
+                                               Source(), request_id='scan', reason='Fixture')
+                            self.assertEqual(result['state'], 'complete')
+                            self.assertEqual(ledger.get_task('demo', 'task')['revision'], 1)
+                            observations = monitor.page('observations', project_id='project')['items']
+                            self.assertEqual(len(observations), 2)
+                            for event in before:
+                                self.assertIn(event, observations)
+                            self.assertEqual(sync.db.execute("SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 0)
+                            self.assertIsNone(sync.meta('cursor'))
+                            self.assertEqual(len(sync.page('project')['items']), 1)
+
     def test_replay_capacity_refuses_new_writes_without_pruning_old_requests(self):
         """protects=bounded durable replay; fails_when=capacity discards pending identities;
         why_new=protected storage ceiling; seam=real store; no_claim=unlimited operation history.

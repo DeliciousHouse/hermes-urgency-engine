@@ -127,7 +127,12 @@ conversation --------------------------------> cached reads only
 
 This is not a transaction spanning three databases. Persisted original request
 arguments reconcile a crash after a ledger or monitor commit without duplicate
-credit. Concurrent local edits produce conflicts instead of last-writer-wins.
+credit. A changed task uses one durable source-intent commit, then one source-store
+commit publishing its projection, acknowledgment and cursor together after Ledger
+and Monitor acceptance. No source transaction spans those other stores' calls;
+journal and synchronous durability settings are unchanged. A failed final commit
+leaves the intent replayable; older pending records without a cursor still replay.
+Concurrent local edits produce conflicts instead of last-writer-wins.
 Native inventory and detail calls are not an atomic board snapshot either;
 missing or inconsistent data stays unknown.
 
