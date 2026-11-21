@@ -61,11 +61,33 @@ class ReconciliationTests(unittest.TestCase):
         self.sync.db.set_trace_callback(statements.append)
         self.source.rows = [dict(id=f't{i}', tenant='synthetic') for i in range(5)]
         self.scan()
-        # Scan reservation, per-task intent/finalization, cursor reset, receipt.
-        self.assertEqual(statements.count('COMMIT'), 2 * 5 + 3)
+        # Scan reservation, one bounded intent batch, per-task finalization,
+        # cursor reset and receipt. Every intent still precedes its Ledger effect.
+        self.assertEqual(statements.count('COMMIT'), 5 + 4)
         self.assertEqual(len(self.ledger.list_tasks('project')), 5)
         self.assertEqual(self.sync.db.execute("SELECT count(*) FROM sync_requests WHERE state='applied'").fetchone()[0], 5)
         self.assertIsNone(self.sync.meta('cursor'))
+
+    def test_absent_monitor_does_not_read_per_task_graph_replay_metadata(self):
+        """protects=bounded metadata reads without a Monitor consumer;
+        fails_when=each retained source triggers an unused graph lookup;
+        why_new=measured per-page read amplification; seam=real disk SQL trace;
+        no_claim=hosted wall-time guarantee or permission to skip withdrawal.
+        """
+        self.source.rows = [dict(id=f't{i}', tenant='synthetic') for i in range(5)]
+        self.scan()
+        statements = []
+        self.sync.db.set_trace_callback(statements.append)
+        self.scan('unchanged')
+        graph_reads = [sql for sql in statements if sql.startswith(
+            'SELECT value_json FROM sync_meta') and 'graph:' in sql]
+        self.assertEqual(graph_reads, [])
+        # No Monitor does not excuse retaining authoritative cached coverage.
+        self.cfg['kanban_bindings'] = []
+        self.scan('withdrawn')
+        self.assertEqual({row[0] for row in self.sync.db.execute(
+            'SELECT coverage FROM sources')}, {'unknown'})
+        self.assertEqual(len(self.ledger.list_tasks('project')), 5)
 
     def test_intent_and_final_commit_faults_replay_without_duplicate_effects(self):
         """protects=write-ahead intent and atomic final cursor/projection/ack;
@@ -127,6 +149,127 @@ class ReconciliationTests(unittest.TestCase):
                             self.assertEqual(sync.db.execute("SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 0)
                             self.assertIsNone(sync.meta('cursor'))
                             self.assertEqual(len(sync.page('project')['items']), 1)
+
+    def test_batched_intents_survive_commit_and_application_faults(self):
+        """protects=all page intents durable before effects and ordered recovery;
+        fails_when=batch loss, premature cursor or duplicate effects;
+        why_new=bounded intent batching; seam=real disk stores/commit faults;
+        no_claim=power-loss simulation or cross-store atomicity.
+        """
+        from unittest.mock import patch
+        from urgency_engine.watchdog import Monitor
+
+        for boundary in ('intent', 'third_ack'):
+            for after in (False, True):
+                with self.subTest(boundary=boundary, after=after), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    clock = [NOW]
+                    class FaultConnection(sqlite3.Connection):
+                        armed = False
+                        def commit(db):
+                            pending = db.execute("SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0]
+                            applied = db.execute("SELECT count(*) FROM sync_requests WHERE state='applied'").fetchone()[0]
+                            hit = db.armed and ((boundary == 'intent' and pending == 5) or
+                                                (boundary == 'third_ack' and applied == 3))
+                            if hit:
+                                db.armed = False
+                                if not after:
+                                    raise RuntimeError('commit fault')
+                            super().commit()
+                            if hit:
+                                raise RuntimeError('commit fault')
+
+                    source = Source()
+                    source.rows = [dict(id=f't{i}', tenant='synthetic') for i in range(5)]
+                    with Ledger(sqlite3.connect(root / 'ledger.db'), clock=lambda: clock[0], artifact_root=root) as ledger, \
+                            Monitor.open(root / 'monitor.db', clock=lambda: clock[0]) as monitor:
+                        ledger.create_project('project', 'Project', request_id='p', actor='test')
+                        with kanban.Sync(sqlite3.connect(root / 'sync.db', factory=FaultConnection),
+                                         clock=lambda: clock[0], redact=str) as sync:
+                            sync.db.armed = True
+                            original = ledger.upsert_task
+                            def apply(*args, **kwargs):
+                                self.assertFalse(sync.db.in_transaction)
+                                # Another connection observes committed intent for the whole batch.
+                                from contextlib import closing
+                                with closing(sqlite3.connect(root / 'sync.db')) as reader:
+                                    self.assertEqual(reader.execute("SELECT count(*) FROM sync_requests WHERE state IN ('pending','applied')").fetchone()[0], 5)
+                                return original(*args, **kwargs)
+                            with patch.object(ledger, 'upsert_task', apply), self.assertRaisesRegex(RuntimeError, 'commit fault'):
+                                sync.scan(self.cfg, ledger, monitor, root / 'ledger.db', source,
+                                          request_id='batch', reason='Fixture')
+                            published = 0 if boundary == 'intent' else 3 if after else 2
+                            self.assertEqual(sync.db.execute('SELECT count(*) FROM sources').fetchone()[0], published)
+                            self.assertEqual(sync.meta('cursor'), ['demo', 'synthetic', f't{published-1}'] if published else None)
+                            old = monitor.page('observations', project_id='project')['items']
+                        clock[0] += timedelta(seconds=1)
+                        with kanban.Sync(sqlite3.connect(root / 'sync.db'), clock=lambda: clock[0], redact=str) as sync:
+                            inventory = source.inventory
+                            def after_replay(binding):
+                                if boundary == 'third_ack' or after:
+                                    self.assertEqual(sync.meta('cursor'), ['demo', 'synthetic', 't4'])
+                                return inventory(binding)
+                            source.inventory = after_replay
+                            result = sync.scan(self.cfg, ledger, monitor, root / 'ledger.db', source,
+                                               request_id='batch', reason='Fixture')
+                            self.assertEqual(result['state'], 'complete')
+                            self.assertIsNone(sync.meta('cursor'))
+                            self.assertEqual(sync.db.execute("SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 0)
+                            for i in range(5):
+                                self.assertEqual(ledger.get_task('demo', f't{i}')['revision'], 1)
+                            observations = monitor.page('observations', project_id='project')['items']
+                            self.assertEqual(len(observations), 10)
+                            for event in old:
+                                self.assertIn(event, observations)
+
+    def test_unchanged_cursor_never_skips_a_buffered_changed_task(self):
+        """protects=mixed-page durable cursor; fails_when=unchanged row passes volatile intent;
+        why_new=batch flush boundary; seam=real stores/restart; no_claim=atomic source snapshot.
+        """
+        from unittest.mock import patch
+        self.source.rows = [dict(id=f't{i}', tenant='synthetic') for i in range(3)]
+        self.scan()
+        original = self.source.detail
+        def detail(binding, task_id):
+            document = original(binding, task_id)
+            if task_id == 't0':
+                document['task']['title'] = 'Changed'
+            return document
+        self.source.detail = detail
+        with patch.object(self.ledger, 'upsert_task', side_effect=RuntimeError('before effect')):
+            with self.assertRaisesRegex(RuntimeError, 'before effect'):
+                self.scan('mixed')
+        self.assertIsNone(self.sync.meta('cursor'))
+        self.assertEqual(self.sync.db.execute("SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 1)
+        self.sync.db.close()
+        self.sync = kanban.Sync(sqlite3.connect(self.root / 'kanban.db'), clock=lambda: self.now, redact=str)
+        self.addCleanup(self.sync.db.close)
+        self.assertEqual(self.scan('mixed')['state'], 'complete')
+        self.assertEqual(self.ledger.get_task('demo', 't0')['goal'], 'Changed')
+        self.assertEqual([self.ledger.get_task('demo', f't{i}')['revision'] for i in range(3)], [2, 1, 1])
+
+    def test_later_detail_cannot_overwrite_an_earlier_buffered_local_edit(self):
+        """protects=CAS across bounded collection; fails_when=batch replaces local edit;
+        why_new=longer read/effect interval; seam=two real connections; no_claim=distributed transaction.
+        """
+        self.source.rows = [dict(id=f't{i}', tenant='synthetic') for i in range(2)]
+        self.scan()
+        original = self.source.detail
+        self.source.title = 'New source'
+        def detail(binding, task_id):
+            if task_id == 't1':
+                with Ledger(sqlite3.connect(self.root / 'data.db'), clock=lambda: self.now, artifact_root=self.root) as local:
+                    local.upsert_task('demo', 't0', project_id='project', goal='Local edit', remaining_seconds=7,
+                        expected_revision=1, request_id='local', reason='Concurrent', actor='test')
+            return original(binding, task_id)
+        self.source.detail = detail
+        with self.assertRaises(LedgerError) as caught:
+            self.scan('race')
+        self.assertEqual(caught.exception.code, 'REVISION_CONFLICT')
+        self.assertEqual(self.ledger.get_task('demo', 't0')['goal'], 'Local edit')
+        self.assertEqual(self.ledger.get_task('demo', 't0')['remaining_seconds'], 7)
+        self.assertEqual(self.ledger.get_task('demo', 't1')['revision'], 1)
+        self.assertEqual(self.sync.db.execute("SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 2)
 
     def test_replay_capacity_refuses_new_writes_without_pruning_old_requests(self):
         """protects=bounded durable replay; fails_when=capacity discards pending identities;

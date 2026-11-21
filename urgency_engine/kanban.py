@@ -445,9 +445,10 @@ class Sync:
         count = 0
         fingerprint = hashlib.sha256(_json(cfg['kanban_bindings']).encode()).hexdigest()
         pending = self.db.execute("SELECT request_id,result_json FROM sync_requests WHERE state='pending' ORDER BY request_id").fetchall()
-        for row in pending:
-            identity = row['request_id']
-            plan = json.loads(row['result_json'])
+        pending = [(row['request_id'], json.loads(row['result_json'])) for row in pending]
+        # A page can retain several intents. Resume in cursor order, not hash
+        # order, so the last acknowledgment cannot move the cursor backwards.
+        for identity, plan in sorted(pending, key=lambda item: item[1].get('cursor', [])):
             if plan['binding'] != fingerprint:
                 # Only Ledger can be the first effect. Its durable receipts also
                 # cover a crash between reopen and upsert, before any Monitor call.
@@ -486,6 +487,21 @@ class Sync:
         for row in self.db.execute('SELECT board_id,task_id FROM sources').fetchall():
             if (row['board_id'], row['task_id']) not in seen:
                 self.mark_unknown((row['board_id'], row['task_id']), 'SOURCE_ABSENT')
+        plans = []
+
+        def apply_collected():
+            if not plans:
+                return
+            # At most this page's 100 details; no source I/O or cross-store
+            # effects under this lock. Every task keeps its own replay record.
+            with self.transaction():
+                for identity, plan in plans:
+                    self.db.execute('INSERT INTO sync_requests VALUES(?,?,?,?)',
+                                    (identity, hashlib.sha256(_json(plan).encode()).hexdigest(), 'pending', _json(plan)))
+            for identity, plan in plans:
+                self.apply_plan(identity, plan, ledger, monitor)
+            plans.clear()
+
         for binding, rows in inventories:
             for row in sorted(rows, key=lambda r: r['id']):
                 task_id = _id(row.get('id'), 'task_id')
@@ -493,6 +509,7 @@ class Sync:
                 if cursor and position <= cursor:
                     continue
                 if processed == 100:
+                    apply_collected()
                     self.admit_graph(cfg, monitor, set(), ledger_path)
                     return dict(state='partial', count=count, cursor=self.meta('cursor'))
                 key = binding['board'], task_id
@@ -518,6 +535,8 @@ class Sync:
                         self.mark_unknown(key, 'SOURCE_STALE')
                         fail('source_updated_at', 'SOURCE_STALE')
                 if existing and existing['source_digest'] == projection['source_digest']:
+                    # Do not advance past earlier, still volatile changed tasks.
+                    apply_collected()
                     with self.transaction():
                         self.db.execute('UPDATE sources SET observed_at=?,coverage=?,projection_json=? WHERE board_id=? AND task_id=?',
                                         (projection['observed_at'], projection['coverage'], _json(projection), *key))
@@ -549,11 +568,9 @@ class Sync:
                 if reopen:
                     plan['reopen_revision'] = arguments['expected_revision']
                     arguments['expected_revision'] += 1
-                with self.transaction():
-                    self.db.execute('INSERT INTO sync_requests VALUES(?,?,?,?)',
-                                    (identity, hashlib.sha256(_json(plan).encode()).hexdigest(), 'pending', _json(plan)))
-                self.apply_plan(identity, plan, ledger, monitor)
+                plans.append((identity, plan))
                 count += 1
+        apply_collected()
         self.admit_graph(cfg, monitor, seen, ledger_path)
         with self.transaction():
             self.put('cursor', None)
@@ -589,7 +606,7 @@ class Sync:
         rows = [json.loads(row[0]) for row in self.db.execute('SELECT projection_json FROM sources')]
         for projection in rows:
             key = projection['board_id'], projection['task_id']
-            desired = self.meta('graph:' + _json(list(key)) + ':desired')
+            desired = self.meta('graph:' + _json(list(key)) + ':desired') if monitor is not None else None
             withdrawn = (projection['board_id'], projection['tenant'], projection['project_id']) not in bindings
             if withdrawn:
                 self.mark_unknown(key, 'SOURCE_WITHDRAWN')

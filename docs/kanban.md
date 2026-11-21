@@ -140,11 +140,18 @@ conversation --------------------------------> cached reads only
 
 This is not a transaction spanning three databases. Persisted original request
 arguments reconcile a crash after a ledger or monitor commit without duplicate
-credit. A changed task uses one durable source-intent commit, then one source-store
-commit publishing its projection, acknowledgment and cursor together after Ledger
-and Monitor acceptance. No source transaction spans those other stores' calls;
-journal and synchronous durability settings are unchanged. A failed final commit
-leaves the intent replayable; older pending records without a cursor still replay.
+credit. Consecutive changed details share a bounded source-intent commit (at most
+100 per page); each retains its own original arguments and replay identity before
+any Ledger or Monitor effect. Each accepted task then gets its own source-store
+commit publishing projection, acknowledgment and cursor together. An unchanged
+row flushes earlier collected changes before advancing the cursor. Pending page
+intents replay in cursor order after restart, not request-hash order. A source
+failure before the batch commits leaves those collected changes unapplied and
+its cursor unchanged, so they can be collected again.
+
+No source transaction spans native I/O or other stores' calls; journal and
+synchronous durability settings are unchanged. A failed final commit leaves the
+intent replayable; older pending records without a cursor still replay.
 After a binding change, sync cancels an old pending intent only when no Ledger
 operation for it committed. It retains the cancelled receipt and reports
 `SCOPE_CONFLICT`; a subsequent scan can collect under the new binding. An
@@ -346,3 +353,32 @@ retained-data uninstall. It does not start a worker or model.
 The supplied home must contain only the enabled installed plugin and no prior
 plugin data. CI runs this against its exact public revision on both pinned native
 hosts; source-copy execution alone is not public-install evidence.
+
+### How to measure disk synchronization cost
+
+From a checkout with Python 3.11–3.14, run:
+
+```sh
+python tests/diagnose_sync_cost.py --source . --rows 1000
+python tests/diagnose_sync_cost.py --source . --rows 100 --monitor
+```
+
+`--source` selects the checkout whose implementation and synthetic source fixture
+are imported. Use a fresh process per revision. `--rows` accepts 100 or 1000;
+`--monitor` exercises real Monitor admission too. The diagnostic creates temporary
+disk stores, reports Python/SQLite/runner-image versions and effective durability
+settings, then prints one JSON record per page for fresh import, unchanged rescan
+and reopened source storage. Stage timings are exclusive of nested instrumented
+calls; SQL cursor-fetch time remains in its caller. It emits no task contents.
+A final `event:complete` and exit 0 mean the diagnostic assertions passed; missing
+completion or nonzero exit is incomplete evidence, not a passing benchmark.
+
+Hosted Windows probes identified commit time as the dominant measured cost,
+with substantial variation even for identical commit counts. Intent batching
+reduces source-store commits for a fresh 1000-row traversal from 2021 to 1031;
+it does not change Ledger commits, durability settings or per-task receipts.
+Without a Monitor consumer, withdrawal still updates cached coverage but avoids
+unused per-task graph-metadata reads. The small probes are diagnostics, not a
+throughput promise or a replacement for the full 10000-row restart/churn test.
+For errors, preserve the last page record and the nonzero exit, check the source
+checkout/import path, and rerun only after identifying the failing boundary.
