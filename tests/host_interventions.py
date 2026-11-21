@@ -45,8 +45,20 @@ def journey(home, host=None):
         assert result.returncode == 0, (name, result.returncode, result.stdout, result.stderr)
     after = json.loads(run('kanban', '--board', 'synthetic', 'list', '--tenant', 'demo', '--archived', '--json'))
     assert len(after) == 1 and after[0]['priority'] == 7
+    request_file = home / 'synthetic-intervention.json'
+    request = json.loads(request_file.read_text(encoding='utf-8'))
+    request.update(kind='set_priority', request_id='worker-denied', parameters={'priority': 3})
+    request_file.write_text(json.dumps(request), encoding='utf-8')
+    worker = dict(env, HERMES_KANBAN_TASK=after[0]['id'], HERMES_KANBAN_BOARD='synthetic')
+    denied = subprocess.run([*cli, 'urgency', 'interventions', 'apply', '--json-file', str(request_file)],
+                            env=worker, cwd=home, capture_output=True, text=True, timeout=45)
+    assert denied.returncode == 1, (denied.returncode, denied.stdout, denied.stderr)
+    error = json.loads(denied.stderr.splitlines()[-1])['error']
+    assert (error['code'], error['side_effects']) == ('SOURCE_DENIED', 'none'), error
+    task = json.loads(run('kanban', '--board', 'synthetic', 'show', after[0]['id'], '--json'))['task']
+    assert task['priority'] == 7
     print(json.dumps(dict(interventions='passed', native_cards=len(after), effects=['priority', 'estimate', 'soft_target'],
-                          recovery='refused', workers_launched=0)))
+                          recovery='refused', worker_context='refused', workers_launched=0)))
 
 
 if __name__ == '__main__':

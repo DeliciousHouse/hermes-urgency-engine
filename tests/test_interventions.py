@@ -3,6 +3,8 @@ import io
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -257,6 +259,95 @@ class InterventionTests(unittest.TestCase):
         with self.assertRaisesRegex(LedgerError, 'IDEMPOTENCY_CONFLICT'), \
              interventions.Actions(sqlite3.connect(path), self.runtime.clock) as store:
             store.reserve(dict(payload, parameters={'remaining_seconds': 31}))
+
+    def test_owned_transport_timeout_and_process_restart_never_repeat_effect(self):
+        """protects=durable no-resend after real timeout; fails_when=owned child survives or replay edits;
+        why_new=process outcome can be lost after effect; seam=synthetic native argv child;
+        no_claim=production board, worker dispatch or native edit atomicity.
+        """
+        driver = '''
+import json, sqlite3, sys
+from datetime import datetime, timezone
+from pathlib import Path
+from urgency_engine import interventions as actions
+from urgency_engine.kanban import NativeSource, read_process
+
+root, step = Path(sys.argv[1]), sys.argv[2]
+value = root / 'native-value'
+payload = dict(board_id='demo', project_id='demo', task_id='task', request_id='priority',
+               plan_id='plan', incident_id='incident', kind='set_priority', parameters={'priority': 7})
+
+def failing_transport(argv, **kwargs):
+    assert argv[-6:] == ['--board', 'demo', 'edit', 'task', '--priority', '7']
+    with (root / 'attempts').open('a') as calls:
+        calls.write('sent\\n')
+    return read_process([sys.executable, '-c',
+        'from pathlib import Path; import sys,time; Path(sys.argv[1]).write_text("7"); time.sleep(60)',
+        str(value)], timeout=3, **kwargs)
+
+def effect(*unused):
+    return NativeSource(failing_transport).assign_priority({'board': 'demo'}, 'task', 7)
+
+def observe(request, receipt):
+    observed = {'priority': int(value.read_text()) if value.exists() else 0}
+    return observed, observed == request['parameters']
+
+with actions.Actions(sqlite3.connect(root / 'actions.db'), lambda: datetime.now(timezone.utc)) as store:
+    if step == 'reconcile':
+        row = store.reserve(payload)
+        result = actions.reconcile(store, row['action_id'], observe)
+    elif step.startswith('crash-'):
+        import os
+        boundary = step.removeprefix('crash-')
+        if boundary == 'before-reserve':
+            os._exit(23)
+        row = store.reserve(payload)
+        if boundary == 'reserved':
+            os._exit(23)
+        action_id = row['action_id']
+        store.transition(action_id, 'reserved', 'in_flight', {})
+        if boundary == 'in-flight':
+            os._exit(23)
+        value.write_text('7')
+        if boundary == 'receipt':
+            store.transition(action_id, 'in_flight', 'in_flight', {'receipt': {'priority': 7}})
+        os._exit(23)
+    else:
+        result = actions.execute(store, payload, lambda _: None, effect, observe)
+print(json.dumps(result))
+'''
+        env = {k: v for k, v in os.environ.items() if not k.startswith(('HERMES_', 'GIT_', 'PYTHON'))}
+
+        def launch(step, root=self.root, expected=0):
+            child = subprocess.run([sys.executable, '-B', '-c', driver, str(root), step],
+                cwd=Path(__file__).resolve().parents[1], env=env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(child.returncode, expected, child.stderr)
+            return json.loads(child.stdout) if expected == 0 else {}
+
+        for boundary, state, attribution in (
+            ('before-reserve', 'reserved', 'unknown'), ('reserved', 'reserved', 'unknown'),
+            ('in-flight', 'in_flight', 'unknown'), ('effect', 'observed', 'observed_only'),
+            ('receipt', 'applied', 'receipt'),
+        ):
+            with self.subTest(boundary=boundary):
+                root = self.root / boundary
+                root.mkdir()
+                launch('crash-' + boundary, root, expected=23)
+                recovered = launch('reconcile', root)
+                self.assertEqual((recovered['state'], recovered['attribution']), (state, attribution))
+                self.assertFalse((root / 'attempts').exists())
+                if state != 'reserved':
+                    self.assertEqual(launch('apply', root), recovered)
+                    self.assertFalse((root / 'attempts').exists())
+
+        first = launch('apply')
+        self.assertEqual((first['state'], first['attribution'], first['last_error']),
+                         ('observed', 'observed_only', 'SOURCE_TIMEOUT'))
+        (self.root / 'native-value').write_text('11', encoding='ascii')
+        self.assertEqual(launch('reconcile'), first)
+        self.assertEqual(launch('apply'), first)
+        self.assertEqual((self.root / 'attempts').read_text(), 'sent\n')
+        self.assertEqual((self.root / 'native-value').read_text(), '11')
 
     def test_scope_and_mode_fail_closed(self):
         """protects=canonical scope and mode; fails_when=unavailable facts authorize an effect;
