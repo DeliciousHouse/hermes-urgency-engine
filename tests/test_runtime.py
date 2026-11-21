@@ -266,6 +266,39 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(health['last_success'], last_success)
         self.assertIsNotNone(health['incomplete_scan'])
 
+    def test_empty_bindings_revoke_on_cli_and_due_tick(self):
+        """protects=last binding withdrawal; fails_when=runtime bypasses reconciliation;
+        why_new=empty config at native entrypoints; seam=real stores; no_claim=live watcher.
+        """
+        from datetime import timedelta
+        from unittest.mock import patch
+        from urgency_engine.kanban import Sync, NativeSource
+        from urgency_engine.watchdog import Monitor
+        self.project()
+        binding = [dict(board='demo', tenant='synthetic', project_id='p')]
+        self.ctx.settings.update(watchdog_enabled=True, kanban_sync_enabled=True, kanban_bindings=binding)
+        tick = setup_parser(Parser()).parse_args(['watchdog', 'tick', '--force'])
+        with patch.object(Sync, 'host', side_effect=lambda **kw: Sync(sqlite3.connect(self.root / 'kanban.db'), **kw)), \
+             patch.object(Monitor, 'host', side_effect=lambda **kw: Monitor.open(self.root / 'watchdog.db', **kw)), \
+             patch.object(NativeSource, 'inventory', return_value=[dict(id='task', tenant='synthetic')]) as inventory, \
+             patch.object(NativeSource, 'detail', return_value=dict(task=dict(id='task', tenant='synthetic', title='Deliver', status='ready'), parents=[])), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            for operation in ('tick', 'sync'):
+                self.ctx.settings['kanban_bindings'] = binding
+                self.now += timedelta(seconds=61)
+                self.assertEqual(self.runtime.cli(tick), 0)
+                with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
+                    self.assertEqual(monitor.db.execute('SELECT dependency_state FROM task_signals').fetchone()[0], 'available')
+                self.ctx.settings['kanban_bindings'] = []
+                self.now += timedelta(seconds=61)
+                calls = inventory.call_count
+                command = tick if operation == 'tick' else setup_parser(Parser()).parse_args(
+                    ['kanban', 'sync', '--request-id', 'empty', '--reason', 'fixture'])
+                self.assertEqual(self.runtime.cli(command), 0)
+                self.assertEqual(inventory.call_count, calls)
+                with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
+                    self.assertEqual(monitor.db.execute('SELECT dependency_state FROM task_signals').fetchone()[0], 'unknown')
+
     def test_partial_sync_still_evaluates_expired_deadlines(self):
         """protects=independent deadline detection; fails_when=source cursor suppresses tick;
         why_new=multi-tick source integration; seam=real stores/faulted native boundary;

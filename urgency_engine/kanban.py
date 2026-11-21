@@ -373,7 +373,7 @@ class Sync:
 
     def scan(self, cfg, ledger, monitor, ledger_path, source, *, request_id, reason):
         cfg = settings(cfg)
-        if not cfg['kanban_sync_enabled'] or not cfg['kanban_bindings']:
+        if not cfg['kanban_sync_enabled']:
             return dict(state='disabled', count=0)
         _id(request_id, 'request_id')
         _text(reason, 'reason', 1024)
@@ -397,6 +397,7 @@ class Sync:
                 # Clear only pre-scan hints. Hints arriving during I/O survive.
                 self.put('dirty_bindings', [])
             try:
+                self.withdraw_graph(cfg, monitor, ledger_path)
                 result = self._scan(cfg, ledger, monitor, ledger_path, source,
                                     request_id=request_id, reason=reason)
             except Exception as exc:
@@ -560,34 +561,71 @@ class Sync:
         if sum(len(p['parents']) for p in mapped.values()) > 50000:
             fail('edges', 'SOURCE_LIMIT')
         complete = len(mapped) == len(inventory)
-        for key, projection in sorted(scoped.items()):
+        for projection in sorted(rows, key=lambda p: (p['board_id'], p['task_id'])):
+            key = projection['board_id'], projection['task_id']
             parents = [(key[0], parent) for parent in projection['parents']]
             known = complete and key in mapped and all(parent in mapped and mapped[parent]['project_id'] == projection['project_id']
                                      for parent in parents)
             data: dict = dict(dependency_state='available' if known else 'unknown')
             if known:
                 data['dependencies'] = [list(parent) for parent in parents]
-            cache_key = 'graph:' + _json(list(key))
+            self.admit_graph_event(projection, data, monitor, ledger_path)
+
+    def withdraw_graph(self, cfg, monitor, ledger_path):
+        bindings = {(b['board'], b['tenant'], b['project_id']) for b in cfg['kanban_bindings']}
+        rows = [json.loads(row[0]) for row in self.db.execute('SELECT projection_json FROM sources')]
+        for projection in rows:
+            key = projection['board_id'], projection['task_id']
+            desired = self.meta('graph:' + _json(list(key)) + ':desired')
+            withdrawn = (projection['board_id'], projection['tenant'], projection['project_id']) not in bindings
+            if withdrawn:
+                self.mark_unknown(key, 'SOURCE_WITHDRAWN')
+            if monitor is not None and (withdrawn or desired is not None):
+                self.admit_graph_event(projection, dict(dependency_state='unknown') if withdrawn else desired,
+                                       monitor, ledger_path)
+
+    def admit_graph_event(self, projection, data, monitor, ledger_path):
+        key = projection['board_id'], projection['task_id']
+        cache_key = 'graph:' + _json(list(key))
+        pending_key = cache_key + ':pending'
+        desired_key = cache_key + ':desired'
+        # Preserve an interrupted desired transition even if bindings change
+        # again. Reconcile the old intent before advancing to the latest state.
+        desired = self.meta(desired_key)
+        saved = self.meta(cache_key)
+        if desired is None and self.meta(pending_key) is None and saved and saved['data'] == data:
+            return
+        if desired is None or (data['dependency_state'] == 'unknown' and desired != data):
+            desired = data
+            with self.transaction():
+                self.put(desired_key, desired)
+        while True:
             saved = self.meta(cache_key)
-            if saved and saved['data'] == data:
-                continue
-            # Persist the complete event before admission: a crash must replay the
-            # exact timestamp and request, not rebuild it from the next poll.
-            pending_key = cache_key + ':pending'
             event = self.meta(pending_key)
+            if event is None and saved and saved['data'] == desired:
+                with self.transaction():
+                    self.put(desired_key, None)
+                if desired == data:
+                    return
+                desired = data
+                with self.transaction():
+                    self.put(desired_key, desired)
+                continue
             if event is None:
-                identity = hashlib.sha256(_json([key, data, self.clock().isoformat(), saved]).encode()).hexdigest()
+                occurred_at = self.clock().isoformat()
+                if saved and saved.get('occurred_at', '') > occurred_at:
+                    occurred_at = saved['occurred_at']
+                identity = hashlib.sha256(_json([key, desired, occurred_at, saved]).encode()).hexdigest()
                 event = dict(request_id=identity + ':mapped', project_id=projection['project_id'],
-                    board_id=key[0], task_id=key[1], kind='task_signal', occurred_at=self.clock().isoformat(),
-                    reason='Mapped canonical dependency coverage', data=data)
+                    board_id=key[0], task_id=key[1], kind='task_signal', occurred_at=occurred_at,
+                    reason='Mapped canonical dependency coverage', data=desired)
                 with self.transaction():
                     self.put(pending_key, event)
             monitor.observe(event, Path(ledger_path), source='kanban-sync')
             with self.transaction():
-                self.put(cache_key, dict(data=event['data']))
+                self.put(cache_key, dict(data=event['data'], request_id=event['request_id'],
+                                         occurred_at=event['occurred_at']))
                 self.put(pending_key, None)
-            if event['data'] != data:
-                fail('graph', 'SOURCE_STALE')
 
     def mark_unknown(self, key, code):
         with self.transaction():

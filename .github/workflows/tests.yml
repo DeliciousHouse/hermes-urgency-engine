@@ -80,7 +80,7 @@ jobs:
           .host/.venv/bin/python .host/hermes plugins validate "$RUNNER_TEMP/plugin" --install-deps
           .host/.venv/bin/python "$RUNNER_TEMP/plugin/tests/host_runtime.py" --hermes-root "$GITHUB_WORKSPACE/.host"
       - name: Install exact public revision and exercise installed lifecycle and tutorial
-        if: matrix.name == 'Native plugin (Hermes v0.23.2)'
+        # Exercise capability-positive or explicit-unknown facts on each host.
         env:
           PLUGIN_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |

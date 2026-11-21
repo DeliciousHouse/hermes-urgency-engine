@@ -403,7 +403,7 @@ class Runtime:
                 data = self.kanban_read(operation, arguments_from(args, 'kanban_' + operation))
             else:
                 cfg = self.kanban_config()
-                if not cfg['kanban_sync_enabled'] or not cfg['kanban_bindings']:
+                if not cfg['kanban_sync_enabled'] or (not cfg['kanban_bindings'] and not (self.data_dir() / 'kanban.db').exists()):
                     data = dict(state='disabled')
                 else:
                     with Sync.host(clock=self.clock, redact=lambda text: self.ctx.redact_text(text, force=True)) as sync:
@@ -506,7 +506,7 @@ class Runtime:
 
     def due_source_sync(self, monitor):
         cfg = self.kanban_config()
-        if not cfg['kanban_sync_enabled'] or not cfg['kanban_bindings']:
+        if not cfg['kanban_sync_enabled'] or (not cfg['kanban_bindings'] and not (self.data_dir() / 'kanban.db').exists()):
             return None
         with Sync.host(clock=self.clock, redact=lambda text: self.ctx.redact_text(text, force=True)) as sync:
             if sync.meta('paused', False):

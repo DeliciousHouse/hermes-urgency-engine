@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = 'hermes-urgency-engine'
 
 
-def journey(home):
+def journey(home, host=None):
     assert (home / 'config.yaml').is_file()
     assert not (home / 'plugin-data' / PLUGIN).exists(), 'use a clean disposable installation'
     env = {k: v for k, v in os.environ.items()
@@ -28,6 +28,9 @@ def journey(home):
     env.update(HERMES_HOME=str(home), HERMES_KANBAN_HOME=str(home / 'kanban'),
                HERMES_RUNTIME_DIR=os.environ.get('URGENCY_TEST_RUNTIME', str(home / 'runtime')),
                HERMES_DISABLE_LAZY_INSTALLS='1', PYTHONUTF8='1')
+    if host is not None:
+        # Match host_runtime's explicit source-checkout selection for local proof.
+        env['PYTHONPATH'] = str(host)
     cli = [sys.executable, '-m', 'hermes_cli.main']
 
     def run(*args):
@@ -87,13 +90,21 @@ def journey(home):
     run(*board, 'claim', worker_id)
     run(*board, 'heartbeat', worker_id)
     native = json.loads(run(*board, 'show', worker_id, '--json'))
-    run_id = native['task']['current_run_id']
-    assert type(run_id) is int and run_id > 0
-    claimed, = [r for r in native['runs'] if r['id'] == run_id]
-    heartbeat, = [e for e in native['events'] if e['kind'] == 'heartbeat' and e['run_id'] == run_id]
-    claim_at = datetime.fromtimestamp(claimed['started_at'], timezone.utc).isoformat()
-    heartbeat_at = datetime.fromtimestamp(heartbeat['created_at'], timezone.utc).isoformat()
-    assert claimed['profile'] == 'fixture' and claimed['status'] == 'running'
+    run_id = native['task'].get('current_run_id')
+    claim_at = heartbeat_at = None
+    if run_id is not None:
+        assert type(run_id) is int and run_id > 0
+        claimed, = [r for r in native['runs'] if r['id'] == run_id]
+        heartbeat, = [e for e in native['events'] if e['kind'] == 'heartbeat' and e['run_id'] == run_id]
+        assert claimed['started_at'] == native['task']['started_at']
+        claim_at = datetime.fromtimestamp(claimed['started_at'], timezone.utc).isoformat()
+        heartbeat_at = datetime.fromtimestamp(heartbeat['created_at'], timezone.utc).isoformat()
+        assert claimed['profile'] == 'fixture' and claimed['status'] == 'running'
+        expected_worker = dict(run_id=run_id, state='running', started_at=claim_at,
+                               heartbeat_at=heartbeat_at, ended_at=None)
+    else:
+        # Historical runs/heartbeats cannot substitute for the current-run pointer.
+        expected_worker = dict(run_id=None, state=None, started_at=None, heartbeat_at=None, ended_at=None)
     # Naturally due public scheduler, not force or a replaced clock.
     time.sleep(61)
     run('cron', 'tick')
@@ -104,16 +115,21 @@ def journey(home):
     projections = {t['task_id']: t for t in urgency('kanban', 'tasks', '--project', 'demo')['items']}
     assert projections[task_id]['parents'] == [parent['id']]
     assert projections[worker_id]['assignee'] == 'fixture'
-    assert projections[worker_id]['worker'] == dict(run_id=run_id, state='running',
-        started_at=claim_at, heartbeat_at=heartbeat_at, ended_at=None)
+    assert projections[worker_id]['worker'] == expected_worker
     worker_task = urgency('task', 'synthetic', worker_id)
     assert worker_task['assignee'] == 'fixture' and worker_task['status'] == 'running'
     facts = [o for o in urgency('watchdog', 'export', '--table', 'observations', '--project', 'demo')['items']
              if o['board_id'] == 'synthetic' and o['task_id'] == worker_id and o['source'] == 'kanban-sync']
-    signal, = [o for o in facts if o['kind'] == 'task_signal' and 'heartbeat_at' in o['payload']['data']]
-    assert signal['payload']['data'] == dict(claim_at=claim_at, heartbeat_at=heartbeat_at, agent_available=True)
-    outcome, = [o for o in facts if o['kind'] == 'worker_outcome']
-    assert outcome['occurred_at'] == heartbeat_at and outcome['payload']['data'] == dict(state='running')
+    if run_id is not None:
+        signal, = [o for o in facts if o['kind'] == 'task_signal' and 'heartbeat_at' in o['payload']['data']]
+        assert signal['payload']['data'] == dict(claim_at=claim_at, heartbeat_at=heartbeat_at, agent_available=True)
+        outcome, = [o for o in facts if o['kind'] == 'worker_outcome']
+        assert outcome['occurred_at'] == heartbeat_at and outcome['payload']['data'] == dict(state='running')
+    else:
+        assert not [o for o in facts if o['kind'] == 'worker_outcome']
+        assert all(all(o['payload']['data'].get(key) is None
+                       for key in ('claim_at', 'heartbeat_at', 'agent_available'))
+                   for o in facts if o['kind'] == 'task_signal')
     run('kanban', '--board', 'synthetic', 'complete', parent['id'], '--summary', 'Synthetic parent claim')
     run('kanban', '--board', 'synthetic', 'complete', task_id, '--summary', 'Synthetic claim only')
     urgency('kanban', 'sync', '--request-id', 'claimed', '--reason', 'fixture')
@@ -166,11 +182,14 @@ assert 'Foreign task' not in text
     assert (home / 'plugin-data' / PLUGIN / 'kanban.db').is_file()
     print(json.dumps(dict(native_kanban='passed', scheduler='naturally due public cron tick',
                          tutorial='executed', isolation='two homes and boards',
-                         last_success=health['last_success'], assigned_run_admitted=True, worker_dispatch=False)))
+                         last_success=health['last_success'], assigned_run_admitted=run_id is not None,
+                         worker_capability='current_run' if run_id is not None else 'unknown_missing_current_run_id',
+                         current_run_pointer_present='current_run_id' in native['task'], worker_dispatch=False)))
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--installed-home', type=Path, required=True)
+    parser.add_argument('--hermes-root', type=Path)
     args = parser.parse_args()
-    journey(args.installed_home.resolve())
+    journey(args.installed_home.resolve(), args.hermes_root.resolve() if args.hermes_root else None)

@@ -43,7 +43,9 @@ Reads and successful writes return `{"ok":true,"data":...}` on stdout. A partial
 scan returns `ok:false` with `data.state:partial` on stderr and exit 1; inspect
 its cursor rather than calling that full coverage. Named operation errors also
 exit 1. Invalid CLI usage exits 2. Disabled/unbound sync returns `state:disabled`
-without initializing source storage. Task pages return `items`, `has_more`,
+without initializing source storage. When source storage already exists, enabled
+sync with no bindings reconciles withdrawn graph coverage without calling the
+native source. Task pages return `items`, `has_more`,
 `next`; pass `next` unchanged as `--after`.
 
 `/urgency kanban health` and `/urgency kanban tasks --project ID` are read-only.
@@ -69,6 +71,9 @@ known source revision is retained separately for ordering: a later null does
 not allow a delayed, older known revision to overwrite the projection. Worker facts
 require a matching current run and start identity; heartbeat events must belong
 to that run. Unrelated events and repeated polling cannot renew a worker sample.
+If native task output has no authoritative `current_run_id`, worker projection
+and Monitor heartbeat remain null even if a run-history entry says `running`.
+The adapter does not guess current ownership from that history.
 
 Projection coverage is `partial` even after a successful scan: canonical status
 is not verification. Failed/absent/stale source coverage is `unknown`. Cached
@@ -155,8 +160,16 @@ Lifecycle callbacks only coalesce dirty-binding hints. They never establish
 source facts. Periodic scans still reconcile external edits and missed hooks.
 There is no new scheduler: use the existing watchdog no-agent job. Partial
 source pages, named source transport failures and scan scope conflicts revoke
-graph coverage for the configured bindings, but
-independent monitor evaluation still runs in that tick. Source health retains
+graph coverage for the configured bindings. Before collecting, enabled sync also
+withdraws coverage owned by persisted rows whose binding was removed or changed.
+It admits `unknown` to Monitor under the original project identity, never moves
+the ledger task to the replacement project, and leaves unrelated facts alone.
+The desired graph transition is committed before any pending Monitor event is
+replayed. Original event arguments are retained until acknowledged; a crash
+before or after Monitor commit retries the same event. Interrupted known coverage
+is drained to the durable unknown transition before any new source I/O. This is
+eventual crash reconciliation, not a transaction across the two stores.
+Independent monitor evaluation still runs in that tick. Source health retains
 its incomplete traversal/error; a successful watchdog tick is not a successful
 source refresh. Explicit `kanban sync` still reports its partial/error result.
 Pausing or disabling source sync leaves the standalone watchdog usable.
@@ -287,11 +300,14 @@ using that Hermes interpreter, run:
 python tests/host_kanban.py --installed-home /path/to/disposable-home
 ```
 
-The journey executes the tutorial, a naturally due public cron tick after an
-external title edit, and checks that a native claim and heartbeat for a synthetic
-assigned task reach the projection, Ledger and Monitor. It also checks cached
-slash/tool/pre-turn reads, pause/resume, two-home and board isolation, and
+The journey executes the tutorial and a naturally due public cron tick after an
+external title edit. For a native claim and heartbeat on a synthetic assigned
+task, it checks current-run identity, canonical Ledger status and Monitor heartbeat
+when the host exposes authoritative current identity. Otherwise it asserts null
+worker projection and no known worker signal. This is a
+capability assertion, not a skipped host or a weaker identity rule.
+It also checks cached slash/tool/pre-turn reads, pause/resume, two-home and board isolation, and
 retained-data uninstall. It does not start a worker or model.
 The supplied home must contain only the enabled installed plugin and no prior
-plugin data. CI runs this against its exact public revision on the pinned
-released host; source-copy execution alone is not public-install evidence.
+plugin data. CI runs this against its exact public revision on both pinned native
+hosts; source-copy execution alone is not public-install evidence.
