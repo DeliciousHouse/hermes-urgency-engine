@@ -15,6 +15,7 @@ import uuid
 
 from .ledger import Ledger, LedgerError, open_hermes_ledger, open_readonly_ledger
 from .watchdog import Monitor, DEFAULTS as WATCHDOG_DEFAULTS, LIMITATIONS, settings as monitor_settings
+from .kanban import Sync, NativeSource, DEFAULTS as KANBAN_DEFAULTS, settings as kanban_settings
 
 
 PLUGIN_ID = 'hermes-urgency-engine'
@@ -31,6 +32,8 @@ READ_FIELDS = {
     'watchdog_health': ({}, {}),
     'watchdog_incidents': ({}, {'project_id': str, 'limit': int, 'after': str}),
     'watchdog_plans': ({}, {'project_id': str, 'limit': int, 'after': str}),
+    'kanban_health': ({}, {}),
+    'kanban_tasks': ({'project_id': str}, {'limit': int, 'after': str}),
 }
 # Explicit signature allowlists, not reflection into the Ledger or host.
 MUTATIONS = {
@@ -119,6 +122,21 @@ def setup_parser(parser, *, conversational=False):
     status.add_argument('--limit', type=int, default=100)
     status.add_argument('--after')
     commands.add_parser('diagnose', help='Read storage health; no repairs')
+    kanban = commands.add_parser('kanban', help='Cached canonical source facts; sync may recompute native readiness')
+    source = kanban.add_subparsers(dest='kanban_operation', required=True)
+    source.add_parser('health')
+    tasks = source.add_parser('tasks')
+    tasks.add_argument('--project', dest='project_id', required=True)
+    tasks.add_argument('--limit', type=int, default=100)
+    tasks.add_argument('--after')
+    if not conversational:
+        snapshot = source.add_parser('snapshot', help='Read a minimal public-tool task snapshot; configured scope only')
+        snapshot.add_argument('--board', required=True)
+        snapshot.add_argument('--task', dest='task_id', required=True)
+        for name in ('sync', 'pause', 'resume'):
+            sub = source.add_parser(name)
+            sub.add_argument('--request-id', required=True)
+            sub.add_argument('--reason', required=True)
     watchdog = commands.add_parser('watchdog', help='Independent monitor and recovery plans')
     monitor = watchdog.add_subparsers(dest='watchdog_operation', required=True)
     monitor.add_parser('health')
@@ -253,6 +271,8 @@ class Runtime:
             settings = self.settings()
             if operation.startswith('watchdog_'):
                 return {'ok': True, 'data': self.monitor_read(operation.removeprefix('watchdog_'), arguments)}
+            if operation.startswith('kanban_'):
+                return {'ok': True, 'data': self.kanban_read(operation.removeprefix('kanban_'), arguments)}
             if operation in MUTATIONS:
                 storage = self.open(settings)
             else:
@@ -295,7 +315,7 @@ class Runtime:
                     has_more = bool(items and ledger.history(arguments['entity_type'], arguments['entity_id'], 1, items[-1]['sequence']))
                     data = dict(items=items, has_more=has_more, next=items[-1]['sequence'] if has_more else None)
                 else:
-                    data = dict(storage='available', schema=1, context_enabled=settings['context_enabled'], **EVIDENCE)
+                    data = dict(storage='available', schema=ledger.schema_version, context_enabled=settings['context_enabled'], **EVIDENCE)
             check_json(data)
             return {'ok': True, 'data': data}
         except LedgerError as exc:
@@ -342,6 +362,8 @@ class Runtime:
         operation = vars(args).get('operation')
         if operation == 'watchdog':
             return self.monitor_cli(args)
+        if operation == 'kanban':
+            return self.kanban_cli(args)
         if operation is None:
             setup_parser(Parser(prog='hermes urgency')).print_help()
             return 2
@@ -373,6 +395,123 @@ class Runtime:
 
     def monitor_config(self):
         return monitor_settings({key: self.ctx.get_config(key, default) for key, default in WATCHDOG_DEFAULTS.items()})
+
+    def kanban_config(self):
+        return kanban_settings({key: self.ctx.get_config(key, default) for key, default in KANBAN_DEFAULTS.items()})
+
+    def kanban_snapshot(self, board, task_id):
+        from .kanban import fail, project, _id
+        cfg = self.kanban_config()
+        bindings = [b for b in cfg['kanban_bindings'] if b['board'] == board]
+        if not cfg['kanban_sync_enabled'] or len(bindings) != 1:
+            fail('binding', 'SOURCE_DENIED')
+        binding, = bindings
+        _id(task_id, 'task_id')
+        NativeSource().validate_board(binding)
+        if not callable(getattr(self.ctx, 'dispatch_tool', None)):
+            fail('public_tool', 'SOURCE_UNAVAILABLE')
+        from tools.registry import discover_builtin_tools
+        discover_builtin_tools()
+        raw = self.ctx.dispatch_tool('kanban_show', dict(board=board, task_id=task_id))
+        if not isinstance(raw, str):
+            fail('public_tool')
+        if len(raw.encode('utf-8')) > 16 * 1024 * 1024:
+            fail('public_tool', 'SOURCE_LIMIT')
+        def pairs(items):
+            result = {}
+            for key, value in items:
+                if key in result:
+                    fail('json')
+                result[key] = value
+            return result
+        try:
+            document = json.loads(raw, object_pairs_hook=pairs, parse_constant=lambda _: fail('json'))
+        except (ValueError, RecursionError):
+            fail('json')
+        if not isinstance(document, dict) or document.get('error') or document.get('ok') is False:
+            fail('public_tool', 'SOURCE_DENIED')
+        task = document.get('task')
+        if not isinstance(task, dict) or task.get('id') != task_id:
+            fail('task')
+        if task.get('tenant') != binding['tenant']:
+            fail('tenant', 'SOURCE_DENIED')
+        # Only scalar source facts cross the child boundary. Private task text,
+        # histories and event payloads are never rendered or persisted.
+        def select(row, fields):
+            if not isinstance(row, dict):
+                fail('source')
+            result = {key: row[key] for key in fields if key in row}
+            for value in result.values():
+                if value is not None and type(value) not in (str, int, float):
+                    fail('source')
+                if isinstance(value, str) and len(value) > 4096:
+                    fail('source', 'SOURCE_LIMIT')
+            return result
+        result = dict(task=select(task, ('id', 'title', 'status', 'tenant', 'assignee', 'priority',
+            'started_at', 'current_run_id', 'updated_at')), parents=document.get('parents'))
+        for key, fields in (('runs', ('id', 'profile', 'status', 'started_at', 'ended_at')),
+                            ('events', ('kind', 'run_id', 'created_at'))):
+            rows = document.get(key, [])
+            if not isinstance(rows, list) or len(rows) > 10000:
+                fail(key, 'SOURCE_LIMIT')
+            result[key] = [select(row, fields) for row in rows]
+        project(result, binding, self.clock(), lambda text: self.ctx.redact_text(text, force=True))
+        check_json(result)
+        return result
+
+    def kanban_cli(self, args):
+        operation = args.kanban_operation
+        try:
+            if operation == 'snapshot':
+                data = self.kanban_snapshot(args.board, args.task_id)
+            elif operation in ('health', 'tasks'):
+                data = self.kanban_read(operation, arguments_from(args, 'kanban_' + operation))
+            else:
+                cfg = self.kanban_config()
+                if not cfg['kanban_sync_enabled'] or (not cfg['kanban_bindings'] and not (self.data_dir() / 'kanban.db').exists()):
+                    data = dict(state='disabled')
+                else:
+                    with Sync.host(clock=self.clock, redact=lambda text: self.ctx.redact_text(text, force=True)) as sync:
+                        if operation in ('pause', 'resume'):
+                            data = sync.control(operation, args.request_id, args.reason)
+                        else:
+                            with self.open(self.settings()) as ledger, Monitor.host(clock=self.clock) as monitor:
+                                data = sync.scan(cfg, ledger, monitor, self.data_dir() / 'data.db', NativeSource(),
+                                                 request_id=args.request_id, reason=args.reason)
+            result = {'ok': data.get('state') not in ('partial', 'conflict'), 'data': data}
+        except LedgerError as exc:
+            result = self.error(exc, 'kanban_' + operation)
+        except Exception:
+            result = self.unexpected('kanban_' + operation)
+        rendered = self.render(result)
+        ok = json.loads(rendered)['ok']
+        print(rendered, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+
+    def kanban_read(self, operation, arguments, *, deadline=None) -> dict:
+        cfg = self.kanban_config()
+        path = self.data_dir() / 'kanban.db'
+        if not path.exists():
+            return (dict(storage='uninitialized', enabled=cfg['kanban_sync_enabled'], coverage='unknown')
+                    if operation == 'health' else dict(items=[], next=None, has_more=False))
+        connection = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=.1)
+        if deadline is not None:
+            connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+        with Sync(connection, clock=self.clock, redact=lambda text: self.ctx.redact_text(text, force=True), readonly=True) as sync:
+            if operation == 'tasks':
+                return sync.page(**arguments, cfg=cfg)
+            with sync.transaction(False):
+                last_success = sync.meta('last_success')
+                age = ((self.clock() - datetime.fromisoformat(last_success)).total_seconds()
+                       if last_success else None)
+                return dict(storage='available', enabled=cfg['kanban_sync_enabled'],
+                            paused=sync.meta('paused', False), last_attempt=sync.meta('last_attempt'),
+                            last_success=last_success, last_error=sync.meta('last_error'),
+                            last_result=sync.meta('last_result'), age_seconds=age,
+                            stale=age is None or age < 0 or age > cfg['kanban_sync_seconds'],
+                            dirty_bindings=sync.meta('dirty_bindings', []),
+                            incomplete_scan=sync.meta('incomplete_scan'), cursor=sync.meta('cursor'),
+                            coverage='unknown')
 
     def monitor_read(self, operation, arguments, *, active=False):
         storage = Monitor.open(self.data_dir() / 'watchdog.db', clock=self.clock, readonly=True)
@@ -408,7 +547,9 @@ class Runtime:
                     elif operation == 'tick':
                         if not (cfg['watchdog_enabled'] or (monitor.meta('install') or {}).get('state') == 'installed'):
                             return 0
-                        data = monitor.tick(self.data_dir() / 'data.db', cfg, args.force)
+                        data = self.due_source_sync(monitor)
+                        if data is None:
+                            data = monitor.tick(self.data_dir() / 'data.db', cfg, args.force)
                         if not data['notices']:
                             return 0
                         # Records retain full details; one bounded summary goes to cron.
@@ -427,6 +568,31 @@ class Runtime:
         ok = json.loads(rendered)['ok']
         print(rendered, file=sys.stdout if ok else sys.stderr)
         return 0 if ok else 1
+
+    def due_source_sync(self, monitor):
+        cfg = self.kanban_config()
+        if not cfg['kanban_sync_enabled'] or (not cfg['kanban_bindings'] and not (self.data_dir() / 'kanban.db').exists()):
+            return None
+        with Sync.host(clock=self.clock, redact=lambda text: self.ctx.redact_text(text, force=True)) as sync:
+            if sync.meta('paused', False):
+                return None
+            last = sync.meta('last_attempt')
+            if last and (self.clock() - datetime.fromisoformat(last)).total_seconds() < cfg['kanban_sync_seconds']:
+                return None
+            with sync.transaction():
+                sync.put('last_attempt', self.clock().isoformat())
+            with self.open(self.settings()) as ledger:
+                try:
+                    sync.scan(cfg, ledger, monitor, self.data_dir() / 'data.db', NativeSource(),
+                              request_id=uuid.uuid4().hex, reason='Existing watchdog tick')
+                except LedgerError as exc:
+                    if exc.code not in ('SCOPE_CONFLICT', 'REVISION_CONFLICT') and not exc.code.startswith('SOURCE_'):
+                        raise
+                    # scan persists the source error and revokes graph coverage.
+                    # A failed source refresh must not disable unrelated monitoring.
+        # Partial scans revoke graph coverage before returning. They must not
+        # suppress independent deadline/checkpoint evaluation in the same tick.
+        return None
 
     def cron(self, action, **arguments):
         # Plugin CLI commands do not otherwise initialize built-in tool discovery.
@@ -518,6 +684,24 @@ class Runtime:
             monitor.put('paused', False)
             monitor.audit(uuid.uuid4().hex, 'install', [operation, deliver], {'state': 'installed', 'job_id': job['job_id']})
         return receipt
+
+    def kanban_hint(self, board=None, **kwargs):
+        # Lifecycle callbacks lack tenant coverage. Coalesce a binding refresh;
+        # never use hook timestamps, run IDs or bodies as source observations.
+        try:
+            cfg = self.kanban_config()
+            if not cfg['kanban_sync_enabled'] or not cfg['kanban_bindings']:
+                return
+            boards = {binding['board'] for binding in cfg['kanban_bindings']}
+            if board is not None:
+                if not isinstance(board, str) or board not in boards:
+                    return
+                boards = {board}
+            with Sync.host(clock=self.clock, redact=lambda text: self.ctx.redact_text(text, force=True)) as sync:
+                with sync.transaction():
+                    sync.put('dirty_bindings', sorted(set(sync.meta('dirty_bindings', [])) | boards))
+        except Exception:
+            return  # An optional hint must not interrupt a native transition.
 
     def post_tool_call(self, tool_name=None, result=None, duration=None, session_id=None, **kwargs):
         # Project focus cannot identify a board task. Only explicit verified mappings
@@ -624,8 +808,8 @@ class Runtime:
             if not isinstance(raw_args, str) or len(raw_args) > MAX_INPUT_BYTES:
                 invalid('arguments')
             args = parser.parse_args(shlex.split(raw_args) or ['status'])
-            if args.operation == 'watchdog':
-                operation = 'watchdog_' + args.watchdog_operation
+            if args.operation in ('watchdog', 'kanban'):
+                operation = args.operation + '_' + getattr(args, args.operation + '_operation')
                 result = self.run_request(operation, arguments_from(args, operation), surface='slash', session_id=session_id)
             elif args.operation == 'focus':
                 result = self.focus(args.project_id, session_id)
@@ -685,6 +869,20 @@ class Runtime:
                 lines.append('No deadline forecast: no active deadlines in this project.')
             for deadline in deadlines:
                 lines.append('Deadline: ' + encode({key: deadline[key] for key in ('deadline_id', 'kind', 'target_at', 'original_at', 'forecast_at', 'input', 'forecast')}))
+            source_cfg = self.kanban_config()
+            if source_cfg['kanban_sync_enabled'] and source_cfg['kanban_bindings']:
+                canonical = self.kanban_read('tasks', dict(project_id=project_id, limit=5), deadline=stop_at)
+                check_budget()
+                for task in canonical['items']:
+                    lines.append('Canonical task: ' + encode({key: task[key] for key in
+                        ('board_id', 'task_id', 'status', 'coverage', 'observed_at', 'age_seconds', 'stale')}))
+                    if task['stale'] or task['coverage'] == 'unknown':
+                        lines.append('Canonical coverage unknown: refresh source before diagnosing blockers.')
+                    elif task['status'] == 'blocked':
+                        lines.append('Canonical blocker: inspect dependencies for ' +
+                                     encode([task['board_id'], task['task_id']]) + '; cause not established by status.')
+                if canonical['has_more']:
+                    lines.append('Canonical task listing truncated; query kanban_tasks for the next page.')
             for task in tasks:
                 lines.append('Task: ' + encode({key: task[key] for key in ('board_id', 'task_id', 'goal', 'status', 'criteria')}))
             plans = self.monitor_read('plans', {'project_id': project_id, 'limit': 3}, active=True)
@@ -738,3 +936,5 @@ def register(ctx):
     ctx.register_hook('on_session_end', runtime.session_end)
     ctx.register_hook('on_session_reset', runtime.session_reset)
     ctx.register_hook('post_tool_call', runtime.post_tool_call)
+    for hook in ('kanban_task_claimed', 'kanban_task_completed', 'kanban_task_blocked'):
+        ctx.register_hook(hook, runtime.kanban_hint)

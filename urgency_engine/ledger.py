@@ -145,6 +145,10 @@ _SCHEMA = (
 )
 
 
+_REMAINING_COLUMN = 'remaining_known INTEGER NOT NULL DEFAULT 1 CHECK(remaining_known IN (0,1))'
+_SCHEMA_V2 = tuple(sql.replace('PRIMARY KEY(board_id,task_id)', _REMAINING_COLUMN + ', PRIMARY KEY(board_id,task_id)') if sql.startswith('CREATE TABLE tasks(') else sql for sql in _SCHEMA)
+
+
 _HAS_EVIDENCE = '''EXISTS(SELECT 1 FROM evidence e WHERE e.board_id=c.board_id AND e.task_id=c.task_id AND e.criterion_id=c.criterion_id AND e.criterion_revision=c.criterion_revision AND e.invalidated_at IS NULL AND e.observed_sha256=c.expected_sha256)'''
 
 
@@ -184,15 +188,21 @@ class Ledger:
             if version == 0 and not objects:
                 if read_only:
                     raise LedgerError('NOT_FOUND', 'initialize', next_action='Initialize the ledger with hermes urgency apply.')
-                for statement in _SCHEMA:
+                for statement in _SCHEMA_V2:
                     connection.execute(statement)
-                connection.execute('PRAGMA user_version=1')
-            elif version != 1:
+                connection.execute('PRAGMA user_version=2')
+                version = 2
+            elif version not in (1, 2):
                 raise LedgerError('UNSUPPORTED_SCHEMA', 'initialize')
-            elif sorted(row[0] for row in objects) != sorted(_SCHEMA):
+            elif sorted(row[0] for row in objects) != sorted(_SCHEMA if version == 1 else _SCHEMA_V2):
                 raise LedgerError('CORRUPT_STATE', 'initialize')
             if (not read_only or check_integrity) and (connection.execute('PRAGMA quick_check').fetchone()[0] != 'ok' or connection.execute('PRAGMA foreign_key_check').fetchone()):
                 raise LedgerError('CORRUPT_STATE', 'initialize')
+            if version == 1 and not read_only:
+                connection.execute('ALTER TABLE tasks ADD COLUMN ' + _REMAINING_COLUMN)
+                connection.execute('PRAGMA user_version=2')
+                version = 2
+            self.schema_version = version
 
     def __enter__(self):
         return self
@@ -229,6 +239,13 @@ class Ledger:
                         sqlite3.SQLITE_CORRUPT: 'CORRUPT_STATE', sqlite3.SQLITE_NOTADB: 'CORRUPT_STATE'}.get(code, 'STORAGE_FAILURE')
                 raise LedgerError(name, operation, side_effects='unknown' if committing or not rolled_back else 'none') from None
             raise
+
+    def has_committed_operation(self, *request_ids):
+        """Check exact durable receipts without replaying a mutation."""
+        with self._transaction('operation_receipt'):
+            return any(self.connection.execute('SELECT 1 FROM operations WHERE request_id=?',
+                                               (request_id,)).fetchone() is not None
+                       for request_id in request_ids)
 
     def _replay(self, request_id, digest):
         row = self.connection.execute('SELECT * FROM operations WHERE request_id=?', (request_id,)).fetchone()
@@ -317,6 +334,9 @@ class Ledger:
         if not row:
             raise LedgerError('NOT_FOUND', 'read', 'task_id')
         result = dict(row)
+        result['remaining_known'] = bool(result.get('remaining_known', 1))
+        if not result['remaining_known']:
+            result['remaining_seconds'] = None
         result['criteria'] = [dict(c) for c in self.connection.execute(
             'SELECT * FROM criteria WHERE board_id=? AND task_id=? AND active=1 ORDER BY criterion_id', (board_id, task_id))]
         return result
@@ -338,7 +358,7 @@ class Ledger:
         if status not in ('planned', 'running', 'blocked'):
             _invalid('status')
         numbers = [_number(v, f) for v, f in (
-            (remaining_seconds, 'remaining_seconds'), (verification_seconds, 'verification_seconds'),
+            (0 if remaining_seconds is None else remaining_seconds, 'remaining_seconds'), (verification_seconds, 'verification_seconds'),
             (deployment_seconds, 'deployment_seconds'), (actual_seconds, 'actual_seconds'))]
         exists = self.connection.execute('SELECT 1 FROM tasks WHERE board_id=? AND task_id=?', (board_id, task_id)).fetchone()
         before = self._task(board_id, task_id) if exists else None
@@ -349,14 +369,14 @@ class Ledger:
             # Status edits cannot forge or erase verified completion; reopen is explicit.
             if before['status'] in ('verified', 'claimed_complete'):
                 status = before['status']
-            self.connection.execute('UPDATE tasks SET assignee=?,goal=?,status=?,remaining_seconds=?,verification_seconds=?,deployment_seconds=?,actual_seconds=?,revision=revision+1 WHERE board_id=? AND task_id=?',
-                                    (assignee, goal, status, *numbers, board_id, task_id))
+            self.connection.execute('UPDATE tasks SET assignee=?,goal=?,status=?,remaining_seconds=?,verification_seconds=?,deployment_seconds=?,actual_seconds=?,remaining_known=?,revision=revision+1 WHERE board_id=? AND task_id=?',
+                                    (assignee, goal, status, *numbers, int(remaining_seconds is not None), board_id, task_id))
         else:
             count = self.connection.execute('SELECT count(*) FROM tasks WHERE project_id=?', (project_id,)).fetchone()[0]
             if count >= 10000:
                 _invalid('tasks_capacity')
-            self.connection.execute('INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?,NULL,NULL,1)',
-                                    (board_id, task_id, project_id, assignee, goal, status, *numbers))
+            self.connection.execute('INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?,NULL,NULL,1,?)',
+                                    (board_id, task_id, project_id, assignee, goal, status, *numbers, int(remaining_seconds is not None)))
         self._bump(project_id)
         return self._task(board_id, task_id), 'task', _json([board_id, task_id]), before
 
@@ -644,6 +664,8 @@ class Ledger:
             parameters.append(deadline['milestone_id'])
         tasks = [dict(row) for row in self.connection.execute('SELECT * FROM tasks WHERE ' + condition + ' ORDER BY board_id,task_id', parameters)]
         work, verification, deployment = [math.fsum(t[field] for t in tasks) for field in ('remaining_seconds', 'verification_seconds', 'deployment_seconds')]
+        if not tasks or any(not t.get('remaining_known', 1) for t in tasks):
+            work = None
         now = datetime.fromisoformat(self._now())
         previous_row = self.connection.execute("SELECT payload_json FROM snapshots WHERE project_id=? AND kind='forecast' AND json_extract(payload_json,'$.deadline_id')=? ORDER BY snapshot_id DESC LIMIT 1", (deadline['project_id'], deadline_id)).fetchone()
         previous = None
@@ -652,7 +674,7 @@ class Ledger:
             previous = UrgencyState(UrgencyLevel(record['level']), datetime.fromisoformat(record['changed_at']))
         try:
             forecast = asdict(calculate_forecast(ForecastInput(datetime.fromisoformat(deadline['target_at']), work, verification, deployment), now=now, previous=previous))
-            projected = now + timedelta(seconds=work + verification + deployment)
+            projected = now + timedelta(seconds=work + verification + deployment) if work is not None else None
         except (ValueError, OverflowError):
             _invalid('forecast')
         forecast['changed_at'] = forecast['changed_at'].isoformat()
@@ -660,10 +682,10 @@ class Ledger:
         forecast['reasons'] = list(forecast['reasons'])
         actual = max(t['actual_verified_at'] for t in tasks) if tasks and all(t['actual_verified_at'] for t in tasks) else None
         comparison = datetime.fromisoformat(actual) if actual else projected
-        return {**deadline, 'forecast': forecast, 'forecast_at': projected.isoformat(),
+        return {**deadline, 'forecast': forecast, 'forecast_at': projected.isoformat() if projected else None,
                 'actual_verified_at': actual,
-                'baseline_variance_seconds': (comparison - datetime.fromisoformat(deadline['original_at'])).total_seconds(),
-                'target_variance_seconds': (comparison - datetime.fromisoformat(deadline['target_at'])).total_seconds(),
+                'baseline_variance_seconds': (comparison - datetime.fromisoformat(deadline['original_at'])).total_seconds() if comparison else None,
+                'target_variance_seconds': (comparison - datetime.fromisoformat(deadline['target_at'])).total_seconds() if comparison else None,
                 'input_revisions': {'deadline': deadline['revision'], 'project': self._project(deadline['project_id'])['revision'],
                                     'tasks': [[t['board_id'], t['task_id'], t['revision']] for t in tasks]},
                 'input': dict(remaining_seconds=work, verification_seconds=verification, deployment_seconds=deployment, now=now.isoformat())}
@@ -689,10 +711,14 @@ class Ledger:
             percent = min(99.99999999999999, 100 * (verified / weight)) if weight else None
             if count and count == verified_count:
                 percent = 100.0
+            unscoped = self.connection.execute('SELECT count(*) FROM tasks t WHERE project_id=? AND NOT EXISTS (SELECT 1 FROM criteria c WHERE c.board_id=t.board_id AND c.task_id=t.task_id AND c.active=1)', (project_id,)).fetchone()[0]
+            if unscoped:
+                percent = None
             last = self.connection.execute('SELECT max(last_verified_progress_at) FROM tasks WHERE project_id=?', (project_id,)).fetchone()[0]
             return dict(project_id=project_id, baseline_weight=json.loads(baseline[0])['weight'] if baseline else None,
                         current_weight=weight, verified_weight=verified, percent=percent,
-                        state='determinate' if weight else 'insufficient_evidence', last_verified_progress_at=last, revision=project['revision'])
+                        state='determinate' if percent is not None else 'insufficient_evidence', unscoped_task_count=unscoped,
+                        last_verified_progress_at=last, revision=project['revision'])
 
 
 def open_readonly_ledger(path, *, clock, deadline=None, busy_timeout_ms=100, check_integrity=False):

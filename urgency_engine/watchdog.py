@@ -178,6 +178,9 @@ def snapshot(path, clock, cursor=None, deadline=None):
         tasks = tasks[:500]
         revisions = {}
         for task in tasks:
+            task['remaining_known'] = bool(task.get('remaining_known', 1))
+            if not task['remaining_known']:
+                task['remaining_seconds'] = None
             project = ledger._project(task['project_id'])
             revisions[task['project_id']] = project['revision']
             task['objective'] = project['title']

@@ -4,12 +4,22 @@ Import the public API from `urgency_engine`. All four data classes are frozen. `
 
 | Type | Fields |
 |---|---|
-| `ForecastInput` | `deadline: datetime`, `remaining_work_seconds: float`, `verification_buffer_seconds: float = 0`, `deployment_buffer_seconds: float = 0`, `completion_samples_seconds: tuple[float, ...] = ()` |
+| `ForecastInput` | `deadline: datetime`, `remaining_work_seconds: float \| None`, `verification_buffer_seconds: float = 0`, `deployment_buffer_seconds: float = 0`, `completion_samples_seconds: tuple[float, ...] = ()` |
 | `UrgencyPolicy` | `elevated_slack_ratio: float = 1.0`, `high_slack_ratio: float = 0.25`, `imminent_seconds: float = 900`, `deescalation_cooldown_seconds: float = 300`, `deescalation_margin_seconds: float = 60`, `min_distribution_samples: int = 5` |
 | `UrgencyState` | `level: UrgencyLevel`, `changed_at: datetime` |
-| `Forecast` | `time_remaining_seconds: float`, `deadline_slack_seconds: float`, `effective_slack_seconds: float`, `p50_seconds: float \| None`, `p90_seconds: float \| None`, `on_time_probability: float \| None`, `sample_count: int`, `evidence: str`, `raw_level: UrgencyLevel`, `level: UrgencyLevel`, `changed_at: datetime`, `reasons: tuple[str, ...]` |
+| `Forecast` | `time_remaining_seconds: float`, `deadline_slack_seconds: float \| None`, `effective_slack_seconds: float \| None`, `p50_seconds: float \| None`, `p90_seconds: float \| None`, `on_time_probability: float \| None`, `sample_count: int`, `evidence: str`, `raw_level: UrgencyLevel`, `level: UrgencyLevel`, `changed_at: datetime`, `reasons: tuple[str, ...]` |
 
 `now`, `deadline`, and any `previous.changed_at` must be timezone-aware and convertible to UTC. The previous instant cannot be later than `now`. Time arithmetic uses UTC, including when both datetimes share a timezone across a daylight-saving transition. Supply an explicit offset or resolved fold for ambiguous local times; the core does not parse strings or infer intent. Durations, samples and ratios accept finite nonnegative integers or floats, excluding booleans. The elevated ratio must exceed the high ratio. The sample minimum is an integer of at least 2, excluding booleans. Supply at most 10,000 samples in a tuple. Invalid fields raise a named `ValueError` during evaluation. `reasons` contains explanatory text, not machine-readable status codes.
+
+## Unknown remaining work
+
+Pass `remaining_work_seconds=None` when there is no estimate; zero means a known
+zero estimate. Both slack fields and all three distribution metrics become null,
+with `evidence=insufficient_evidence`, even if samples were supplied. Sample count
+is retained. Raw urgency is elevated until the imminent window, then imminent,
+then overdue at or beyond the target. An existing higher urgency is retained;
+missing work is never evidence for deescalation. Buffers and samples still undergo
+normal numeric validation. The following slack rules apply to known work.
 
 ## Slack and raw urgency
 

@@ -276,7 +276,7 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(ledger.explain_deadline('d')['input']['remaining_seconds'], 10)
             ledger.set_milestone_tasks('m', [], expected_revision=ledger.get_project('p')['revision'],
                 reason='Ungroup', request_id='ungroup', actor='operator')
-            self.assertEqual(ledger.explain_deadline('d')['input']['remaining_seconds'], 0)
+            self.assertIsNone(ledger.explain_deadline('d')['input']['remaining_seconds'])
             self.assertEqual(len(ledger.history('milestone', 'm')), 3)
 
     def test_process_replay_and_competing_revisions(self):
@@ -513,7 +513,7 @@ class LedgerTests(unittest.TestCase):
         self.prepare_task()
         with self.open() as ledger:
             baseline = ledger.connection.total_changes
-            invalid = [None, True, -1, float('nan'), float('inf'), 10**400, '1']
+            invalid = [True, -1, float('nan'), float('inf'), 10**400, '1']
             for value in invalid:
                 with self.subTest(value=type(value).__name__), self.assertRaises(LedgerError) as caught:
                     ledger.upsert_task('b', 't', project_id='p', goal='Deliver', remaining_seconds=value,
@@ -568,7 +568,7 @@ class LedgerTests(unittest.TestCase):
             ledger.create_project('p', 'Project', request_id='p', actor='operator')
             conn = ledger.connection
             conn.execute('BEGIN IMMEDIATE')
-            conn.executemany("INSERT INTO tasks VALUES('b',?,'p',NULL,'Goal','planned',0,0,0,0,NULL,NULL,1)", [(str(i),) for i in range(10000)])
+            conn.executemany("INSERT INTO tasks VALUES('b',?,'p',NULL,'Goal','planned',0,0,0,0,NULL,NULL,1,1)", [(str(i),) for i in range(10000)])
             conn.executemany("INSERT INTO criteria VALUES('b',?,?,1,'Check',?,1,1,?)", [(str(i), c, weight, 'a'*64) for i in range(10000) for c, weight in [('a', 1), ('b', 3)]])
             conn.executemany("INSERT INTO evidence VALUES(?,'b',?,'a',1,'artifact',?,?,NULL)", [(str(i), str(i), 'a'*64, NOW.isoformat()) for i in range(10000)])
             conn.executemany('INSERT INTO projects VALUES(?,?,1,?)', [('page-'+str(i).zfill(4), 'Page', NOW.isoformat()) for i in range(503)])
@@ -729,7 +729,8 @@ class LedgerTests(unittest.TestCase):
             original_scope = [r for r in rows if r['sequence'] <= baseline['audit_sequence'] and r['action'] == 'set_criteria']
             self.assertEqual(json.loads(original_scope[0]['after_json'])['criteria'][0]['weight'], 1)
             ledger.set_criteria('b', 'extra', [], expected_revision=2, request_id='remove', actor='operator', reason='Remove added scope')
-            self.assertEqual(ledger.progress('p')['percent'], 100)
+            self.assertIsNone(ledger.progress('p')['percent'])
+            self.assertEqual(ledger.progress('p')['unscoped_task_count'], 1)
             self.assertEqual(ledger.progress('p')['baseline_weight'], 1)
 
 

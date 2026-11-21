@@ -16,7 +16,8 @@ jobs:
   forecast:
     name: Forecast (${{ matrix.os }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    # Includes the 10000-source disk-backed restart/reconciliation journey.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -79,7 +80,7 @@ jobs:
           .host/.venv/bin/python .host/hermes plugins validate "$RUNNER_TEMP/plugin" --install-deps
           .host/.venv/bin/python "$RUNNER_TEMP/plugin/tests/host_runtime.py" --hermes-root "$GITHUB_WORKSPACE/.host"
       - name: Install exact public revision and exercise installed lifecycle and tutorial
-        if: matrix.name == 'Native plugin (Hermes v0.23.2)'
+        # Exercise capability-positive or explicit-unknown facts on each host.
         env:
           PLUGIN_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
@@ -106,3 +107,9 @@ jobs:
           cp "$scratch/home/config.yaml" "$watchdog_home/config.yaml"
           "${clean[@]}" timeout 8m "$python" "$RUNNER_TEMP/plugin/tests/host_watchdog.py" \
             --hermes-root "$host" --installed-home "$watchdog_home"
+          kanban_home="$scratch/kanban-home"
+          mkdir "$kanban_home"
+          cp -r "$scratch/home/plugins" "$kanban_home/plugins"
+          cp "$scratch/home/config.yaml" "$kanban_home/config.yaml"
+          "${clean[@]}" timeout 8m "$python" "$RUNNER_TEMP/plugin/tests/host_kanban.py" \
+            --installed-home "$kanban_home"
