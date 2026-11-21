@@ -168,7 +168,7 @@ Every successful mutation --> audit + operations (same transaction)
 | Table | Key and stored columns |
 | --- | --- |
 | `projects` | `project_id` PK; title, revision, created_at |
-| `tasks` | `(board_id,task_id)` PK; project_id FK, assignee, goal, status, remaining_seconds, verification_seconds, deployment_seconds, actual_seconds, actual_verified_at, last_verified_progress_at, revision |
+| `tasks` | `(board_id,task_id)` PK; project_id FK, assignee, goal, status, remaining_seconds, remaining_known (schema 2), verification_seconds, deployment_seconds, actual_seconds, actual_verified_at, last_verified_progress_at, revision |
 | `criteria` | `(board_id,task_id,criterion_id,criterion_revision)` PK; task FK, description, weight, required, active, expected_sha256 |
 | `deadlines` | `deadline_id` PK; project_id FK, nullable task FK pair / milestone_id FK, kind, original_at, target_at, timezone, owner, source, revision |
 | `milestones` | `milestone_id` PK; project_id FK, title |
