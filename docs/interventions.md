@@ -26,6 +26,8 @@ An apply file is one UTF-8 JSON object, at most 256 KiB. Required fields: intege
 
 The JSON envelope has `ok` and `data`, or `ok: false` and an `error` with `code`, `operation`, `retryable`, `side_effects` and `next_action`. A recorded failed or uncertain effect also returns `data`. Commands with failed or uncertain outcomes exit nonzero and report on stderr. `data` includes the action ID, kind, state, requested/observed effect, attribution, attempt count, last error and next action. `attempt_count` counts durable effect admissions; a process may stop before the external call begins.
 
+Apply returns `SOURCE_DENIED` when the task reports a current run ID, even if the native detail lacks the matching run record. Missing run telemetry does not make a task with a current run pointer eligible for intervention.
+
 ## Why receipts and readback are separate
 
 `reserved` means no effect was admitted. `in_flight` means the intent was durably admitted before the write. `applied` requires a conclusive receipt and matching readback; `observed` means the desired value matches but no receipt attributes it to the request. `refused` and `conflict` distinguish blocked input/scope from a competing revision; `unknown` means the current evidence cannot settle the outcome. None of these states resolves an incident or verifies delivery.

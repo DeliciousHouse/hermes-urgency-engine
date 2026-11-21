@@ -373,6 +373,20 @@ print(json.dumps(result))
         with self.ledger() as ledger:
             self.assertEqual(ledger.get_task('demo', 'task'), before)
 
+    def test_unresolved_current_run_pointer_refuses_intervention(self):
+        """protects=no worker intervention; fails_when=an uncorroborated pointer is treated as idle;
+        why_new=canonical claim evidence; seam=real stores/native read fixture; no_claim=native CAS.
+        """
+        before, payload = self.seed()
+        detail = self.source.detail(self.binding, 'task')
+        detail = dict(detail, task=dict(detail['task'], current_run_id=12345), runs=[])
+        with patch.object(self.source, 'detail', return_value=detail):
+            code, result = self.apply(payload)
+        self.assertEqual((code, result['data']['state'], result['data']['attempt_count']), (1, 'refused', 0))
+        self.assertEqual((result['error']['code'], result['error']['side_effects']), ('SOURCE_DENIED', 'none'))
+        with self.ledger() as ledger:
+            self.assertEqual(ledger.get_task('demo', 'task'), before)
+
     def test_concurrent_ledger_edit_survives_action(self):
         """protects=write-time CAS; fails_when=preflight replaces a competing edit;
         why_new=narrow reestimate; seam=real ledger interleave; no_claim=native CAS.

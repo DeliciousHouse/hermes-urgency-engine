@@ -487,9 +487,11 @@ class Runtime:
         from .kanban import project
         cfg, binding = self.intervention_binding(payload)
         key = payload['board_id'], payload['task_id']
-        source = project(NativeSource().detail(binding, key[1]), binding, self.clock(),
-                         lambda text: self.ctx.redact_text(text, force=True))
-        if source['task_id'] != key[1] or source['status'] not in ('todo', 'ready', 'blocked') or source['worker']['run_id']:
+        detail = NativeSource().detail(binding, key[1])
+        source = project(detail, binding, self.clock(), lambda text: self.ctx.redact_text(text, force=True))
+        # Worker telemetry requires corroboration; admission must honor the canonical pointer alone.
+        if (source['task_id'] != key[1] or source['status'] not in ('todo', 'ready', 'blocked') or
+                detail['task'].get('current_run_id') is not None):
             invalid('status', 'SOURCE_DENIED')
         path = self.data_dir() / 'kanban.db'
         if not path.exists():
