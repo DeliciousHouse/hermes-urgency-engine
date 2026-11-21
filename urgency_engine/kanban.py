@@ -7,6 +7,7 @@ import re
 import subprocess
 import threading
 import time
+from time import monotonic
 import uuid
 from pathlib import Path
 from typing import NoReturn
@@ -19,6 +20,18 @@ from .ledger import LedgerError, _id, _json, _integer, _text
 DEFAULTS = dict(kanban_sync_enabled=False, kanban_bindings=[],
                 kanban_sync_seconds=60, kanban_max_tasks=10000)
 STATUSES = {'todo', 'ready', 'triage', 'running', 'blocked', 'review', 'done', 'archived'}
+MAX_INTENT_BYTES = 16 * 1024 * 1024
+
+
+def intent_batch_size(remaining):
+    if remaining <= 30:
+        return 10
+    if remaining <= 60:
+        return 60
+    size = 100
+    while size < remaining:
+        size *= 2
+    return size
 
 
 def fail(field, code='SOURCE_MALFORMED') -> NoReturn:
@@ -488,19 +501,25 @@ class Sync:
             if (row['board_id'], row['task_id']) not in seen:
                 self.mark_unknown((row['board_id'], row['task_id']), 'SOURCE_ABSENT')
         plans = []
+        batch_bytes = 0
+        detail_deadline = monotonic() + 20
 
         def apply_collected():
+            nonlocal batch_bytes
             if not plans:
                 return
-            # At most this page's 100 details; no source I/O or cross-store
-            # effects under this lock. Every task keeps its own replay record.
-            with self.transaction():
-                for identity, plan in plans:
-                    self.db.execute('INSERT INTO sync_requests VALUES(?,?,?,?)',
-                                    (identity, hashlib.sha256(_json(plan).encode()).hexdigest(), 'pending', _json(plan)))
-            for identity, plan in plans:
-                self.apply_plan(identity, plan, ledger, monitor)
+            # No source I/O or cross-store effects under the intent write lock.
+            size = intent_batch_size(len(plans))
+            for start in range(0, len(plans), size):
+                batch = plans[start:start + size]
+                with self.transaction():
+                    for identity, encoded in batch:
+                        self.db.execute('INSERT INTO sync_requests VALUES(?,?,?,?)',
+                                        (identity, hashlib.sha256(encoded.encode()).hexdigest(), 'pending', encoded))
+                for identity, encoded in batch:
+                    self.apply_plan(identity, json.loads(encoded), ledger, monitor)
             plans.clear()
+            batch_bytes = 0
 
         for binding, rows in inventories:
             for row in sorted(rows, key=lambda r: r['id']):
@@ -508,10 +527,6 @@ class Sync:
                 position = [binding['board'], binding['tenant'], task_id]
                 if cursor and position <= cursor:
                     continue
-                if processed == 100:
-                    apply_collected()
-                    self.admit_graph(cfg, monitor, set(), ledger_path)
-                    return dict(state='partial', count=count, cursor=self.meta('cursor'))
                 key = binding['board'], task_id
                 try:
                     task = ledger.get_task(*key)
@@ -519,6 +534,10 @@ class Sync:
                     if exc.code != 'NOT_FOUND':
                         raise
                     task = None
+                if processed and monotonic() >= detail_deadline:
+                    apply_collected()
+                    self.admit_graph(cfg, monitor, set(), ledger_path)
+                    return dict(state='partial', count=count, cursor=self.meta('cursor'))
                 try:
                     document = source.detail(binding, task_id)
                 except LedgerError as exc:
@@ -568,7 +587,12 @@ class Sync:
                 if reopen:
                     plan['reopen_revision'] = arguments['expected_revision']
                     arguments['expected_revision'] += 1
-                plans.append((identity, plan))
+                encoded = _json(plan)
+                # _json escapes non-ASCII, so its string length is its UTF-8 byte count.
+                if batch_bytes + len(encoded) > MAX_INTENT_BYTES:
+                    apply_collected()
+                plans.append((identity, encoded))
+                batch_bytes += len(encoded)
                 count += 1
         apply_collected()
         self.admit_graph(cfg, monitor, seen, ledger_path)

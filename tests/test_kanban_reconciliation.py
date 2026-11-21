@@ -5,6 +5,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from urgency_engine import kanban
 from urgency_engine.ledger import Ledger, LedgerError
@@ -51,6 +52,100 @@ class ReconciliationTests(unittest.TestCase):
     def scan(self, identity='scan'):
         return self.sync.scan(self.cfg, self.ledger, None, self.root / 'data.db',
                               self.source, request_id=identity, reason='Fixture')
+
+    def slow_source_clock(self):
+        # 100 detail reads consume the scanner's 20-second collection window.
+        return patch.object(kanban, 'monotonic', lambda: self.source.calls / 5)
+
+    def test_adaptive_intent_commit_boundaries(self):
+        for low, high, size in ((1, 30, 10), (31, 60, 60), (61, 100, 100),
+                                (101, 200, 200), (201, 400, 400), (401, 800, 800),
+                                (801, 1600, 1600), (6401, 10000, 12800)):
+            for remaining in (low, high):
+                self.assertEqual(kanban.intent_batch_size(remaining), size)
+
+        # Count durable intent inserts per transaction for previously unseen IDs.
+        for count, expected in ((7, [7]), (27, [10, 10, 7]), (31, [31]), (201, [201])):
+            batches = []
+            pending = 0
+            def trace(sql):
+                nonlocal pending
+                if sql.startswith('INSERT INTO sync_requests') and "'pending'" in sql:
+                    pending += 1
+                if sql == 'COMMIT' and pending:
+                    batches.append(pending)
+                    pending = 0
+            self.sync.db.set_trace_callback(trace)
+            self.source.rows = [dict(id=f'n{count}-{i}', tenant='synthetic') for i in range(count)]
+            with patch.object(kanban, 'monotonic', return_value=0):
+                self.assertEqual(self.scan(f'n{count}')['state'], 'complete')
+            self.assertEqual(batches, expected)
+
+    def test_detail_start_budget_includes_ledger_lookup(self):
+        self.source.rows = [dict(id=task_id, tenant='synthetic') for task_id in ('t0', 't1')]
+        get_task = self.ledger.get_task
+        elapsed = 0
+        detail_starts = []
+        detail = self.source.detail
+
+        def lookup(board_id, task_id):
+            nonlocal elapsed
+            if task_id == 't1':
+                elapsed = 20.1
+            return get_task(board_id, task_id)
+
+        def capture(binding, task_id):
+            detail_starts.append((task_id, elapsed))
+            return detail(binding, task_id)
+
+        with patch.object(kanban, 'monotonic', lambda: elapsed), \
+             patch.object(self.ledger, 'get_task', lookup), \
+             patch.object(self.source, 'detail', capture):
+            result = self.scan()
+            self.assertEqual(detail_starts, [('t0', 0)])
+            self.assertEqual(result, dict(state='partial', count=1,
+                                          cursor=[BINDING['board'], BINDING['tenant'], 't0']))
+            self.assertEqual(get_task(BINDING['board'], 't0')['goal'], self.source.title)
+            # The next page must resume at t1 and still make progress when its
+            # first lookup alone takes the whole collection window.
+            elapsed = 0
+            self.assertEqual(self.scan('tail'), dict(state='complete', count=1))
+            self.assertEqual(detail_starts, [('t0', 0), ('t1', 20.1)])
+
+    def test_small_tail_uses_remaining_inventory(self):
+        self.source.rows = [dict(id=f't{i:03}', tenant='synthetic') for i in range(125)]
+        with self.slow_source_clock():
+            self.assertEqual(self.scan()['count'], 100)
+        statements = []
+        self.sync.db.set_trace_callback(statements.append)
+        with patch.object(kanban, 'monotonic', return_value=0):
+            self.assertEqual(self.scan('tail')['count'], 25)
+        self.assertEqual(statements.count('COMMIT'), 25 + 3 + 3)
+
+    def test_intents_flush_at_byte_limit(self):
+        self.source.rows = [dict(id=f't{i}', tenant='synthetic') for i in range(3)]
+        statements = []
+        self.sync.db.set_trace_callback(statements.append)
+        with patch.object(kanban, 'MAX_INTENT_BYTES', 1):
+            self.assertEqual(self.scan()['count'], 3)
+        self.assertEqual(statements.count('COMMIT'), 3 * 2 + 3)
+
+    def test_unchanged_inventory_does_not_inflate_the_changed_batch(self):
+        self.source.rows = [dict(id=f't{i:02}', tenant='synthetic') for i in range(31)]
+        self.enterContext(patch.object(kanban, 'monotonic', return_value=0))
+        self.scan()
+        read = self.source.detail
+        def update(binding, task_id):
+            doc = read(binding, task_id)
+            if task_id >= 't04':
+                doc['task']['title'] = 'Changed'
+            return doc
+        statements = []
+        self.sync.db.set_trace_callback(statements.append)
+        with patch.object(self.source, 'detail', side_effect=update):
+            self.assertEqual(self.scan('refresh')['count'], 27)
+        # Four unchanged cursor writes, 27 finalizations, 3 intent batches, 3 scan writes.
+        self.assertEqual(statements.count('COMMIT'), 4 + 27 + 3 + 3)
 
     def test_changed_task_uses_only_intent_and_final_projection_commits(self):
         """protects=bounded durable write cost; fails_when=ack/cursor commit separately;
@@ -374,7 +469,8 @@ with Sync(sqlite3.connect(sys.argv[1]), clock=lambda: datetime.now(timezone.utc)
         import time
         started = time.monotonic()
         self.source.rows = [dict(id=f't{i:05d}', tenant='synthetic') for i in range(10000)]
-        self.assertEqual(self.scan('page0')['state'], 'partial')
+        with self.slow_source_clock():
+            self.assertEqual(self.scan('page0')['state'], 'partial')
         # Replace an already-consumed key with a lower-sorting key, then restart.
         self.source.rows[0] = dict(id='a-new', tenant='synthetic')
         self.sync.db.close()
@@ -383,7 +479,6 @@ with Sync(sqlite3.connect(sys.argv[1]), clock=lambda: datetime.now(timezone.utc)
         self.addCleanup(self.sync.db.close)
         for index in range(1, 101):
             result = self.scan(f'page{index}')
-            self.assertLessEqual(result['count'], 100)
             if result['state'] == 'complete':
                 break
         self.assertEqual(result['state'], 'complete')
@@ -401,6 +496,7 @@ with Sync(sqlite3.connect(sys.argv[1]), clock=lambda: datetime.now(timezone.utc)
         why_new=source churn; seam=synthetic source; no_claim=unbounded growth.
         """
         self.source.rows = [dict(id=f't{i:03d}', tenant='synthetic') for i in range(101)]
+        self.enterContext(self.slow_source_clock())
         self.assertEqual(self.scan()['state'], 'partial')
         self.source.rows[0] = dict(id='a-new', tenant='synthetic')
         self.assertEqual(self.scan('tail')['state'], 'complete')
@@ -707,6 +803,7 @@ with Sync(sqlite3.connect(sys.argv[1]), clock=lambda: datetime.now(timezone.utc)
         no_claim=atomic native snapshot or production throughput.
         """
         from urgency_engine.watchdog import Monitor
+        self.enterContext(self.slow_source_clock())
         self.source.rows = [dict(id=f't{i:03d}', tenant='synthetic') for i in range(101)]
         with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
             def scan(identity):
@@ -728,6 +825,7 @@ with Sync(sqlite3.connect(sys.argv[1]), clock=lambda: datetime.now(timezone.utc)
         no_claim=clock synchronization.
         """
         from urgency_engine.watchdog import Monitor
+        self.enterContext(self.slow_source_clock())
         self.source.rows = [dict(id=f't{i:03d}', tenant='synthetic') for i in range(101)]
         with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
             self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
@@ -790,6 +888,7 @@ with Sync(sqlite3.connect(sys.argv[1]), clock=lambda: datetime.now(timezone.utc)
         why_new=multi-tick refresh; seam=real stores; no_claim=atomic board snapshot.
         """
         from urgency_engine.watchdog import Monitor
+        self.enterContext(self.slow_source_clock())
         with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
             self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
                            self.source, request_id='small', reason='Fixture')

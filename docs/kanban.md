@@ -103,9 +103,13 @@ application/control/scan replay records; `sync_events` contains control/source
 error events; `sync_meta` contains cursors, pause, dirty hints and graph admission
 state. Source sync never reads the raw canonical board database.
 
-One process owns a scan at a time through an OS file lock. Each scan processes
-at most 100 task details after validating all selected inventories; a durable
-ordered cursor continues on a later request and resets at the tail. Each native
+One process owns a scan at a time through an OS file lock. After validating the
+selected inventories, the scanner starts a 20-second collection window. It
+allows the first detail read even if its ledger lookup uses the window. For
+later reads, it checks the deadline after the ledger lookup, just before
+starting the detail read. At or past the deadline, it flushes collected work
+and returns a partial result without starting that read. A durable ordered
+cursor continues on a later request and resets at the tail. Each native
 subprocess has a 20-second timeout and 16 MiB stdout cap. These are per-call
 bounds, not a 20-second scan guarantee. Inventories cap at 10000 tasks, each task
 at 1000 parents, and admitted graphs at 50000 edges. A partial traversal revokes
@@ -140,8 +144,22 @@ conversation --------------------------------> cached reads only
 
 This is not a transaction spanning three databases. Persisted original request
 arguments reconcile a crash after a ledger or monitor commit without duplicate
-credit. Consecutive changed details share a bounded source-intent commit (at most
-100 per page); each retains its own original arguments and replay identity before
+credit. Each flush sizes its intent transactions from the consecutive changes
+ready to write. Unchanged tasks and previously acknowledged tasks do not count.
+
+| Changes ready to write | Maximum changes per transaction |
+| --- | ---: |
+| 1–30 | 10 |
+| 31–60 | 60 |
+| 61–100 | 100 |
+| 101–200 | 200 |
+| 201–400 | 400 |
+| Above 400 | Double the ceiling until it covers the ready changes |
+
+A fast scan with 27 changed cards writes batches of 10, 10 and 7 in the same
+request. The scanner flushes a short tail immediately. It also flushes before
+adding a plan that would take the buffered intent data above 16 MiB.
+Each task retains its own original arguments and replay identity before
 any Ledger or Monitor effect. Each accepted task then gets its own source-store
 commit publishing projection, acknowledgment and cursor together. An unchanged
 row flushes earlier collected changes before advancing the cursor. Pending page
@@ -374,9 +392,10 @@ A final `event:complete` and exit 0 mean the diagnostic assertions passed; missi
 completion or nonzero exit is incomplete evidence, not a passing benchmark.
 
 Hosted Windows probes identified commit time as the dominant measured cost,
-with substantial variation even for identical commit counts. Intent batching
-reduces source-store commits for a fresh 1000-row traversal from 2021 to 1031;
-it does not change Ledger commits, durability settings or per-task receipts.
+with substantial variation even for identical commit counts. In the earlier
+fixed-100 diagnostic, intent batching reduced source-store commits for a fresh
+1000-row traversal from 2021 to 1031. With adaptive batching the commit count
+depends on remaining inventory, elapsed time, payload size and unchanged rows.
 Without a Monitor consumer, withdrawal still updates cached coverage but avoids
 unused per-task graph-metadata reads. The small probes are diagnostics, not a
 throughput promise or a replacement for the full 10000-row restart/churn test.
