@@ -97,8 +97,11 @@ ordered cursor continues on a later request and resets at the tail. Each native
 subprocess has a 20-second timeout and 16 MiB stdout cap. These are per-call
 bounds, not a 20-second scan guarantee. Inventories cap at 10000 tasks, each task
 at 1000 parents, and admitted graphs at 50000 edges. A partial traversal revokes
-previous complete graph coverage until the tail is read. Unmapped parents do not
-become fabricated local tasks or proof of a healthy graph.
+previous complete graph coverage until the tail is read and every selected
+projection is within the configured freshness interval. A slow multi-page scan
+can complete its traversal while graph coverage remains unknown; future-dated
+observations also cannot establish coverage. Unmapped parents do not become
+fabricated local tasks or proof of a healthy graph.
 
 At most 20000 distinct source rows are retained across bindings; new rows beyond
 that are refused before ledger mutation. Event writes prune entries older than

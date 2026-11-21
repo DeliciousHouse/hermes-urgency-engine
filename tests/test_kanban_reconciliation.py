@@ -411,6 +411,42 @@ with Sync(sqlite3.connect(sys.argv[1]), clock=lambda: datetime.now(timezone.utc)
             self.assertEqual(self.sync.db.execute(
                 "SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 0)
 
+    def test_paged_graph_rejects_expired_observations(self):
+        """protects=current graph coverage; fails_when=tail refresh certifies stale head;
+        why_new=scan spans freshness window; seam=real stores/injected clock;
+        no_claim=atomic native snapshot or production throughput.
+        """
+        from urgency_engine.watchdog import Monitor
+        self.source.rows = [dict(id=f't{i:03d}', tenant='synthetic') for i in range(101)]
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
+            def scan(identity):
+                return self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
+                                      self.source, request_id=identity, reason='Fixture')
+            self.assertEqual(scan('head')['state'], 'partial')
+            self.now += timedelta(seconds=61)
+            self.assertEqual(scan('tail')['state'], 'complete')
+            states = [r[0] for r in monitor.db.execute('SELECT dependency_state FROM task_signals')]
+            self.assertEqual(len(states), 101)
+            self.assertEqual(set(states), {'unknown'})
+            self.assertEqual(scan('fresh-head')['state'], 'partial')
+            self.assertEqual(scan('fresh-tail')['state'], 'complete')
+            self.assertEqual({r[0] for r in monitor.db.execute('SELECT dependency_state FROM task_signals')}, {'available'})
+
+    def test_paged_graph_rejects_future_observations(self):
+        """protects=clock reversal coverage; fails_when=future head certifies graph;
+        why_new=negative observation age; seam=real stores/injected clock;
+        no_claim=clock synchronization.
+        """
+        from urgency_engine.watchdog import Monitor
+        self.source.rows = [dict(id=f't{i:03d}', tenant='synthetic') for i in range(101)]
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
+            self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
+                           self.source, request_id='head', reason='Fixture')
+            self.now -= timedelta(seconds=1)
+            self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
+                           self.source, request_id='tail', reason='Fixture')
+            self.assertEqual({r[0] for r in monitor.db.execute('SELECT dependency_state FROM task_signals')}, {'unknown'})
+
     def test_graph_commit_crash_replays_original_event_after_clock_advance(self):
         """protects=graph admission replay; fails_when=retry invents new timestamp;
         why_new=second-pass crash; seam=real Monitor post-commit fault; no_claim=distributed transaction.

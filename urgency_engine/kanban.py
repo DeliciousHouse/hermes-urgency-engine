@@ -538,8 +538,11 @@ class Sync:
         rows = [json.loads(row[0]) for row in self.db.execute('SELECT projection_json FROM sources')]
         scoped = {(p['board_id'], p['task_id']): p for p in rows
                   if (p['board_id'], p['tenant'], p['project_id']) in bindings}
+        now = self.clock()
         mapped = {key: p for key, p in scoped.items()
-                  if key in inventory and p['coverage'] != 'unknown'}
+                  if key in inventory and p['coverage'] != 'unknown'
+                  and 0 <= (now - datetime.fromisoformat(p['observed_at'])).total_seconds()
+                  <= cfg['kanban_sync_seconds']}
         if sum(len(p['parents']) for p in mapped.values()) > 50000:
             fail('edges', 'SOURCE_LIMIT')
         complete = len(mapped) == len(inventory)
