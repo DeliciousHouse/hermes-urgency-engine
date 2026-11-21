@@ -2,7 +2,9 @@
 
 The watchdog evaluates local ledger work without an agent turn. It records incidents
 and **recommended**, not executed, recovery plans. Hermes's no-agent cron runs one
-small Python launcher; the plugin starts no daemon, thread, model call or OS service.
+small Python launcher; the plugin starts no monitoring daemon, background evaluator,
+model call or OS service. Canonical collection uses a bounded child-output reader
+thread only for the duration of each source call.
 Use [native installation](runtime.md#compatibility-and-installation) first.
 
 ## Reference
@@ -257,7 +259,8 @@ preserve edited/unrelated assets. An interrupted create may have succeeded; read
 public cron state before retrying. Never blindly add a duplicate job.
 
 Rollback: pause, uninstall the owned job, stop writes, and use SQLite's backup API for
-both databases. Revert plugin source through the normal reviewed workflow. Older code
+ledger and monitor databases, plus `kanban.db` when canonical sync is configured.
+Revert plugin source through the normal reviewed workflow. Older code
 ignores `watchdog.db`; do not downgrade/delete it or assume uninstall purges history.
 No OS supervisor is installed by this plugin.
 
