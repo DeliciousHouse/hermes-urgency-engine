@@ -198,6 +198,69 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(self.request('task', board_id='demo', task_id='task')['data']['remaining_seconds'])
         self.assertFalse(self.runtime.run_request('kanban_sync', {}, surface='tool')['ok'])
 
+    def test_denied_sync_still_evaluates_expired_deadlines(self):
+        """protects=watchdog during denied source; fails_when=adapter error suppresses deadline;
+        why_new=failed source integration; seam=real stores/denied transport;
+        no_claim=source health or recovered permissions.
+        """
+        from datetime import timedelta
+        from unittest.mock import patch
+        from urgency_engine.kanban import Sync, NativeSource
+        from urgency_engine.ledger import LedgerError
+        from urgency_engine.watchdog import Monitor
+        self.project()
+        self.ctx.settings.update(watchdog_enabled=True, kanban_sync_enabled=True,
+            kanban_bindings=[dict(board='demo', tenant='synthetic', project_id='p')])
+        with self.runtime.open(self.runtime.settings()) as ledger:
+            ledger.set_deadline('due', project_id='p', kind='hard', at=self.now.isoformat(),
+                timezone='UTC', owner='fixture', source='fixture', request_id='due', actor='test')
+        self.now += timedelta(seconds=1)
+        with patch.object(Sync, 'host', side_effect=lambda **kw: Sync(sqlite3.connect(self.root / 'kanban.db'), **kw)), \
+             patch.object(Monitor, 'host', side_effect=lambda **kw: Monitor.open(self.root / 'watchdog.db', **kw)), \
+             patch.object(NativeSource, 'inventory', side_effect=LedgerError('SOURCE_DENIED', 'kanban', 'board')), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = self.runtime.cli(setup_parser(Parser()).parse_args(['watchdog', 'tick', '--force']))
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now, readonly=True) as monitor:
+            self.assertIn('expired_deadline', [item['detector'] for item in monitor.page('incidents')['items']])
+        self.assertEqual(code, 0)
+        health = self.runtime.kanban_read('health', {})
+        self.assertEqual(health['last_error'], 'SOURCE_DENIED')
+        self.assertIsNotNone(health['incomplete_scan'])
+        self.assertIsNone(health['last_success'])
+
+    def test_partial_sync_still_evaluates_expired_deadlines(self):
+        """protects=independent deadline detection; fails_when=source cursor suppresses tick;
+        why_new=multi-tick source integration; seam=real stores/faulted native boundary;
+        no_claim=live dispatch or recovery execution.
+        """
+        from unittest.mock import patch
+        from urgency_engine.kanban import Sync, NativeSource
+        from urgency_engine.watchdog import Monitor
+        from test_kanban_reconciliation import Source
+        self.project()
+        self.ctx.settings.update(watchdog_enabled=True, kanban_sync_enabled=True,
+            kanban_bindings=[dict(board='demo', tenant='synthetic', project_id='p')])
+        with self.runtime.open(self.runtime.settings()) as ledger:
+            ledger.set_deadline('due', project_id='p', kind='hard', at=self.now.isoformat(),
+                timezone='UTC', owner='fixture', source='fixture', request_id='due', actor='test')
+        from datetime import timedelta
+        self.now += timedelta(seconds=1)
+        source = Source()
+        source.rows = [dict(id=f't{i:03d}', tenant='synthetic') for i in range(101)]
+        with patch.object(Sync, 'host', side_effect=lambda **kw: Sync(sqlite3.connect(self.root / 'kanban.db'), **kw)), \
+             patch.object(Monitor, 'host', side_effect=lambda **kw: Monitor.open(self.root / 'watchdog.db', **kw)), \
+             patch.object(NativeSource, 'inventory', side_effect=source.inventory), \
+             patch.object(NativeSource, 'detail', side_effect=source.detail), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = self.runtime.cli(setup_parser(Parser()).parse_args(['watchdog', 'tick', '--force']))
+        self.assertEqual(code, 0)
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now, readonly=True) as monitor:
+            self.assertIn('expired_deadline', [item['detector'] for item in monitor.page('incidents')['items']])
+            self.assertEqual({row[0] for row in monitor.db.execute('SELECT dependency_state FROM task_signals')}, {'unknown'})
+        health = self.runtime.kanban_read('health', {})
+        self.assertEqual(health['last_result']['state'], 'partial')
+        self.assertIsNone(health['last_success'])
+
     def test_diagnose_reports_actual_schema_after_unknown_work_write(self):
         """protects=upgrade diagnostics; fails_when=schema1 reported for schema2;
         why_new=migration; seam=real Runtime; no_claim=installed upgrade.

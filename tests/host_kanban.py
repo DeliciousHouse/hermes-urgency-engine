@@ -65,6 +65,12 @@ def journey(home):
     foreign = json.loads(run('kanban', '--board', 'foreign', 'create',
                             'Foreign task', '--tenant', 'demo', '--json'))
     assert foreign['id'] not in {t['task_id'] for t in urgency('kanban', 'tasks', '--project', 'demo')['items']}
+    # Preserve native worker board fencing; no worker process is dispatched.
+    denied = subprocess.run([*cli, 'kanban', '--board', 'foreign', 'show', foreign['id'], '--json'],
+        cwd=home, env={**env, 'HERMES_KANBAN_TASK': task_id, 'HERMES_KANBAN_BOARD': 'synthetic',
+             'HERMES_KANBAN_DB': str(home / 'kanban' / 'boards' / 'synthetic' / 'kanban.db')},
+        capture_output=True, text=True, timeout=120)
+    assert denied.returncode != 0 and 'Foreign task' not in denied.stdout, (denied.returncode, denied.stdout, denied.stderr)
 
     parent = json.loads(run('kanban', '--board', 'synthetic', 'create',
                             'Synthetic parent', '--tenant', 'demo', '--json'))

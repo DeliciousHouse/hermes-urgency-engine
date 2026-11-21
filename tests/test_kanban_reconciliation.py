@@ -219,6 +219,58 @@ with Sync(sqlite3.connect(sys.argv[1]), clock=lambda: datetime.now(timezone.utc)
                 self.assertEqual(self.ledger.list_tasks('project'), [])
                 self.assertEqual(self.source.calls, 0)
 
+    def test_source_update_across_detail_boundary_converges_in_both_orders(self):
+        """protects=source convergence; fails_when=late/new source snapshot loses next update;
+        why_new=both read/update orders; seam=controlled public-source boundary/real stores;
+        no_claim=atomic native snapshot.
+        """
+        original = self.source.detail
+        for update_first in (False, True):
+            with self.subTest(update_first=update_first):
+                old, new = ('Old-' + str(update_first), 'New-' + str(update_first))
+                self.source.title = old
+                def detail(binding, task_id):
+                    if update_first:
+                        self.source.title = new
+                    document = original(binding, task_id)
+                    self.source.title = new
+                    return document
+                self.source.detail = detail
+                self.scan('race-' + str(update_first))
+                self.assertEqual(self.ledger.get_task('demo', 'task')['goal'], new if update_first else old)
+                self.source.detail = original
+                self.scan('settled-' + str(update_first))
+                self.assertEqual(self.ledger.get_task('demo', 'task')['goal'], new)
+                revision = self.ledger.get_task('demo', 'task')['revision']
+                self.scan('repeated-' + str(update_first))
+                self.assertEqual(self.ledger.get_task('demo', 'task')['revision'], revision)
+                self.assertIsNone(self.sync.page('project')['items'][0]['worker']['heartbeat_at'])
+
+    def test_criterion_edit_between_read_and_apply_is_not_overwritten(self):
+        """protects=local criteria and weights; fails_when=sync bypasses shared revision;
+        why_new=criterion interleaving; seam=real separate Ledger connection;
+        no_claim=semantic evidence certification.
+        """
+        self.scan()
+        original = self.source.detail
+        before = self.ledger.get_task('demo', 'task')
+        criteria = [dict(criterion_id='new', description='Local criterion', weight=7, required=True, expected_sha256=None)]
+        def detail(binding, task_id):
+            with Ledger(sqlite3.connect(self.root / 'data.db'), clock=lambda: self.now, artifact_root=self.root) as local:
+                local.set_criteria('demo', 'task', criteria, expected_revision=before['revision'],
+                    reason='Concurrent', request_id='local-criteria', actor='test')
+            return original(binding, task_id)
+        self.source.title = 'Changed source'
+        self.source.detail = detail
+        with self.assertRaises(LedgerError) as caught:
+            self.scan('criteria-race')
+        self.assertEqual(caught.exception.code, 'REVISION_CONFLICT')
+        task = self.ledger.get_task('demo', 'task')
+        self.assertEqual(task['goal'], before['goal'])
+        self.assertEqual(task['criteria'][0]['weight'], 7)
+        self.assertEqual(task['criteria'][0]['description'], 'Local criterion')
+        self.assertIsNone(task['remaining_seconds'])
+
     def test_older_source_revision_cannot_overwrite_newer_projection(self):
         """protects=source ordering; fails_when=delayed response rewinds state;
         why_new=canonical revision boundary; seam=controlled responses; no_claim=hosts without revisions.

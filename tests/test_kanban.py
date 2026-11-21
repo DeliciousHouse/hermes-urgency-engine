@@ -10,6 +10,22 @@ BINDING = dict(board='demo', tenant='synthetic', project_id='project')
 
 
 class SyncTests(unittest.TestCase):
+    def test_native_source_refuses_misattributed_pinned_board(self):
+        """protects=board attribution; fails_when=pinned rows labeled foreign;
+        why_new=native pin redirect; seam=adapter env; no_claim=host fence proof.
+        """
+        import os
+        from unittest.mock import patch
+        for context in ({'HERMES_KANBAN_TASK': 'worker', 'HERMES_KANBAN_BOARD': 'other'},
+                        {'HERMES_KANBAN_DB': 'synthetic.db'},
+                        {'HERMES_DELEGATED_CHILD_CONTEXT': '1'}):
+            with patch.dict(os.environ, context, clear=True):
+                source = kanban.NativeSource(lambda argv: [{'slug': 'demo'}])
+                for read in (lambda: source.inventory(BINDING), lambda: source.detail(BINDING, 'task')):
+                    with self.assertRaises(LedgerError) as caught:
+                        read()
+                    self.assertEqual(caught.exception.code, 'SOURCE_DENIED')
+
     def test_pause_resume_is_audited_and_replayed(self):
         """protects=operator replay; fails_when=paused source called;
         why_new=controls; seam=real store; no_claim=cron integration.
@@ -253,6 +269,11 @@ class TransportTests(unittest.TestCase):
         """protects=explicit existing board; fails_when=unknown board initialized;
         why_new=public CLI selection; seam=transport receipt; no_claim=real host run.
         """
+        import os
+        from unittest.mock import patch
+        context = patch.dict(os.environ, {}, clear=True)
+        context.start()
+        self.addCleanup(context.stop)
         calls = []
         def run(argv):
             calls.append(argv)

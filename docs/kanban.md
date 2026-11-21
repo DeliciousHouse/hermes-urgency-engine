@@ -132,14 +132,19 @@ The adapter invokes the public native CLI. **Native `kanban list` recomputes
 dependency readiness**; opting in accepts that normal native effect. Collection
 is therefore not described as side-effect-free, even though this adapter never
 writes board rows directly or bypasses worker fences. Cached conversational
-reads do not invoke that CLI.
+reads do not invoke that CLI. A worker/delegate or database-pinned invocation
+must explicitly identify the same board in `HERMES_KANBAN_BOARD`; mismatched or
+unidentified bindings return `SOURCE_DENIED`. The adapter retains native pins
+and never relabels redirected board rows as a different configured board.
 
 Lifecycle callbacks only coalesce dirty-binding hints. They never establish
 source facts. Periodic scans still reconcile external edits and missed hooks.
-There is no new scheduler: use the existing watchdog no-agent job. A partial
-source page defers that tick's monitor evaluation; a source failure exits with
-an error rather than reporting a successful complete refresh. Pausing or
-disabling source sync leaves the standalone watchdog usable.
+There is no new scheduler: use the existing watchdog no-agent job. Partial
+source pages and named source transport failures revoke graph coverage, but
+independent monitor evaluation still runs in that tick. Source health retains
+its incomplete traversal/error; a successful watchdog tick is not a successful
+source refresh. Explicit `kanban sync` still reports its partial/error result.
+Pausing or disabling source sync leaves the standalone watchdog usable.
 
 ## How to enable and inspect a binding
 

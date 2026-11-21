@@ -87,14 +87,23 @@ class NativeSource:
     def __init__(self, run=read_process):
         self.run = run
 
+    def _check_board(self, binding):
+        import os
+        if any(os.environ.get(key) for key in ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_DB',
+                                               'HERMES_DELEGATED_CHILD_CONTEXT')):
+            if binding['board'] != os.environ.get('HERMES_KANBAN_BOARD'):
+                fail('board', 'SOURCE_DENIED')
+
     def detail(self, binding, task_id):
         import sys
+        self._check_board(binding)
         _id(task_id, 'task_id')
         return self.run([sys.executable, '-m', 'hermes_cli.main', 'kanban', '--board',
                          binding['board'], 'show', task_id, '--json'])
 
     def inventory(self, binding):
         import sys
+        self._check_board(binding)
         prefix = [sys.executable, '-m', 'hermes_cli.main', 'kanban']
         boards = self.run([*prefix, 'boards', 'list', '--json', '--all'])
         if not isinstance(boards, list):

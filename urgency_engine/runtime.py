@@ -517,9 +517,17 @@ class Runtime:
             with sync.transaction():
                 sync.put('last_attempt', self.clock().isoformat())
             with self.open(self.settings()) as ledger:
-                result = sync.scan(cfg, ledger, monitor, self.data_dir() / 'data.db', NativeSource(),
-                                   request_id=uuid.uuid4().hex, reason='Existing watchdog tick')
-        return None if result['state'] == 'complete' else dict(notices=[], omitted=0, source=result)
+                try:
+                    sync.scan(cfg, ledger, monitor, self.data_dir() / 'data.db', NativeSource(),
+                              request_id=uuid.uuid4().hex, reason='Existing watchdog tick')
+                except LedgerError as exc:
+                    if not exc.code.startswith('SOURCE_'):
+                        raise
+                    # scan persists the source error and revokes graph coverage.
+                    # A denied source must not disable unrelated monitoring.
+        # Partial scans revoke graph coverage before returning. They must not
+        # suppress independent deadline/checkpoint evaluation in the same tick.
+        return None
 
     def cron(self, action, **arguments):
         # Plugin CLI commands do not otherwise initialize built-in tool discovery.
