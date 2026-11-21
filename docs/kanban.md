@@ -306,6 +306,22 @@ periodic collection, and the [ledger tutorial](ledger.md#build-a-temporary-evide
 for deliberate criteria and byte evidence. Neither tutorial proves semantic
 quality, remote delivery, Desktop operation or executed recovery.
 
+## Tested native capabilities
+
+Both pinned CI hosts were exercised with a clean exact-public plugin installation,
+not only a source copy. These results describe those immutable host revisions:
+
+| Hermes host | Host revision | CLI `show` current-run pointer | Public-tool snapshot | Installed initial/resumed claim and heartbeat |
+| --- | --- | --- | --- | --- |
+| Released 0.23.2 | `ae2a81ccc00e9b7c06301523e5bb09608397149c` | Absent | Present | Admitted to Ledger/Monitor |
+| Stock development | `152fe18976002e9a987422b7c6102c805d61264b` | Absent | Present | Admitted to Ledger/Monitor |
+
+The journeys used native claim, heartbeat, schedule and reclaim operations without
+starting a worker or model. Both exercised the tutorial, naturally due cron and
+profile/board fences. Missing-pointer projection is separately regression-tested
+with synthetic inputs; these two hosts do **not** supply native missing-tool proof.
+Other host revisions must expose the same public contract or remain unknown.
+
 ## Contributor verification
 
 Run `python -m unittest discover -s tests -v` for deterministic source, replay,
