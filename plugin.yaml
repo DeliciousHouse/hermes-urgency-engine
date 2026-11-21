@@ -15,6 +15,10 @@ provides_hooks:
   - kanban_task_completed
   - kanban_task_blocked
 config_schema:
+  intervention_mode:
+    type: str
+    default: advisory
+    description: advisory (no writes), supervised (explicit local CLI), or autonomous (external writes unavailable)
   kanban_sync_enabled:
     type: bool
     default: false

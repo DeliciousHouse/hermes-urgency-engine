@@ -433,6 +433,15 @@ class Monitor:
                     row[field[:-5]] = json.loads(row.pop(field))
         return dict(schema_version=1, items=rows, has_more=more, next=rows[-1][column] if more else None)
 
+    def action_scope(self, incident_id, plan_id):
+        """Read the exact active episode and its recommended plan together."""
+        incident = self.db.execute("SELECT * FROM incidents WHERE incident_id=? AND state='active'", (incident_id,)).fetchone()
+        plan = self.db.execute("SELECT * FROM plans WHERE plan_id=? AND incident_id=? AND state='recommended'",
+                               (plan_id, incident_id)).fetchone()
+        if not incident or not plan:
+            return None
+        return dict(incident), json.loads(plan['actions_json'])
+
     def health(self):
         last = self.meta('last_success')
         return dict(schema_version=1, storage='available', paused=self.meta('paused', False),
