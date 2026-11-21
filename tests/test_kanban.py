@@ -164,6 +164,8 @@ class SyncTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             source = Source()
+            from unittest.mock import patch
+            self.enterContext(patch.object(kanban, 'monotonic', lambda: len(source.calls) / 5))
             cfg = kanban.settings(dict(kanban_sync_enabled=True, kanban_bindings=[BINDING]))
             with Ledger(sqlite3.connect(root / 'data.db'), clock=lambda: NOW, artifact_root=root) as ledger:
                 ledger.create_project('project', 'Project', request_id='p', actor='test')

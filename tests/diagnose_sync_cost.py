@@ -114,16 +114,22 @@ def run(source_path, rows, with_monitor):
             if phase == 'restart':
                 sync.db.close()
                 sync = kanban.Sync(connection(root / 'sync.db', 'sync'), clock=lambda: now, redact=str)
-            for page in range((rows + 99) // 100):
+            phase_calls = source.calls
+            for page in range(rows):
+                previous_calls = source.calls
                 start = time.perf_counter()
                 result = sync.scan(cfg, ledger, monitor, root / 'ledger.db', source,
                                    request_id=f'{phase}-{page}', reason='Synthetic diagnostic')
                 elapsed = time.perf_counter() - start
-                assert result['count'] <= 100
+                assert 0 <= result['count'] <= source.calls - previous_calls
+                assert 0 < source.calls - previous_calls <= rows
                 print(json.dumps(dict(event='page', phase=phase, page=page, rows=rows,
                     monitor=with_monitor, elapsed_ms=round(elapsed * 1000, 3),
                     state=result['state'], imported=result['count'], timings=timing.take())), flush=True)
+                if result['state'] == 'complete':
+                    break
             assert result['state'] == 'complete'
+            assert source.calls - phase_calls == rows
             assert sync.db.execute('SELECT count(*) FROM sources').fetchone()[0] == rows
             assert ledger.get_task('demo', f't{rows-1:05d}')['goal'] == 'Deliver'
             timing.take()

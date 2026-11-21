@@ -384,6 +384,7 @@ class RuntimeTests(unittest.TestCase):
         self.now += timedelta(seconds=1)
         source = Source()
         source.rows = [dict(id=f't{i:03d}', tenant='synthetic') for i in range(101)]
+        self.enterContext(patch('urgency_engine.kanban.monotonic', lambda: source.calls / 5))
         with patch.object(Sync, 'host', side_effect=lambda **kw: Sync(sqlite3.connect(self.root / 'kanban.db'), **kw)), \
              patch.object(Monitor, 'host', side_effect=lambda **kw: Monitor.open(self.root / 'watchdog.db', **kw)), \
              patch.object(NativeSource, 'inventory', side_effect=source.inventory), \
