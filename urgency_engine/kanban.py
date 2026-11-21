@@ -7,6 +7,7 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import NoReturn
 
@@ -408,7 +409,7 @@ class Sync:
                         projection['coverage'] = 'unknown'
                         self.db.execute('UPDATE sources SET coverage=?,projection_json=? WHERE board_id=? AND task_id=?',
                                         ('unknown', _json(projection), row['board_id'], row['task_id']))
-                if code.startswith('SOURCE_') and code != 'SOURCE_ERROR':
+                if code == 'SCOPE_CONFLICT' or (code.startswith('SOURCE_') and code != 'SOURCE_ERROR'):
                     self.admit_graph(cfg, monitor, set(), ledger_path)
                 raise
             with self.transaction():
@@ -431,10 +432,19 @@ class Sync:
         fingerprint = hashlib.sha256(_json(cfg['kanban_bindings']).encode()).hexdigest()
         pending = self.db.execute("SELECT request_id,result_json FROM sync_requests WHERE state='pending' ORDER BY request_id").fetchall()
         for row in pending:
+            identity = row['request_id']
             plan = json.loads(row['result_json'])
             if plan['binding'] != fingerprint:
+                # Only Ledger can be the first effect. Its durable receipts also
+                # cover a crash between reopen and upsert, before any Monitor call.
+                if not ledger.has_committed_operation(identity + ':reopen', plan['arguments']['request_id'],
+                                                      identity + ':claim'):
+                    with self.transaction():
+                        self.db.execute("UPDATE sync_requests SET state='cancelled' WHERE request_id=? AND state='pending'",
+                                        (identity,))
+                        self.put('cursor', None)
                 fail('binding', 'SCOPE_CONFLICT')
-            self.apply_plan(row['request_id'], plan, ledger, monitor)
+            self.apply_plan(identity, plan, ledger, monitor)
         cursor = self.meta('cursor')
         processed = 0
         total = 0
@@ -504,6 +514,11 @@ class Sync:
                 if task and task['status'] == 'verified' and projection['status'] not in ('done', 'archived') and not existing:
                     fail('status', 'STATE_CONFLICT')
                 identity = hashlib.sha256(_json([request_id, key, projection['source_digest']]).encode()).hexdigest()
+                if self.db.execute("SELECT 1 FROM sync_requests WHERE request_id=? AND state='cancelled'",
+                                   (identity,)).fetchone():
+                    # Restoring a binding and retrying its old scan must not
+                    # resurrect the cancelled intent or discard its receipt.
+                    identity = hashlib.sha256(_json([identity, uuid.uuid4().hex]).encode()).hexdigest()
                 arguments = dict(board_id=key[0], task_id=key[1], project_id=binding['project_id'], goal=projection['title'],
                     assignee=projection['assignee'], status='running' if projection['status'] == 'running' else
                     'blocked' if projection['status'] == 'blocked' else 'planned',
@@ -610,7 +625,8 @@ class Sync:
     def apply_plan(self, identity, plan, ledger, monitor=None):
         projection = plan['projection']
         key = projection['board_id'], projection['task_id']
-        if (not self.db.execute('SELECT 1 FROM sources WHERE board_id=? AND task_id=?', key).fetchone()
+        existing = self.db.execute('SELECT source_updated_at FROM sources WHERE board_id=? AND task_id=?', key).fetchone()
+        if (not existing
                 and self.db.execute('SELECT count(*) FROM sources').fetchone()[0] >= 20000):
             fail('sources_capacity', 'SOURCE_LIMIT')
         if plan.get('reopen'):
@@ -623,9 +639,11 @@ class Sync:
         self.admit_facts(ledger, monitor, projection, identity)
         # Keep the intent pending through both stores. Publish the projection,
         # acknowledgment and cursor together only after their replay-safe calls.
+        # The indexed revision is a high-water mark; the public projection stays nullable.
         with self.transaction():
             self.db.execute('INSERT OR REPLACE INTO sources VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                (*key, projection['project_id'], projection['tenant'], projection['source_updated_at'],
+                (*key, projection['project_id'], projection['tenant'],
+                 projection['source_updated_at'] or (existing['source_updated_at'] if existing else None),
                  projection['source_digest'], projection['status'], projection['assignee'],
                  projection['title'], projection['observed_at'], projection['coverage'], _json(projection), projection['source_digest']))
             self.put('ledger_path', str(ledger.connection.execute('PRAGMA database_list').fetchone()[2]))

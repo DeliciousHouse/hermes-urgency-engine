@@ -5,6 +5,7 @@ fails_when=only synthetic transport works; why_new=canonical integration;
 seam=disposable home, real CLI; no_claim=Desktop, workers, remote delivery or recovery.
 """
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -78,6 +79,21 @@ def journey(home):
     assert urgency('watchdog', 'install')['job_id'] == receipt['job_id']
     initial = urgency('kanban', 'health')['last_success']
     run('kanban', '--board', 'synthetic', 'edit', task_id, '--title', 'External cron update')
+    # Claim a disposable assigned task via the native CLI, without dispatching.
+    board = ('kanban', '--board', 'synthetic')
+    worker_id = json.loads(run(*board, 'create', 'Synthetic assigned task',
+                               '--tenant', 'demo', '--assignee', 'fixture', '--json'))['id']
+    run(*board, 'list', '--tenant', 'demo', '--json')
+    run(*board, 'claim', worker_id)
+    run(*board, 'heartbeat', worker_id)
+    native = json.loads(run(*board, 'show', worker_id, '--json'))
+    run_id = native['task']['current_run_id']
+    assert type(run_id) is int and run_id > 0
+    claimed, = [r for r in native['runs'] if r['id'] == run_id]
+    heartbeat, = [e for e in native['events'] if e['kind'] == 'heartbeat' and e['run_id'] == run_id]
+    claim_at = datetime.fromtimestamp(claimed['started_at'], timezone.utc).isoformat()
+    heartbeat_at = datetime.fromtimestamp(heartbeat['created_at'], timezone.utc).isoformat()
+    assert claimed['profile'] == 'fixture' and claimed['status'] == 'running'
     # Naturally due public scheduler, not force or a replaced clock.
     time.sleep(61)
     run('cron', 'tick')
@@ -87,6 +103,17 @@ def journey(home):
     assert urgency('watchdog', 'health')['last_success']
     projections = {t['task_id']: t for t in urgency('kanban', 'tasks', '--project', 'demo')['items']}
     assert projections[task_id]['parents'] == [parent['id']]
+    assert projections[worker_id]['assignee'] == 'fixture'
+    assert projections[worker_id]['worker'] == dict(run_id=run_id, state='running',
+        started_at=claim_at, heartbeat_at=heartbeat_at, ended_at=None)
+    worker_task = urgency('task', 'synthetic', worker_id)
+    assert worker_task['assignee'] == 'fixture' and worker_task['status'] == 'running'
+    facts = [o for o in urgency('watchdog', 'export', '--table', 'observations', '--project', 'demo')['items']
+             if o['board_id'] == 'synthetic' and o['task_id'] == worker_id and o['source'] == 'kanban-sync']
+    signal, = [o for o in facts if o['kind'] == 'task_signal' and 'heartbeat_at' in o['payload']['data']]
+    assert signal['payload']['data'] == dict(claim_at=claim_at, heartbeat_at=heartbeat_at, agent_available=True)
+    outcome, = [o for o in facts if o['kind'] == 'worker_outcome']
+    assert outcome['occurred_at'] == heartbeat_at and outcome['payload']['data'] == dict(state='running')
     run('kanban', '--board', 'synthetic', 'complete', parent['id'], '--summary', 'Synthetic parent claim')
     run('kanban', '--board', 'synthetic', 'complete', task_id, '--summary', 'Synthetic claim only')
     urgency('kanban', 'sync', '--request-id', 'claimed', '--reason', 'fixture')
@@ -139,7 +166,7 @@ assert 'Foreign task' not in text
     assert (home / 'plugin-data' / PLUGIN / 'kanban.db').is_file()
     print(json.dumps(dict(native_kanban='passed', scheduler='naturally due public cron tick',
                          tutorial='executed', isolation='two homes and boards',
-                         last_success=health['last_success'], worker_dispatch=False)))
+                         last_success=health['last_success'], assigned_run_admitted=True, worker_dispatch=False)))
 
 
 if __name__ == '__main__':

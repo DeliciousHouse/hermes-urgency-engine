@@ -521,7 +521,7 @@ class Runtime:
                     sync.scan(cfg, ledger, monitor, self.data_dir() / 'data.db', NativeSource(),
                               request_id=uuid.uuid4().hex, reason='Existing watchdog tick')
                 except LedgerError as exc:
-                    if not exc.code.startswith('SOURCE_'):
+                    if exc.code != 'SCOPE_CONFLICT' and not exc.code.startswith('SOURCE_'):
                         raise
                     # scan persists the source error and revokes graph coverage.
                     # A denied source must not disable unrelated monitoring.

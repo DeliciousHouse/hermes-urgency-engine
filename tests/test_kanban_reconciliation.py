@@ -372,6 +372,40 @@ with Sync(sqlite3.connect(sys.argv[1]), clock=lambda: datetime.now(timezone.utc)
         self.scan('new')
         self.assertEqual(self.ledger.get_task('demo', 'task')['goal'], 'Newer')
 
+    def test_null_source_revision_does_not_erase_ordering_after_restart(self):
+        """protects=source high-water; fails_when=null permits rollback;
+        why_new=known/null/older; seam=disk stores; no_claim=ordering nulls.
+        """
+        original = self.source.detail
+        stamp = 200
+        def detail(binding, task_id):
+            document = original(binding, task_id)
+            document['task']['updated_at'] = stamp
+            return document
+        self.source.detail = detail
+        self.scan()
+        stamp = None
+        self.source.title = 'Unversioned'
+        self.scan('null')
+        self.assertIsNone(self.sync.page('project')['items'][0]['source_updated_at'])
+        before = self.ledger.get_task('demo', 'task')
+        self.assertEqual(before['goal'], 'Unversioned')
+        with kanban.Sync(sqlite3.connect(self.root / 'kanban.db'), clock=lambda: self.now, redact=str) as sync:
+            def scan(identity):
+                return sync.scan(self.cfg, self.ledger, None, self.root / 'data.db',
+                                 self.source, request_id=identity, reason='Fixture')
+            stamp = 100
+            self.source.title = 'Older'
+            with self.assertRaises(LedgerError) as caught:
+                scan('old-after-null')
+            self.assertEqual(caught.exception.code, 'SOURCE_STALE')
+            self.assertEqual(self.ledger.get_task('demo', 'task'), before)
+            self.assertEqual(sync.page('project')['items'][0]['coverage'], 'unknown')
+            stamp = 300
+            self.source.title = 'Newer'
+            self.assertEqual(scan('fresh')['state'], 'complete')
+            self.assertEqual(self.ledger.get_task('demo', 'task')['goal'], 'Newer')
+
     def test_scan_health_retains_error_and_success_without_polling_as_heartbeat(self):
         """protects=durable health; fails_when=failed scan appears successful;
         why_new=source diagnostics; seam=real storage; no_claim=source liveness.
@@ -439,16 +473,53 @@ with Sync(sqlite3.connect(sys.argv[1]), clock=lambda: datetime.now(timezone.utc)
         self.assertEqual(self.ledger.progress('project')['percent'], 100)
 
     def test_binding_change_cancels_unapplied_old_response(self):
-        """protects=scope generation; fails_when=late response writes new project;
-        why_new=binding changes; seam=persisted plan; no_claim=distributed cancellation.
+        """protects=scope generation; fails_when=obsolete plan permanently stalls collection;
+        why_new=binding changes after intent commit; seam=real stores; no_claim=distributed cancellation.
         """
+        from unittest.mock import patch
+        with patch.object(self.ledger, 'upsert_task', side_effect=RuntimeError('before Ledger effect')):
+            with self.assertRaisesRegex(RuntimeError, 'before Ledger effect'):
+                self.scan()
+        self.assertEqual(self.ledger.list_tasks('project'), [])
+        identity, original = self.sync.db.execute(
+            "SELECT request_id,result_json FROM sync_requests WHERE state='pending'").fetchone()
+        self.ledger.create_project('other', 'Other', request_id='other', actor='test')
+        self.cfg['kanban_bindings'][0]['project_id'] = 'other'
+        with self.assertRaises(LedgerError) as caught:
+            self.scan('changed')
+        self.assertEqual(caught.exception.code, 'SCOPE_CONFLICT')
+        self.assertEqual(tuple(self.sync.db.execute('SELECT state,result_json FROM sync_requests WHERE request_id=?',
+                                                  (identity,)).fetchone()), ('cancelled', original))
+        self.assertEqual(self.ledger.list_tasks('project'), [])
+        self.source.title = 'Current scope'
+        self.assertEqual(self.scan('changed')['state'], 'complete')
+        task = self.ledger.get_task('demo', 'task')
+        self.assertEqual((task['project_id'], task['goal']), ('other', 'Current scope'))
+
+    def test_binding_change_preserves_intent_after_ledger_effect(self):
+        """protects=partially applied intent; fails_when=rebinding discards committed work;
+        why_new=cancellation boundary; seam=real Ledger and Monitor; no_claim=distributed atomicity.
+        """
+        from unittest.mock import patch
+        from urgency_engine.watchdog import Monitor
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
+            with patch.object(monitor, 'observe', side_effect=RuntimeError('after Ledger effect')):
+                with self.assertRaisesRegex(RuntimeError, 'after Ledger effect'):
+                    self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db',
+                                   self.source, request_id='scan', reason='Fixture')
+        before = self.ledger.get_task('demo', 'task')
+        self.ledger.create_project('other', 'Other', request_id='other', actor='test')
+        self.cfg['kanban_bindings'][0]['project_id'] = 'other'
+        for identity in ('changed', 'changed-again'):
+            with self.assertRaises(LedgerError) as caught:
+                self.scan(identity)
+            self.assertEqual(caught.exception.code, 'SCOPE_CONFLICT')
+        self.assertEqual(self.sync.db.execute(
+            "SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 1)
+        self.assertEqual(self.ledger.get_task('demo', 'task'), before)
+
+    def test_rebinding_does_not_move_an_existing_ledger_task(self):
         self.scan()
-        identity = self.sync.db.execute("SELECT request_id FROM sync_requests WHERE state='applied'").fetchone()[0]
-        plan = json.loads(self.sync.db.execute('SELECT result_json FROM sync_requests WHERE request_id=?', (identity,)).fetchone()[0])
-        plan['projection']['project_id'] = 'other'
-        self.sync.db.execute("UPDATE sync_requests SET state='pending',result_json=? WHERE request_id=?",
-                             (kanban._json(plan), identity))
-        self.sync.db.commit()
         self.ledger.create_project('other', 'Other', request_id='other', actor='test')
         self.cfg['kanban_bindings'][0]['project_id'] = 'other'
         with self.assertRaises(LedgerError) as caught:

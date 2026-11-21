@@ -240,6 +240,13 @@ class Ledger:
                 raise LedgerError(name, operation, side_effects='unknown' if committing or not rolled_back else 'none') from None
             raise
 
+    def has_committed_operation(self, *request_ids):
+        """Check exact durable receipts without replaying a mutation."""
+        with self._transaction('operation_receipt'):
+            return any(self.connection.execute('SELECT 1 FROM operations WHERE request_id=?',
+                                               (request_id,)).fetchone() is not None
+                       for request_id in request_ids)
+
     def _replay(self, request_id, digest):
         row = self.connection.execute('SELECT * FROM operations WHERE request_id=?', (request_id,)).fetchone()
         if row:

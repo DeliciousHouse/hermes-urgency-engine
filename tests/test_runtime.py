@@ -228,6 +228,44 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNotNone(health['incomplete_scan'])
         self.assertIsNone(health['last_success'])
 
+    def test_inventory_scope_conflict_still_evaluates_expired_deadlines(self):
+        """protects=independent watchdog tick; fails_when=scope conflict aborts it;
+        why_new=wrong inventory tenant after known graph; seam=real stores;
+        no_claim=native transport compatibility.
+        """
+        from datetime import timedelta
+        from unittest.mock import patch
+        from urgency_engine.kanban import Sync, NativeSource
+        from urgency_engine.watchdog import Monitor
+        self.project()
+        self.ctx.settings.update(watchdog_enabled=True, kanban_sync_enabled=True,
+            kanban_bindings=[dict(board='demo', tenant='synthetic', project_id='p')])
+        with self.runtime.open(self.runtime.settings()) as ledger:
+            ledger.set_deadline('due', project_id='p', kind='hard', at=self.now.isoformat(),
+                timezone='UTC', owner='fixture', source='fixture', request_id='due', actor='test')
+        tick = setup_parser(Parser()).parse_args(['watchdog', 'tick', '--force'])
+        rows = [dict(id='task', tenant='synthetic')]
+        with patch.object(Sync, 'host', side_effect=lambda **kw: Sync(sqlite3.connect(self.root / 'kanban.db'), **kw)), \
+             patch.object(Monitor, 'host', side_effect=lambda **kw: Monitor.open(self.root / 'watchdog.db', **kw)), \
+             patch.object(NativeSource, 'inventory', return_value=rows), \
+             patch.object(NativeSource, 'detail', return_value=dict(task=dict(id='task', tenant='synthetic', title='Deliver', status='ready'), parents=[])), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(self.runtime.cli(tick), 0)
+            with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now, readonly=True) as monitor:
+                self.assertEqual(monitor.db.execute('SELECT dependency_state FROM task_signals').fetchone()[0], 'available')
+            last_success = self.runtime.kanban_read('health', {})['last_success']
+            self.now += timedelta(seconds=61)
+            rows[:] = [dict(id='foreign', tenant='other')]
+            code = self.runtime.cli(tick)
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now, readonly=True) as monitor:
+            self.assertIn('expired_deadline', [item['detector'] for item in monitor.page('incidents')['items']])
+            self.assertEqual(monitor.db.execute('SELECT dependency_state FROM task_signals').fetchone()[0], 'unknown')
+        self.assertEqual(code, 0)
+        health = self.runtime.kanban_read('health', {})
+        self.assertEqual(health['last_error'], 'SCOPE_CONFLICT')
+        self.assertEqual(health['last_success'], last_success)
+        self.assertIsNotNone(health['incomplete_scan'])
+
     def test_partial_sync_still_evaluates_expired_deadlines(self):
         """protects=independent deadline detection; fails_when=source cursor suppresses tick;
         why_new=multi-tick source integration; seam=real stores/faulted native boundary;

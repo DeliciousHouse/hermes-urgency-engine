@@ -64,7 +64,9 @@ not persisted by this adapter. Native `show` may return them in its bounded
 response; the adapter discards them rather than logging them.
 
 `observed_at` is collection time, **not a heartbeat or source revision**.
-`source_updated_at` remains null when the host does not expose it. Worker facts
+`source_updated_at` remains null when the host does not expose it. The last
+known source revision is retained separately for ordering: a later null does
+not allow a delayed, older known revision to overwrite the projection. Worker facts
 require a matching current run and start identity; heartbeat events must belong
 to that run. Unrelated events and repeated polling cannot renew a worker sample.
 
@@ -132,6 +134,10 @@ commit publishing its projection, acknowledgment and cursor together after Ledge
 and Monitor acceptance. No source transaction spans those other stores' calls;
 journal and synchronous durability settings are unchanged. A failed final commit
 leaves the intent replayable; older pending records without a cursor still replay.
+After a binding change, sync cancels an old pending intent only when no Ledger
+operation for it committed. It retains the cancelled receipt and reports
+`SCOPE_CONFLICT`; a subsequent scan can collect under the new binding. An
+intent with any committed Ledger effect stays pending for reconciliation.
 Concurrent local edits produce conflicts instead of last-writer-wins.
 Native inventory and detail calls are not an atomic board snapshot either;
 missing or inconsistent data stays unknown.
@@ -148,7 +154,8 @@ and never relabels redirected board rows as a different configured board.
 Lifecycle callbacks only coalesce dirty-binding hints. They never establish
 source facts. Periodic scans still reconcile external edits and missed hooks.
 There is no new scheduler: use the existing watchdog no-agent job. Partial
-source pages and named source transport failures revoke graph coverage, but
+source pages, named source transport failures and scan scope conflicts revoke
+graph coverage for the configured bindings, but
 independent monitor evaluation still runs in that tick. Source health retains
 its incomplete traversal/error; a successful watchdog tick is not a successful
 source refresh. Explicit `kanban sync` still reports its partial/error result.
@@ -171,8 +178,10 @@ Troubleshooting: `SOURCE_DENIED` includes nonzero native CLI exit or a missing
 board; verify public CLI access in the same profile. `SOURCE_TIMEOUT` and
 `SOURCE_LIMIT` do not establish complete coverage. `SOURCE_MALFORMED` or
 `SOURCE_UNSUPPORTED` require a compatible native response, not guessed fields.
-`REVISION_CONFLICT`, `SCOPE_CONFLICT` and `STATE_CONFLICT` require reconciling
-local state and configured bindings. Preserve pending records; do not clear a
+After changing a binding, retry once on `SCOPE_CONFLICT` to allow a scan after
+unapplied intent cancellation. Persistent `SCOPE_CONFLICT`, `REVISION_CONFLICT`
+and `STATE_CONFLICT` require reconciling local state and configured bindings.
+Preserve pending records; do not clear a
 conflict by deleting storage. Read current task/audit state before retrying an
 uncertain write. `STORE_BUSY` permits a bounded retry after the owner exits.
 
@@ -279,8 +288,10 @@ python tests/host_kanban.py --installed-home /path/to/disposable-home
 ```
 
 The journey executes the tutorial, a naturally due public cron tick after an
-external title edit, cached slash/tool/pre-turn reads, pause/resume, two-home and
-board isolation, and retained-data uninstall. It does not start a worker or model.
+external title edit, and checks that a native claim and heartbeat for a synthetic
+assigned task reach the projection, Ledger and Monitor. It also checks cached
+slash/tool/pre-turn reads, pause/resume, two-home and board isolation, and
+retained-data uninstall. It does not start a worker or model.
 The supplied home must contain only the enabled installed plugin and no prior
 plugin data. CI runs this against its exact public revision on the pinned
 released host; source-copy execution alone is not public-install evidence.
