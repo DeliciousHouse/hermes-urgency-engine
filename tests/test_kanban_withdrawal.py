@@ -146,6 +146,12 @@ class WithdrawalTests(unittest.TestCase):
         """protects=profile isolation; fails_when=withdrawal affects other store;
         why_new=two real profiles during withdrawal; seam=real stores; no_claim=remote Desktop.
         """
+        self.f.ledger.upsert_task('manual', 'task', project_id='project', goal='Manual task',
+            expected_revision=0, request_id='manual-task', actor='test', reason='Fixture')
+        self.monitor.observe(dict(request_id='manual-graph', project_id='project', board_id='manual',
+            task_id='task', kind='task_signal', occurred_at=self.f.now.isoformat(), reason='Fixture',
+            data=dict(dependency_state='available', dependencies=[])), self.f.root / 'data.db', source='manual')
+        manual = tuple(self.monitor.db.execute("SELECT * FROM task_signals WHERE board_id='manual'").fetchone())
         other = fixtures.ReconciliationTests()
         other.setUp()
         self.addCleanup(other.doCleanups)
@@ -157,6 +163,7 @@ class WithdrawalTests(unittest.TestCase):
             self.f.cfg['kanban_bindings'] = []
             self.scan('withdraw')
             self.assertEqual(self.state(), 'unknown')
+            self.assertEqual(tuple(self.monitor.db.execute("SELECT * FROM task_signals WHERE board_id='manual'").fetchone()), manual)
             self.assertEqual((other.root / 'monitor.db').read_bytes(), before)
             self.assertEqual(monitor.db.execute('SELECT dependency_state FROM task_signals').fetchone()[0], 'available')
 
