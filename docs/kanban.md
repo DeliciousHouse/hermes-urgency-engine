@@ -177,8 +177,8 @@ and never relabels redirected board rows as a different configured board.
 Lifecycle callbacks only coalesce dirty-binding hints. They never establish
 source facts. Periodic scans still reconcile external edits and missed hooks.
 There is no new scheduler: use the existing watchdog no-agent job. Partial
-source pages, named source transport failures and scan scope conflicts revoke
-graph coverage for the configured bindings. Before collecting, enabled sync also
+source pages, named source transport failures, and scope or ledger revision
+conflicts during a scan revoke graph coverage. Before collecting, enabled sync also
 withdraws coverage owned by persisted rows whose binding was removed or changed.
 It admits `unknown` to Monitor under the original project identity, never moves
 the ledger task to the replacement project, and leaves unrelated facts alone.

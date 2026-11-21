@@ -332,6 +332,81 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(health['last_success'], last_success)
         self.assertIsNotNone(health['incomplete_scan'])
 
+    def test_source_revision_conflict_does_not_stop_due_watchdog_ticks(self):
+        """A buffered source CAS loss stays visible without suppressing deadline evaluation."""
+        from datetime import timedelta
+        from unittest.mock import patch
+        from urgency_engine.kanban import Sync, NativeSource
+        from urgency_engine.watchdog import Monitor
+        self.project()
+        self.ctx.settings.update(watchdog_enabled=True, kanban_sync_enabled=True,
+            kanban_bindings=[dict(board='demo', tenant='synthetic', project_id='p')])
+        with self.runtime.open(self.runtime.settings()) as ledger:
+            ledger.set_deadline('due', project_id='p', kind='hard', at=self.now.isoformat(),
+                timezone='UTC', owner='fixture', source='fixture', request_id='due', actor='test')
+        parser = setup_parser(Parser())
+
+        def command(*args):
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                code = self.runtime.cli(parser.parse_args(args))
+            return code, err.getvalue()
+
+        def detail(binding, task_id):
+            nonlocal raced
+            if title == 'Refresh' and task_id == 't1' and not raced:
+                with self.runtime.open(self.runtime.settings()) as local:
+                    prior = local.get_task('demo', 't0')
+                    local.upsert_task('demo', 't0', project_id='p', goal='Local estimate',
+                        remaining_seconds=7, expected_revision=prior['revision'], request_id='edit',
+                        reason='Fixture', actor='test')
+                raced = True
+            return dict(task=dict(id=task_id, tenant='synthetic', title=title, status='ready'), parents=[])
+
+        def monitor_state():
+            monitor = Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now, readonly=True)
+            assert monitor is not None
+            with monitor:
+                return (monitor.meta('last_success'),
+                        [item['detector'] for item in monitor.page('incidents')['items']],
+                        [row[0] for row in monitor.db.execute('SELECT dependency_state FROM task_signals')])
+
+        title, raced = 'Initial', False
+        rows = [dict(id=task_id, tenant='synthetic') for task_id in ('t0', 't1')]
+        with patch.object(Sync, 'host', side_effect=lambda **kw: Sync(sqlite3.connect(self.root / 'kanban.db'), **kw)), \
+             patch.object(Monitor, 'host', side_effect=lambda **kw: Monitor.open(self.root / 'watchdog.db', **kw)), \
+             patch.object(NativeSource, 'inventory', return_value=rows), \
+             patch.object(NativeSource, 'detail', side_effect=detail):
+            self.assertEqual(command('watchdog', 'tick'), (0, ''))
+            _, detectors, dependencies = monitor_state()
+            self.assertNotIn('expired_deadline', detectors)
+            self.assertEqual(dependencies, ['available', 'available'])
+            last_success = self.runtime.kanban_read('health', {})['last_success']
+            title = 'Refresh'
+            for _ in range(3):
+                self.now += timedelta(seconds=301)
+                code, err = command('watchdog', 'tick')
+                health = self.runtime.kanban_read('health', {})
+                self.assertTrue(raced)
+                self.assertEqual(health['last_error'], 'REVISION_CONFLICT')
+                self.assertEqual(health['last_success'], last_success)
+                self.assertEqual(health['last_attempt'], self.now.isoformat())
+                self.assertIsNotNone(health['incomplete_scan'])
+                evaluated, detectors, dependencies = monitor_state()
+                self.assertIn('expired_deadline', detectors, err)
+                self.assertEqual(code, 0, err)
+                assert evaluated is not None
+                self.assertEqual(datetime.fromisoformat(evaluated), self.now)
+                self.assertEqual(dependencies, ['unknown', 'unknown'])
+                self.assertEqual([item['coverage'] for item in self.runtime.kanban_read('tasks', dict(project_id='p'))['items']],
+                                 ['unknown', 'unknown'])
+            code, err = command('kanban', 'sync', '--request-id', 'explicit', '--reason', 'Fixture')
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(err)['error']['code'], 'REVISION_CONFLICT')
+        with self.runtime.open(self.runtime.settings()) as ledger:
+            self.assertEqual(ledger.get_task('demo', 't0')['remaining_seconds'], 7)
+            self.assertEqual(ledger.get_task('demo', 't1')['goal'], 'Initial')
+
     def test_empty_bindings_revoke_on_cli_and_due_tick(self):
         """protects=last binding withdrawal; fails_when=runtime bypasses reconciliation;
         why_new=empty config at native entrypoints; seam=real stores; no_claim=live watcher.
