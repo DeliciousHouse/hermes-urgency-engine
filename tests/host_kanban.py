@@ -15,8 +15,6 @@ import sys
 import tempfile
 import time
 
-import yaml  # Supplied by the provisioned Hermes host, not the plugin library.
-
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = 'hermes-urgency-engine'
 
@@ -42,13 +40,13 @@ def journey(home):
         assert reply['ok'], reply
         return reply['data']
 
-    # Merge only synthetic settings; keep the native installer's enable state.
+    # The public CLI bootstraps host dependencies; the driver stays stdlib-only.
+    # Set only synthetic settings, retaining the installer's enable state.
     config_path = home / 'config.yaml'
-    config = yaml.safe_load(config_path.read_text(encoding='utf-8'))
-    values = config['plugins'].setdefault('entries', {}).setdefault(PLUGIN, {}).setdefault('settings', {})
-    values.update(kanban_sync_enabled=True, kanban_bindings=[
-        dict(board='synthetic', tenant='demo', project_id='demo')])
-    config_path.write_text(yaml.safe_dump(config), encoding='utf-8')
+    prefix = f'plugins.entries.{PLUGIN}.settings'
+    run('config', 'set', f'{prefix}.kanban_sync_enabled', 'true')
+    run('config', 'set', f'{prefix}.kanban_bindings', json.dumps([
+        dict(board='synthetic', tenant='demo', project_id='demo')]))
     assert urgency('kanban', 'health')['storage'] == 'uninitialized'
     assert urgency('kanban', 'tasks', '--project', 'demo')['items'] == []
     assert not (home / 'plugin-data' / PLUGIN).exists()
