@@ -62,6 +62,72 @@ class RuntimeTests(unittest.TestCase):
     def project(self, name='p'):
         return self.request('create_project', project_id=name, title='Objective SYNTHETIC_SECRET', request_id=name)
 
+    def test_snapshot_is_scoped_minimal_and_does_not_open_stores(self):
+        """protects=public source read; fails_when=private data leaks or read writes;
+        why_new=bounded detail bridge; seam=real CLI/mock public tool; no_claim=native fences.
+        """
+        import copy
+        import types
+        from unittest.mock import patch
+        from urgency_engine.kanban import NativeSource
+        binding = dict(board='demo', tenant='synthetic', project_id='p')
+        self.ctx.settings.update(kanban_sync_enabled=True, kanban_bindings=[binding])
+        document = dict(task=dict(id='task', tenant='synthetic', title='SYNTHETIC_SECRET',
+            status='running', body='PRIVATE', started_at=100, current_run_id=2), parents=[],
+            runs=[dict(id=2, status='running', started_at=200, ended_at=None, summary='PRIVATE')],
+            events=[dict(kind='heartbeat', run_id=2, created_at=250, payload='PRIVATE')],
+            comments=['PRIVATE'], worker_context='PRIVATE')
+        calls = []
+        def dispatch(name, args):
+            calls.append((name, args))
+            return document if isinstance(document, str) else json.dumps(document)
+        self.ctx.dispatch_tool = dispatch
+        parser = setup_parser(Parser())
+        def command():
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = self.runtime.cli(parser.parse_args('kanban snapshot --board demo --task task'.split()))
+            return code, out.getvalue(), err.getvalue()
+        with patch.dict('sys.modules', {'tools.registry': types.SimpleNamespace(discover_builtin_tools=lambda: None)}), \
+             patch.object(NativeSource, 'validate_board', return_value=None, create=True):
+            code, out, err = command()
+            self.assertEqual(code, 0, err)
+            result = json.loads(out)['data']
+            self.assertEqual(result['task']['title'], '[REDACTED]')
+            self.assertNotIn('PRIVATE', out)
+            self.assertEqual(result['runs'], [dict(id=2, status='running', started_at=200, ended_at=None)])
+            self.assertEqual(calls, [('kanban_show', dict(board='demo', task_id='task'))])
+            good = copy.deepcopy(document)
+            for bad in ({'error': 'PRIVATE'}, {'task': []}, {'task': dict(good['task'], id='other'), 'parents': []},
+                        {'task': dict(good['task'], tenant='other'), 'parents': []}, 'not-json',
+                        '{"task":{},"task":{}}', 'x' * (16 * 1024 * 1024 + 1)):
+                document = bad
+                code, out, err = command()
+                self.assertEqual(code, 1)
+                self.assertEqual(out, '')
+                self.assertNotIn('PRIVATE', err)
+            document = good
+            document['task'].pop('current_run_id')
+            self.assertNotIn('current_run_id', json.loads(command()[1])['data']['task'])
+            for changes in (dict(kanban_sync_enabled=False), dict(kanban_bindings=[]),
+                            dict(kanban_bindings=[dict(binding, board='other')]),
+                            dict(kanban_bindings=[binding, dict(binding, tenant='other')])):
+                self.ctx.settings.update(kanban_sync_enabled=True, kanban_bindings=[binding])
+                self.ctx.settings.update(changes)
+                count = len(calls)
+                self.assertEqual(command()[0], 1)
+                self.assertEqual(len(calls), count)
+            self.ctx.settings.update(kanban_sync_enabled=True, kanban_bindings=[binding])
+            for dispatch_failure in (None, lambda *a: (_ for _ in ()).throw(RuntimeError('PRIVATE'))):
+                self.ctx.dispatch_tool = dispatch_failure
+                code, out, err = command()
+                self.assertEqual(code, 1)
+                self.assertEqual(out, '')
+                self.assertNotIn('PRIVATE', err)
+        self.assertFalse(list(self.root.glob('*.db')))
+        self.assertFalse((self.root / 'state.json').exists())
+        self.assertFalse(json.loads(self.runtime.tool(dict(operation='kanban_snapshot', arguments={})))['ok'])
+
     def test_guidance_uses_scoped_cached_blockers_and_never_collects(self):
         """protects=truthful scoped advisory; fails_when=canonical blocker absent/stale presented fresh;
         why_new=pre-turn projection; seam=real stores and source fixture; no_claim=LLM action change.

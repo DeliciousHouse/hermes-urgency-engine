@@ -10,6 +10,31 @@ BINDING = dict(board='demo', tenant='synthetic', project_id='project')
 
 
 class SyncTests(unittest.TestCase):
+    def test_native_detail_uses_bounded_snapshot_without_fallback(self):
+        """protects=bounded public detail; fails_when=CLI show loses run pointer;
+        why_new=public bridge; seam=owned runner fixture; no_claim=installed host.
+        """
+        import os
+        import sys
+        from unittest.mock import patch
+        calls = []
+        def run(argv):
+            calls.append(argv)
+            return dict(ok=True, data=dict(task=dict(id='task'), parents=[]))
+        with patch.dict(os.environ, {}, clear=True):
+            source = kanban.NativeSource(run)
+            self.assertEqual(source.detail(BINDING, 'task'), dict(task=dict(id='task'), parents=[]))
+            self.assertEqual(calls, [[sys.executable, '-m', 'hermes_cli.main', 'urgency', 'kanban',
+                                     'snapshot', '--board', 'demo', '--task', 'task']])
+            for response in ({'ok': False, 'error': 'private'}, {'ok': True}, [], {'task': {}}):
+                calls.clear()
+                def denied(argv):
+                    calls.append(argv)
+                    return response
+                with self.assertRaises(LedgerError):
+                    kanban.NativeSource(denied).detail(BINDING, 'task')
+                self.assertEqual(len(calls), 1)
+
     def test_native_source_refuses_misattributed_pinned_board(self):
         """protects=board attribution; fails_when=pinned rows labeled foreign;
         why_new=native pin redirect; seam=adapter env; no_claim=host fence proof.
@@ -277,6 +302,8 @@ class TransportTests(unittest.TestCase):
         calls = []
         def run(argv):
             calls.append(argv)
+            if 'snapshot' in argv:
+                return dict(ok=True, data=dict(task=dict(id='task'), parents=[]))
             return [{'slug': 'demo'}] if 'boards' in argv else []
         adapter = kanban.NativeSource(run)
         self.assertEqual(adapter.inventory(BINDING), [])
@@ -286,7 +313,7 @@ class TransportTests(unittest.TestCase):
             adapter.inventory(dict(BINDING, board='absent'))
         self.assertEqual(len(calls), 3)
         adapter.detail(BINDING, 'task')
-        self.assertEqual(calls[-1][-5:], ['--board', 'demo', 'show', 'task', '--json'])
+        self.assertEqual(calls[-1][-5:], ['snapshot', '--board', 'demo', '--task', 'task'])
 
     def test_transport_enforces_timeout_output_limit_and_json(self):
         """protects=owned subprocess bounds; fails_when=hang or output accepted;
@@ -337,6 +364,39 @@ class ProjectionTests(unittest.TestCase):
         result = kanban.project(document, BINDING, NOW, lambda text: text)
         self.assertIsNone(result['worker']['run_id'])
         self.assertIsNone(result['worker']['heartbeat_at'])
+
+    def test_resumed_worker_uses_exact_run_not_task_lifetime(self):
+        """protects=resumed claim identity; fails_when=lifetime start rejects new run;
+        why_new=public tool semantics; seam=projection; no_claim=native integration.
+        """
+        import copy
+        document = dict(task=dict(id='task', tenant='synthetic', title='Deliver',
+            status='running', assignee='fixture', started_at=100, current_run_id=2), parents=[],
+            runs=[dict(id=2, profile='fixture', status='running', started_at=200, ended_at=None)],
+            events=[dict(kind='heartbeat', run_id=1, created_at=400),
+                    dict(kind='heartbeat', run_id=2, created_at=250)])
+        worker = kanban.project(document, BINDING, NOW, str)['worker']
+        self.assertEqual(worker, dict(run_id=2, state='running', started_at=kanban.timestamp(200),
+                                    heartbeat_at=kanban.timestamp(250), ended_at=None))
+        future_heartbeat = copy.deepcopy(document)
+        future_heartbeat['events'].append(dict(kind='heartbeat', run_id=2, created_at=NOW.timestamp() + 1))
+        self.assertIsNone(kanban.project(future_heartbeat, BINDING, NOW, str)['worker']['heartbeat_at'])
+        for change in ('profile', 'future', 'ended', 'task_start', 'duplicate', 'missing'):
+            bad = copy.deepcopy(document)
+            if change == 'profile':
+                bad['runs'][0]['profile'] = 'other'
+            elif change == 'future':
+                bad['runs'][0]['started_at'] = NOW.timestamp() + 1
+            elif change == 'ended':
+                bad['runs'][0]['ended_at'] = 150
+            elif change == 'task_start':
+                bad['task']['started_at'] = 300
+            elif change == 'duplicate':
+                bad['runs'].append(dict(bad['runs'][0]))
+            else:
+                bad['task'].pop('current_run_id')
+            with self.subTest(change=change):
+                self.assertTrue(all(v is None for v in kanban.project(bad, BINDING, NOW, str)['worker'].values()))
 
     def test_projection_does_not_promote_claims_or_polling_time(self):
         """protects=claim boundary; fails_when=poll becomes heartbeat;

@@ -73,6 +73,23 @@ def journey(home, host=None):
              'HERMES_KANBAN_DB': str(home / 'kanban' / 'boards' / 'synthetic' / 'kanban.db')},
         capture_output=True, text=True, timeout=120)
     assert denied.returncode != 0 and 'Foreign task' not in denied.stdout, (denied.returncode, denied.stdout, denied.stderr)
+    store_bytes = {p.name: p.read_bytes() for p in (home / 'plugin-data' / PLUGIN).glob('*.db')}
+    snapshot = urgency('kanban', 'snapshot', '--board', 'synthetic', '--task', task_id)
+    assert snapshot['task']['id'] == task_id
+    assert store_bytes == {p.name: p.read_bytes() for p in (home / 'plugin-data' / PLUGIN).glob('*.db')}
+    for extra_env, board_name, denied_id in (
+        ({}, 'foreign', foreign['id']),
+        ({'HERMES_KANBAN_TASK': task_id, 'HERMES_KANBAN_BOARD': 'foreign'}, 'synthetic', task_id),
+    ):
+        denied = subprocess.run([*cli, 'urgency', 'kanban', 'snapshot', '--board', board_name, '--task', denied_id],
+            cwd=home, env={**env, **extra_env}, capture_output=True, text=True, timeout=120)
+        assert denied.returncode != 0 and not denied.stdout
+        assert 'SOURCE_DENIED' in denied.stderr
+    tenant_task = json.loads(run('kanban', '--board', 'synthetic', 'create',
+                               'Other tenant private', '--tenant', 'other', '--json'))
+    denied = subprocess.run([*cli, 'urgency', 'kanban', 'snapshot', '--board', 'synthetic', '--task', tenant_task['id']],
+        cwd=home, env=env, capture_output=True, text=True, timeout=120)
+    assert denied.returncode != 0 and not denied.stdout and 'Other tenant private' not in denied.stderr
 
     parent = json.loads(run('kanban', '--board', 'synthetic', 'create',
                             'Synthetic parent', '--tenant', 'demo', '--json'))
@@ -89,7 +106,9 @@ def journey(home, host=None):
     run(*board, 'list', '--tenant', 'demo', '--json')
     run(*board, 'claim', worker_id)
     run(*board, 'heartbeat', worker_id)
-    native = json.loads(run(*board, 'show', worker_id, '--json'))
+    cli_native = json.loads(run(*board, 'show', worker_id, '--json'))
+    native = urgency('kanban', 'snapshot', '--board', 'synthetic', '--task', worker_id)
+    assert native['task']['id'] == cli_native['task']['id']
     run_id = native['task'].get('current_run_id')
     claim_at = heartbeat_at = None
     if run_id is not None:
@@ -130,6 +149,33 @@ def journey(home, host=None):
         assert all(all(o['payload']['data'].get(key) is None
                        for key in ('claim_at', 'heartbeat_at', 'agent_available'))
                    for o in facts if o['kind'] == 'task_signal')
+    if run_id is not None:
+        # End and resume through native lifecycle commands, never a dispatcher.
+        run(*board, 'schedule', worker_id, 'Synthetic retry')
+        time.sleep(1.1)
+        run(*board, 'unblock', worker_id)
+        run(*board, 'claim', worker_id)
+        resumed = urgency('kanban', 'snapshot', '--board', 'synthetic', '--task', worker_id)
+        resumed_id = resumed['task']['current_run_id']
+        assert resumed_id != run_id
+        resumed_run, = [r for r in resumed['runs'] if r['id'] == resumed_id]
+        assert resumed['task']['started_at'] < resumed_run['started_at']
+        assert any(e['kind'] == 'heartbeat' and e['run_id'] == run_id for e in resumed['events'])
+        assert not any(e['kind'] == 'heartbeat' and e['run_id'] == resumed_id for e in resumed['events'])
+        urgency('kanban', 'sync', '--request-id', 'new-attempt', '--reason', 'fixture')
+        resumed_projection, = [t for t in urgency('kanban', 'tasks', '--project', 'demo')['items'] if t['task_id'] == worker_id]
+        assert resumed_projection['worker']['run_id'] == resumed_id
+        assert resumed_projection['worker']['heartbeat_at'] is None
+        run(*board, 'heartbeat', worker_id)
+        resumed = urgency('kanban', 'snapshot', '--board', 'synthetic', '--task', worker_id)
+        new_heartbeat, = [e for e in resumed['events'] if e['kind'] == 'heartbeat' and e['run_id'] == resumed_id]
+        urgency('kanban', 'sync', '--request-id', 'new-heartbeat', '--reason', 'fixture')
+        resumed_projection, = [t for t in urgency('kanban', 'tasks', '--project', 'demo')['items'] if t['task_id'] == worker_id]
+        assert resumed_projection['worker']['heartbeat_at'] == datetime.fromtimestamp(new_heartbeat['created_at'], timezone.utc).isoformat()
+        resumed_facts = urgency('watchdog', 'export', '--table', 'observations', '--project', 'demo')['items']
+        assert any(o['task_id'] == worker_id and o['kind'] == 'task_signal'
+                   and o['payload']['data'].get('claim_at') == datetime.fromtimestamp(resumed_run['started_at'], timezone.utc).isoformat()
+                   and o['payload']['data'].get('heartbeat_at') == resumed_projection['worker']['heartbeat_at'] for o in resumed_facts)
     run('kanban', '--board', 'synthetic', 'complete', parent['id'], '--summary', 'Synthetic parent claim')
     run('kanban', '--board', 'synthetic', 'complete', task_id, '--summary', 'Synthetic claim only')
     urgency('kanban', 'sync', '--request-id', 'claimed', '--reason', 'fixture')
@@ -184,7 +230,9 @@ assert 'Foreign task' not in text
                          tutorial='executed', isolation='two homes and boards',
                          last_success=health['last_success'], assigned_run_admitted=run_id is not None,
                          worker_capability='current_run' if run_id is not None else 'unknown_missing_current_run_id',
-                         current_run_pointer_present='current_run_id' in native['task'], worker_dispatch=False)))
+                         current_run_pointer_present='current_run_id' in native['task'],
+                         cli_current_run_pointer_present='current_run_id' in cli_native['task'],
+                         resumed_attempt_admitted=run_id is not None, worker_dispatch=False)))
 
 
 if __name__ == '__main__':

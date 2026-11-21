@@ -99,18 +99,25 @@ class NativeSource:
         import sys
         self._check_board(binding)
         _id(task_id, 'task_id')
-        return self.run([sys.executable, '-m', 'hermes_cli.main', 'kanban', '--board',
-                         binding['board'], 'show', task_id, '--json'])
+        result = self.run([sys.executable, '-m', 'hermes_cli.main', 'urgency', 'kanban',
+                           'snapshot', '--board', binding['board'], '--task', task_id])
+        if not isinstance(result, dict) or result.get('ok') is not True or not isinstance(result.get('data'), dict):
+            fail('snapshot')
+        return result['data']
 
-    def inventory(self, binding):
+    def validate_board(self, binding):
         import sys
         self._check_board(binding)
-        prefix = [sys.executable, '-m', 'hermes_cli.main', 'kanban']
-        boards = self.run([*prefix, 'boards', 'list', '--json', '--all'])
+        boards = self.run([sys.executable, '-m', 'hermes_cli.main', 'kanban',
+                           'boards', 'list', '--json', '--all'])
         if not isinstance(boards, list):
             fail('boards')
         if not any(isinstance(b, dict) and b.get('slug') == binding['board'] for b in boards):
             fail('board', 'SOURCE_DENIED')
+    def inventory(self, binding):
+        import sys
+        self.validate_board(binding)
+        prefix = [sys.executable, '-m', 'hermes_cli.main', 'kanban']
         rows = self.run([*prefix, '--board', binding['board'], 'list', '--tenant',
                          binding['tenant'], '--archived', '--json'])
         if not isinstance(rows, list):
@@ -199,11 +206,17 @@ def project(document, binding, now, redact):
             state = run.get('status')
             if state in ('running', 'done', 'failed', 'exhausted', 'interrupted', 'blocked', 'scheduled'):
                 started, ended = timestamp(run.get('started_at')), timestamp(run.get('ended_at'))
-                if started and run.get('started_at') == task.get('started_at'):
+                task_start = timestamp(task.get('started_at'))
+                if (started and started <= now.astimezone(timezone.utc).isoformat()
+                        and (task_start is None or task_start <= started)
+                        and (ended is None or started <= ended <= now.astimezone(timezone.utc).isoformat())
+                        and (state != 'running' or ended is None)
+                        and (run.get('profile') is None or run['profile'] == assignee)):
                     heartbeat = max((timestamp(e.get('created_at')) for e in events
                         if isinstance(e, dict) and e.get('kind') == 'heartbeat'
                         and e.get('run_id') == run_id and timestamp(e.get('created_at'))), default=None)
-                    if heartbeat and (heartbeat < started or ended and heartbeat > ended):
+                    if heartbeat and (heartbeat < started or ended and heartbeat > ended
+                                      or heartbeat > now.astimezone(timezone.utc).isoformat()):
                         heartbeat = None
                     worker = dict(run_id=run_id, state=state, started_at=started,
                                   heartbeat_at=heartbeat if state == 'running' and status == 'running' else None,

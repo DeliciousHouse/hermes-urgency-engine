@@ -30,6 +30,7 @@ All CLI rows begin with `hermes urgency kanban`.
 | --- | --- |
 | `health` | Read cached attempt/success times, age, pause, cursor, dirty bindings, incomplete request and last error/result |
 | `tasks` | Required `--project ID`; optional `--limit N` (1–500, default 100), `--after CURSOR`; reads only currently bound cached rows |
+| `snapshot` | Required `--board SLUG --task ID`; read minimal public-tool detail within one unambiguous configured binding; no plugin store initialization |
 | `sync` | Required `--request-id ID --reason TEXT`; one bounded scan, even before watchdog installation |
 | `pause`, `resume` | Required `--request-id ID --reason TEXT`; persisted source control, not watchdog control |
 
@@ -51,7 +52,7 @@ native source. Task pages return `items`, `has_more`,
 `/urgency kanban health` and `/urgency kanban tasks --project ID` are read-only.
 The `urgency_query` tool accepts `kanban_health` with no arguments, or
 `kanban_tasks` with `project_id` and optional `limit`, `after`. Neither surface
-can sync, pause or resume. Pre-turn guidance reads at most five cached canonical
+can snapshot, sync, pause or resume. Pre-turn guidance reads at most five cached canonical
 tasks for the selected project within the existing guidance budget. It labels
 stale/unknown coverage and does not collect, initialize storage or grant credit.
 
@@ -62,15 +63,19 @@ canonical status, assignee, priority, parents, source digest, optional source
 update time, collection time, worker summary and evidence label. Worker summary
 is current run ID, recognized state, start/end and matching heartbeat times.
 Bodies, comments, workspace paths, full run history, prompts and artifacts are
-not persisted by this adapter. Native `show` may return them in its bounded
-response; the adapter discards them rather than logging them.
+not persisted by this adapter. The snapshot child calls public `kanban_show`
+through the registered plugin context, discards private fields, validates the
+minimal document and redacts text before rendering. It never prints the raw
+response. Snapshot does not open plugin stores or invoke sync/tick.
 
 `observed_at` is collection time, **not a heartbeat or source revision**.
 `source_updated_at` remains null when the host does not expose it. The last
 known source revision is retained separately for ordering: a later null does
 not allow a delayed, older known revision to overwrite the projection. Worker facts
-require a matching current run and start identity; heartbeat events must belong
-to that run. Unrelated events and repeated polling cannot renew a worker sample.
+require the exact current-run pointer selecting one run with valid timestamps
+and the assigned profile where supplied. A resumed run can start after the task
+lifetime start. Heartbeats must match that run and lie within its lifetime, not
+in the future. Unrelated events and polling cannot renew a worker sample.
 If native task output has no authoritative `current_run_id`, worker projection
 and Monitor heartbeat remain null even if a run-history entry says `running`.
 The adapter does not guess current ownership from that history.
@@ -125,7 +130,8 @@ invent evidence. Sync records the intended update before applying it through
 ledger revision checks, then admits monitor facts and records application.
 
 ```text
-explicit bindings -> native boards/list/show -> minimal source projection
+explicit bindings -> CLI boards/list -> bounded snapshot child
+                                    -> public kanban_show -> minimal projection
                                              -> revision-checked ledger update
                                              -> monitor fact/graph admission
 existing no-agent tick ----------------------> source scan, then evaluation
@@ -147,7 +153,12 @@ Concurrent local edits produce conflicts instead of last-writer-wins.
 Native inventory and detail calls are not an atomic board snapshot either;
 missing or inconsistent data stays unknown.
 
-The adapter invokes the public native CLI. **Native `kanban list` recomputes
+The adapter uses public native CLI inventory and its registered snapshot CLI
+for detail. The child initializes built-in tools and calls the documented
+`ctx.dispatch_tool` API for `kanban_show`; it never reads board SQL or invokes
+a private handler. Parent sync/tick retains the same interpreter, profile,
+20-second owned-child timeout and 16 MiB output bound. There is no weaker CLI
+show fallback on denial or missing capability. **Native `kanban list` recomputes
 dependency readiness**; opting in accepts that normal native effect. Collection
 is therefore not described as side-effect-free, even though this adapter never
 writes board rows directly or bypasses worker fences. Cached conversational
@@ -188,7 +199,12 @@ Pausing or disabling source sync leaves the standalone watchdog usable.
    an install receipt alone does not prove execution.
 
 Troubleshooting: `SOURCE_DENIED` includes nonzero native CLI exit or a missing
-board; verify public CLI access in the same profile. `SOURCE_TIMEOUT` and
+board; verify public CLI access in the same profile. Snapshot also refuses
+disabled, unbound, ambiguous or cross-tenant requests before returning detail.
+`SOURCE_UNAVAILABLE` means no callable public dispatch API; worker facts stay
+unknown. A CLI serializer without a pointer does not imply that the public tool
+lacks it. Inspect `hermes urgency kanban snapshot --board synthetic --task ID`
+for the selected tool capability, not historical run ordering. `SOURCE_TIMEOUT` and
 `SOURCE_LIMIT` do not establish complete coverage. `SOURCE_MALFORMED` or
 `SOURCE_UNSUPPORTED` require a compatible native response, not guessed fields.
 After changing a binding, retry once on `SCOPE_CONFLICT` to allow a scan after
@@ -303,7 +319,10 @@ python tests/host_kanban.py --installed-home /path/to/disposable-home
 The journey executes the tutorial and a naturally due public cron tick after an
 external title edit. For a native claim and heartbeat on a synthetic assigned
 task, it checks current-run identity, canonical Ledger status and Monitor heartbeat
-when the host exposes authoritative current identity. Otherwise it asserts null
+when the public tool exposes authoritative current identity. It also schedules,
+unblocks and reclaims that task using native operations, proves the earlier
+heartbeat cannot renew the new attempt, then admits a new heartbeat. CLI
+pointer presence is reported separately. Otherwise it asserts null
 worker projection and no known worker signal. This is a
 capability assertion, not a skipped host or a weaker identity rule.
 It also checks cached slash/tool/pre-turn reads, pause/resume, two-home and board isolation, and

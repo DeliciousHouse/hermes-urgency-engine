@@ -130,6 +130,9 @@ def setup_parser(parser, *, conversational=False):
     tasks.add_argument('--limit', type=int, default=100)
     tasks.add_argument('--after')
     if not conversational:
+        snapshot = source.add_parser('snapshot', help='Read a minimal public-tool task snapshot; configured scope only')
+        snapshot.add_argument('--board', required=True)
+        snapshot.add_argument('--task', dest='task_id', required=True)
         for name in ('sync', 'pause', 'resume'):
             sub = source.add_parser(name)
             sub.add_argument('--request-id', required=True)
@@ -396,10 +399,72 @@ class Runtime:
     def kanban_config(self):
         return kanban_settings({key: self.ctx.get_config(key, default) for key, default in KANBAN_DEFAULTS.items()})
 
+    def kanban_snapshot(self, board, task_id):
+        from .kanban import fail, project, _id
+        cfg = self.kanban_config()
+        bindings = [b for b in cfg['kanban_bindings'] if b['board'] == board]
+        if not cfg['kanban_sync_enabled'] or len(bindings) != 1:
+            fail('binding', 'SOURCE_DENIED')
+        binding, = bindings
+        _id(task_id, 'task_id')
+        NativeSource().validate_board(binding)
+        if not callable(getattr(self.ctx, 'dispatch_tool', None)):
+            fail('public_tool', 'SOURCE_UNAVAILABLE')
+        from tools.registry import discover_builtin_tools
+        discover_builtin_tools()
+        raw = self.ctx.dispatch_tool('kanban_show', dict(board=board, task_id=task_id))
+        if not isinstance(raw, str):
+            fail('public_tool')
+        if len(raw.encode('utf-8')) > 16 * 1024 * 1024:
+            fail('public_tool', 'SOURCE_LIMIT')
+        def pairs(items):
+            result = {}
+            for key, value in items:
+                if key in result:
+                    fail('json')
+                result[key] = value
+            return result
+        try:
+            document = json.loads(raw, object_pairs_hook=pairs, parse_constant=lambda _: fail('json'))
+        except (ValueError, RecursionError):
+            fail('json')
+        if not isinstance(document, dict) or document.get('error') or document.get('ok') is False:
+            fail('public_tool', 'SOURCE_DENIED')
+        task = document.get('task')
+        if not isinstance(task, dict) or task.get('id') != task_id:
+            fail('task')
+        if task.get('tenant') != binding['tenant']:
+            fail('tenant', 'SOURCE_DENIED')
+        # Only scalar source facts cross the child boundary. Private task text,
+        # histories and event payloads are never rendered or persisted.
+        def select(row, fields):
+            if not isinstance(row, dict):
+                fail('source')
+            result = {key: row[key] for key in fields if key in row}
+            for value in result.values():
+                if value is not None and type(value) not in (str, int, float):
+                    fail('source')
+                if isinstance(value, str) and len(value) > 4096:
+                    fail('source', 'SOURCE_LIMIT')
+            return result
+        result = dict(task=select(task, ('id', 'title', 'status', 'tenant', 'assignee', 'priority',
+            'started_at', 'current_run_id', 'updated_at')), parents=document.get('parents'))
+        for key, fields in (('runs', ('id', 'profile', 'status', 'started_at', 'ended_at')),
+                            ('events', ('kind', 'run_id', 'created_at'))):
+            rows = document.get(key, [])
+            if not isinstance(rows, list) or len(rows) > 10000:
+                fail(key, 'SOURCE_LIMIT')
+            result[key] = [select(row, fields) for row in rows]
+        project(result, binding, self.clock(), lambda text: self.ctx.redact_text(text, force=True))
+        check_json(result)
+        return result
+
     def kanban_cli(self, args):
         operation = args.kanban_operation
         try:
-            if operation in ('health', 'tasks'):
+            if operation == 'snapshot':
+                data = self.kanban_snapshot(args.board, args.task_id)
+            elif operation in ('health', 'tasks'):
                 data = self.kanban_read(operation, arguments_from(args, 'kanban_' + operation))
             else:
                 cfg = self.kanban_config()
