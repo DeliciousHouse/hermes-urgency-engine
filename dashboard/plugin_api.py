@@ -202,8 +202,9 @@ def _strings(value):
 async def commands(request: Request):
     raw = bytearray()
     async for chunk in request.stream():
-        raw.extend(chunk)
-        if len(raw) > _runtime.MAX_INPUT_BYTES:
+        # Refuse before the oversized chunk is retained, not after.
+        if len(raw) + len(chunk) > _runtime.MAX_INPUT_BYTES:
             return JSONResponse(_runtime.Runtime.error(_ledger.LedgerError('INVALID_INPUT', 'desktop', 'body'), 'desktop'), status_code=400)
+        raw.extend(chunk)
     return await asyncio.to_thread(respond, lambda: execute_command(bytes(raw)))
 
