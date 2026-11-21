@@ -33,6 +33,8 @@ Both return a context manager. `connection` is a dedicated `sqlite3.Connection`,
 
 ```text
 get_project(project_id)
+get_milestone(milestone_id)
+list_milestones(project_id, limit=100, after=None)
 get_task(board_id, task_id)
 list_projects(limit=100, after=None)
 list_tasks(project_id, limit=100, after=None)
@@ -45,6 +47,8 @@ explain_deadline(deadline_id)
 All reads use a consistent transaction and write nothing.
 
 - `get_project`: project columns from the schema below.
+- `get_milestone`: milestone columns plus sorted board/task pairs in `tasks`.
+- `list_milestones`: project-scoped milestone records with membership, ordered by ID after the optional ID cursor; limit 1–500. Like task/deadline pages, concurrent edits can change enumeration.
 - `get_task`: task columns plus `criteria`, the active criterion records ordered by ID.
 - `list_projects`: projects ordered by ID, strictly after the optional ID cursor. Limit is 1–500. Continue with the last `project_id`; an empty page ends enumeration. No omission/duplication is promised across concurrent changes; use a stable database/backup for a stable enumeration.
 - `list_tasks`: scoped task key dictionaries (`board_id`, `task_id`), ordered by that pair. The cursor is the last pair as a two-item list/tuple. Use `get_task` for details.
@@ -61,6 +65,8 @@ Every command requires a nonempty `request_id` and `actor`. Update commands requ
 
 ```text
 create_project(project_id, title, *, request_id, actor)
+edit_project(project_id, *, title, expected_revision, reason, request_id, actor)
+edit_milestone(milestone_id, *, title, expected_revision, reason, request_id, actor)
 upsert_task(board_id, task_id, *, project_id, goal, expected_revision,
             reason, request_id, actor, assignee=None, status='planned',
             remaining_seconds=0, verification_seconds=0,
@@ -86,6 +92,8 @@ snapshot_forecast(deadline_id, *, expected_revision, reason, request_id, actor)
 | Command | Revision and result |
 | --- | --- |
 | `create_project` | New ID; returns project at revision 1. |
+| `edit_project` | Project revision. Changes title only, increments revision and retains old/new values in audit. |
+| `edit_milestone` | Project revision. Changes title only, preserves membership, increments project revision and retains old/new values in milestone audit. |
 | `upsert_task` | Task revision, or 0 to create. Returns task and active criteria. Full metadata replacement: omitted optional fields reset to their defaults. Project cannot change. Accepts only planned/running/blocked; existing verified/claimed status is preserved. |
 | `set_criteria` | Task revision. Replaces the entire active set; returns task. Invalidates accepted evidence, clears actual completion and inserts immutable criterion revisions. |
 | `baseline_scope` | Project revision. One baseline per project; returns snapshot ID, weight, criterion count and audit sequence watermark. The immutable audit prefix through that watermark retains the exact original scope; the summary avoids copying every description into progress reads. |

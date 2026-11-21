@@ -320,6 +320,15 @@ class Ledger:
         self.connection.execute('INSERT INTO projects VALUES(?,?,1,?)', (project_id, title, self._now()))
         return self._project(project_id), 'project', project_id, None
 
+    @_command
+    def edit_project(self, project_id, *, title, expected_revision, reason, request_id, actor):
+        before = self._project(project_id)
+        self._check_revision(before, expected_revision)
+        _text(title, 'title')
+        self.connection.execute('UPDATE projects SET title=? WHERE project_id=?', (title, project_id))
+        self._bump(project_id)
+        return self._project(project_id), 'project', project_id, before
+
     def _check_revision(self, record, expected):
         if record['revision'] != expected:
             raise LedgerError('REVISION_CONFLICT', 'update', 'expected_revision')
@@ -577,6 +586,30 @@ class Ledger:
         if not row:
             raise LedgerError('NOT_FOUND', 'read', 'milestone_id')
         return {**dict(row), 'tasks': [list(r) for r in self.connection.execute('SELECT board_id,task_id FROM milestone_tasks WHERE milestone_id=? ORDER BY board_id,task_id', (milestone_id,))]}
+
+    def get_milestone(self, milestone_id):
+        with self._transaction('get_milestone'):
+            return self._milestone(milestone_id)
+
+    def list_milestones(self, project_id, limit=100, after=None):
+        _integer(limit, 'limit', 1, 500)
+        if after is not None:
+            _id(after, 'after')
+        with self._transaction('list_milestones'):
+            self._project(project_id)
+            keys = self.connection.execute(
+                'SELECT milestone_id FROM milestones WHERE project_id=? AND milestone_id>? ORDER BY milestone_id LIMIT ?',
+                (project_id, after or '', limit)).fetchall()
+            return [self._milestone(row[0]) for row in keys]
+
+    @_command
+    def edit_milestone(self, milestone_id, *, title, expected_revision, reason, request_id, actor):
+        before = self._milestone(milestone_id)
+        self._check_revision(self._project(before['project_id']), expected_revision)
+        _text(title, 'title')
+        self.connection.execute('UPDATE milestones SET title=? WHERE milestone_id=?', (title, milestone_id))
+        self._bump(before['project_id'])
+        return self._milestone(milestone_id), 'milestone', milestone_id, before
 
     @_command
     def create_milestone(self, milestone_id, *, project_id, title, request_id, actor):
