@@ -7,5 +7,6 @@ include tests/host_runtime.py
 include tests/host_watchdog.py
 include tests/host_interventions.py
 include docs/watchdog.md
+include docs/kanban.md
 include docs/interventions.md
 recursive-include scripts *.py
