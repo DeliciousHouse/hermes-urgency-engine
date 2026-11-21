@@ -81,6 +81,37 @@ class ReconciliationTests(unittest.TestCase):
                 self.assertEqual(self.scan(f'n{count}')['state'], 'complete')
             self.assertEqual(batches, expected)
 
+    def test_detail_start_budget_includes_ledger_lookup(self):
+        self.source.rows = [dict(id=task_id, tenant='synthetic') for task_id in ('t0', 't1')]
+        get_task = self.ledger.get_task
+        elapsed = 0
+        detail_starts = []
+        detail = self.source.detail
+
+        def lookup(board_id, task_id):
+            nonlocal elapsed
+            if task_id == 't1':
+                elapsed = 20.1
+            return get_task(board_id, task_id)
+
+        def capture(binding, task_id):
+            detail_starts.append((task_id, elapsed))
+            return detail(binding, task_id)
+
+        with patch.object(kanban, 'monotonic', lambda: elapsed), \
+             patch.object(self.ledger, 'get_task', lookup), \
+             patch.object(self.source, 'detail', capture):
+            result = self.scan()
+            self.assertEqual(detail_starts, [('t0', 0)])
+            self.assertEqual(result, dict(state='partial', count=1,
+                                          cursor=[BINDING['board'], BINDING['tenant'], 't0']))
+            self.assertEqual(get_task(BINDING['board'], 't0')['goal'], self.source.title)
+            # The next page must resume at t1 and still make progress when its
+            # first lookup alone takes the whole collection window.
+            elapsed = 0
+            self.assertEqual(self.scan('tail'), dict(state='complete', count=1))
+            self.assertEqual(detail_starts, [('t0', 0), ('t1', 20.1)])
+
     def test_small_tail_uses_remaining_inventory(self):
         self.source.rows = [dict(id=f't{i:03}', tenant='synthetic') for i in range(125)]
         with self.slow_source_clock():

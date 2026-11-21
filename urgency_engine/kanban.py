@@ -527,10 +527,6 @@ class Sync:
                 position = [binding['board'], binding['tenant'], task_id]
                 if cursor and position <= cursor:
                     continue
-                if processed and monotonic() >= detail_deadline:
-                    apply_collected()
-                    self.admit_graph(cfg, monitor, set(), ledger_path)
-                    return dict(state='partial', count=count, cursor=self.meta('cursor'))
                 key = binding['board'], task_id
                 try:
                     task = ledger.get_task(*key)
@@ -538,6 +534,10 @@ class Sync:
                     if exc.code != 'NOT_FOUND':
                         raise
                     task = None
+                if processed and monotonic() >= detail_deadline:
+                    apply_collected()
+                    self.admit_graph(cfg, monitor, set(), ledger_path)
+                    return dict(state='partial', count=count, cursor=self.meta('cursor'))
                 try:
                     document = source.detail(binding, task_id)
                 except LedgerError as exc:

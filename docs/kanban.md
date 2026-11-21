@@ -105,8 +105,10 @@ state. Source sync never reads the raw canonical board database.
 
 One process owns a scan at a time through an OS file lock. After validating the
 selected inventories, the scanner starts a 20-second collection window. It
-reads at least one available detail, finishes work already collected, and returns
-a partial result if more details remain after the window. A durable ordered
+allows the first detail read even if its ledger lookup uses the window. For
+later reads, it checks the deadline after the ledger lookup, just before
+starting the detail read. At or past the deadline, it flushes collected work
+and returns a partial result without starting that read. A durable ordered
 cursor continues on a later request and resets at the tail. Each native
 subprocess has a 20-second timeout and 16 MiB stdout cap. These are per-call
 bounds, not a 20-second scan guarantee. Inventories cap at 10000 tasks, each task
