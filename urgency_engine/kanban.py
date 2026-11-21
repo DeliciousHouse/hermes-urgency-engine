@@ -436,7 +436,7 @@ class Sync:
                         projection['coverage'] = 'unknown'
                         self.db.execute('UPDATE sources SET coverage=?,projection_json=? WHERE board_id=? AND task_id=?',
                                         ('unknown', _json(projection), row['board_id'], row['task_id']))
-                if code == 'SCOPE_CONFLICT' or (code.startswith('SOURCE_') and code != 'SOURCE_ERROR'):
+                if code in ('SCOPE_CONFLICT', 'REVISION_CONFLICT') or (code.startswith('SOURCE_') and code != 'SOURCE_ERROR'):
                     self.admit_graph(cfg, monitor, set(), ledger_path)
                 raise
             with self.transaction():
