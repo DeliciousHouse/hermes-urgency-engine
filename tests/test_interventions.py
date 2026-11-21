@@ -8,7 +8,7 @@ import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier
 from unittest.mock import patch
@@ -257,3 +257,50 @@ class InterventionTests(unittest.TestCase):
         with self.assertRaisesRegex(LedgerError, 'IDEMPOTENCY_CONFLICT'), \
              interventions.Actions(sqlite3.connect(path), self.runtime.clock) as store:
             store.reserve(dict(payload, parameters={'remaining_seconds': 31}))
+
+    def test_scope_and_mode_fail_closed(self):
+        """protects=canonical scope and mode; fails_when=unavailable facts authorize an effect;
+        why_new=operator admission; seam=isolated stores and native projection; no_claim=host ACLs.
+        """
+        before, payload = self.seed()
+        for mode, expected in [('advisory', 'READ_ONLY'), ('autonomous', 'CAPABILITY_UNAVAILABLE')]:
+            self.ctx.settings['intervention_mode'] = mode
+            code, result = self.apply(dict(payload, request_id=mode))
+            self.assertEqual((code, result['error']['code']), (1, expected))
+            self.assertFalse((self.root / 'interventions.db').exists())
+        self.ctx.settings['intervention_mode'] = 'supervised'
+        for changes, expected in [({'board_id': 'other'}, 'SOURCE_DENIED'),
+                                  ({'incident_id': 'other'}, 'SCOPE_CONFLICT'),
+                                  ({'expected_revision': 0}, 'REVISION_CONFLICT')]:
+            code, result = self.apply(dict(payload, request_id=expected, **changes))
+            self.assertEqual((code, result['error']['code']), (1, expected))
+            self.assertEqual(result['data']['attempt_count'], 0)
+        now = self.runtime.clock()
+        self.runtime.clock = lambda: now + timedelta(days=1)
+        code, result = self.apply(dict(payload, request_id='stale'))
+        self.assertEqual((code, result['error']['code']), (1, 'SOURCE_UNAVAILABLE'))
+        with self.ledger() as ledger:
+            self.assertEqual(ledger.get_task('demo', 'task'), before)
+
+    def test_concurrent_ledger_edit_survives_action(self):
+        """protects=write-time CAS; fails_when=preflight replaces a competing edit;
+        why_new=narrow reestimate; seam=real ledger interleave; no_claim=native CAS.
+        """
+        before, payload = self.seed()
+        original = self.runtime.intervention_preflight
+
+        def preflight(request):
+            prepared = original(request)
+            with self.ledger() as ledger:
+                ledger.upsert_task('demo', 'task', project_id='demo', goal='Concurrent goal',
+                    remaining_seconds=23, verification_seconds=15, deployment_seconds=4, actual_seconds=6,
+                    expected_revision=before['revision'], reason='Concurrent edit', request_id='concurrent', actor='fixture')
+            return prepared
+
+        with patch.object(self.runtime, 'intervention_preflight', side_effect=preflight):
+            code, result = self.apply(payload)
+        self.assertEqual((code, result['data']['state'], result['error']['code']), (1, 'conflict', 'REVISION_CONFLICT'))
+        with self.ledger() as ledger:
+            current = ledger.get_task('demo', 'task')
+        self.assertEqual((current['goal'], current['remaining_seconds'], current['verification_seconds']),
+                         ('Concurrent goal', 23, 15))
