@@ -119,6 +119,46 @@ def range_time(value):
         raise LedgerError('INVALID_INPUT', 'timeline', 'range') from None
 
 
+def blocker_observations(path, project_id, tasks, *, clock):
+    """Project-scoped retained signals only; never extend a band to the read clock."""
+    from .watchdog import Monitor, instant
+    if not tasks:
+        return [], 'not_observed'
+    store = Monitor.open(path, clock=clock, readonly=True)
+    if store is None:
+        return [], 'not_observed'
+    keys = json.dumps([(row['board_id'], row['task_id']) for row in tasks])
+    with store, store.transaction(False):
+        rows = list(store.db.execute('''SELECT o.board_id,o.task_id,o.occurred_at,
+                json_extract(o.payload_json,'$.data.blocker_since') AS started_at
+            FROM json_each(?) AS key
+            JOIN observations o ON o.board_id=json_extract(key.value,'$[0]')
+                AND o.task_id=json_extract(key.value,'$[1]')
+            JOIN monitor_audit a ON a.request_id=o.event_id
+            WHERE o.project_id=? AND o.kind='task_signal'
+                AND json_extract(o.payload_json,'$.out_of_order')=0
+                AND json_type(o.payload_json,'$.data.blocker_since') IS NOT NULL
+            ORDER BY o.occurred_at DESC,a.sequence DESC LIMIT 501''', (keys, project_id)))
+    periods, latest = [], {}
+    for row in reversed(rows[:500]):
+        key = row['board_id'], row['task_id']
+        start, at = row['started_at'], row['occurred_at']
+        previous = latest.get(key)
+        if start is None:
+            if previous is not None:
+                previous['clear_observed_at'] = at
+                del latest[key]
+        elif instant(start) <= instant(at):
+            if previous is not None and previous['started_at'] == start:
+                previous['last_observed_at'] = at
+            else:
+                period = dict(board_id=key[0], task_id=key[1], started_at=start,
+                              last_observed_at=at, clear_observed_at=None)
+                latest[key] = period
+                periods.append(period)
+    return periods, 'partial' if len(rows) > 500 else 'retained_observations' if rows else 'not_observed'
+
+
 class Views:
     def __init__(self, ledger, *, clock):
         self.ledger, self.clock = ledger, clock

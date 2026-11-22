@@ -20,12 +20,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows 3.14 runs both disjoint partitions in parallel. The existing
-        # check name is reserved for the gate that requires both to pass.
+        # Both Windows versions retain the full suite across two disjoint jobs.
+        # The original Windows check names belong to the aggregate gates below.
         include:
           - {os: ubuntu-latest, python: '3.11', partition: all}
           - {os: ubuntu-latest, python: '3.14', partition: all}
-          - {os: windows-latest, python: '3.11', partition: all}
+          - {os: windows-latest, python: '3.11', partition: fast, name: 'Forecast remainder (windows-latest, Python 3.11)'}
+          - {os: windows-latest, python: '3.11', partition: slow, name: 'Forecast restart (windows-latest, Python 3.11)'}
           - {os: windows-latest, python: '3.14', partition: fast, name: 'Forecast remainder (windows-latest, Python 3.14)'}
           - {os: windows-latest, python: '3.14', partition: slow, name: 'Forecast restart (windows-latest, Python 3.14)'}
     steps:
@@ -39,14 +40,18 @@ jobs:
       - name: Run forecast, ledger and runtime regressions
         run: python tests/run_suite.py --partition ${{ matrix.partition }}
 
-  forecast-windows-314-gate:
-    name: Forecast (windows-latest, Python 3.14)
+  forecast-windows-gate:
+    name: Forecast (windows-latest, Python ${{ matrix.python }})
     needs: [forecast]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.14']
     steps:
-      - name: Require all forecast jobs, including both Windows 3.14 partitions
+      - name: Require all forecast jobs, including both partitions on each Windows version
         env:
           FORECAST_RESULT: ${{ needs.forecast.result }}
         run: test "$FORECAST_RESULT" = success

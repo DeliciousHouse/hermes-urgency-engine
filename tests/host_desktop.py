@@ -64,6 +64,8 @@ def child():
         assert response.status_code == 200, (suffix, response.status_code, response.text)
         assert response.json()['data']['items'] == []
         assert client.get(url + '/projects/foreign/' + suffix, headers=headers).status_code == 404
+        if suffix == 'source-tasks':
+            assert response.json()['data']['blocker_coverage'] == 'not_observed'
     # Read an existing milestone and its membership at the owning revision;
     # a milestone ID from another project must never populate this editor.
     with Ledger(sqlite3.connect(root / 'data.db'), clock=lambda:datetime(2030, 1, 1, tzinfo=timezone.utc), artifact_root=root) as ledger:

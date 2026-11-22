@@ -185,6 +185,13 @@ def source_tasks(project_id: str, request: Request):
         data = runtime.kanban_read('tasks', {'project_id': project_id, **arguments})
         data['sync_health'] = runtime.kanban_read('health', {})
         data['sync_seconds'] = runtime.kanban_config()['kanban_sync_seconds']
+        periods, data['blocker_coverage'] = _desktop.blocker_observations(
+            runtime.data_dir() / 'watchdog.db', project_id, data['items'], clock=clock)
+        by_task = {}
+        for period in periods:
+            by_task.setdefault((period['board_id'], period['task_id']), []).append(period)
+        for task in data['items']:
+            task['blocked_periods'] = by_task.get((task['board_id'], task['task_id']), [])
         return data
     return respond(read)
 

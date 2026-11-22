@@ -141,6 +141,13 @@ the task, then open Verified work for acceptance evidence. Range presets, zoom,
 Earlier/Later and **Fit observed runs** affect only the loaded page's axis. Runs
 outside that range have an explicit notice. The complete source table preserves
 exact start/end/heartbeat values; a missing end does not establish completion.
+Dashed bands show the reported blocker start through its last explicit blocked
+observation, not through the read clock or later clear observation. A retained
+clear is shown separately on the band. The source-task response adds
+`blocked_periods` (`started_at`, `last_observed_at`, `clear_observed_at`, canonical
+board/task IDs) and `blocker_coverage` (`not_observed`, `partial`, or
+`retained_observations`). Only the latest 500 matching signals on the loaded
+source-task page are considered. A missing band is not proof there was no blocker.
 Interventions uses the actual requested/observed effect and attribution fields;
 matching requested and observed values alone never implies an attributed effect.
 
@@ -517,8 +524,7 @@ recovery controls or completion of the sixteen-scenario acceptance matrix.
   graph and capacity-aware planning overlay are still unfinished.
 - **The Ledger task timeline still reports execution/dependency/blocked-period
   fields as `null`.** The separate Source tasks view draws canonical current-run
-  observations and lists dependency IDs, not a full historical graph. Blocked
-  intervals and critical-path analysis remain unfinished. No elapsed interval
-  or source status earns progress credit.
+  observations, retained blocker bands and dependency IDs, not a complete history
+  or critical path. No elapsed interval or source status earns progress credit.
 - **Recovery-card creation remains unavailable** (`CAPABILITY_UNAVAILABLE`) because
   the installed host exposes no supported route for it.

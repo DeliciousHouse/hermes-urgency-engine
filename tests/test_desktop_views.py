@@ -29,6 +29,33 @@ class DesktopViewTests(unittest.TestCase):
             reason='Scope', request_id='criteria', actor='operator')
         (self.root / 'proof').write_bytes(b'proof')
 
+    def test_blocked_periods_use_explicit_project_scoped_observations(self):
+        """protects=blocked interval provenance; fails_when=unrelated signals extend it;
+        why_new=execution timeline; seam=real Monitor/Ledger; no_claim=continuous liveness.
+        """
+        from urgency_engine.desktop import blocker_observations
+        from urgency_engine.watchdog import Monitor
+        path = self.root / 'watchdog.db'
+        task = {'board_id': 'board', 'task_id': 'task'}
+        self.assertEqual(blocker_observations(path, 'a', [task], clock=lambda: self.now), ([], 'not_observed'))
+        with Monitor.open(path, clock=lambda: self.now) as store:
+            for n, data in ((1, {'blocker_since': '2029-12-31T20:00:00Z'}),
+                            (2, {'blocker_since': '2029-12-31T20:00:00Z'}),
+                            (3, {'checkpoint_at': '2029-12-31T23:00:00Z'}),
+                            (4, {'blocker_since': None})):
+                store.observe({**task, 'request_id': f'event-{n}', 'reason': 'Synthetic observation',
+                               'project_id': 'a', 'kind': 'task_signal',
+                               'occurred_at': f'2029-12-31T{20+n:02}:00:00Z' if n < 4 else '2030-01-01T00:00:00Z',
+                               'data': data}, self.root / 'data.db')
+        rows, coverage = blocker_observations(path, 'a', [task], clock=lambda: self.now)
+        self.assertEqual(coverage, 'retained_observations')
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(datetime.fromisoformat(rows[0]['started_at']), datetime(2029, 12, 31, 20, tzinfo=timezone.utc))
+        self.assertEqual(datetime.fromisoformat(rows[0]['last_observed_at']), datetime(2029, 12, 31, 22, tzinfo=timezone.utc))
+        self.assertEqual(datetime.fromisoformat(rows[0]['clear_observed_at']), self.now)
+        self.assertEqual(blocker_observations(path, 'b', [task], clock=lambda: self.now)[0], [])
+        self.assertEqual(blocker_observations(path, 'a', [{**task, 'board_id': 'foreign'}], clock=lambda: self.now)[0], [])
+
     def test_paged_portfolio_reads_real_progress_without_crediting_claims(self):
         from urgency_engine.desktop import Views
         view = Views(self.ledger, clock=lambda:self.now)

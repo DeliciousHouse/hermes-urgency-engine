@@ -58,6 +58,8 @@ test('execution timeline ends open runs at last observation and exposes exact de
   };
   const item = {board_id: 'b', task_id: 'work', title: 'Work', parents: ['parent'],
     status: 'running', observed_at: '2030-01-01T03:00:00Z', stale: true, coverage: 'unknown',
+    blocked_periods: [{started_at: '2030-01-01T09:00:00Z', last_observed_at: '2030-01-01T12:00:00Z',
+      clear_observed_at: '2030-01-01T16:00:00Z'}],
     worker: {run_id: 3, state: 'running', started_at: '2030-01-01T01:00:00Z',
       heartbeat_at: '2030-01-01T02:00:00Z', ended_at: null}};
   const tree = expand(api.ExecutionTimeline({items: [item], start: '2030-01-01T00:00:00Z',
@@ -67,6 +69,13 @@ test('execution timeline ends open runs at last observation and exposes exact de
   assert.ok(Math.abs(Number.parseFloat(bars[0].props.style.width) - 100 / 24) < 1e-9);
   assert.match(JSON.stringify(tree), /stale/);
   assert.match(JSON.stringify(tree), /b\/parent/);
+  const label = nodes(tree, n => n.props?.children === 'b/work · Work')[0];
+  assert.equal(label.props.style.color, 'var(--ui-text-primary)');
+  assert.equal(label.props.style.background, 'var(--ui-bg-editor)');
+  const blocked = nodes(tree, n => n.props?.['aria-label']?.startsWith('Observed blocker:'));
+  assert.equal(blocked.length, 1);
+  assert.equal(Number.parseFloat(blocked[0].props.style.width), 12.5);
+  assert.match(blocked[0].props['aria-label'], /clear observation/i);
   bars[0].props.onClick();
   assert.equal(selected[0], item);
   const unknown = expand(api.ExecutionTimeline({items: [{...item, worker: {}}],
@@ -86,6 +95,8 @@ test('source execution is reachable with range controls and task inspection', as
   const timeline = tab.props.children.find(n => n?.type?.name === 'TimelineView');
   assert.ok(timeline, 'source tab must mount execution timeline');
   assert.equal(timeline.props.sourceTasks[0], item);
+  const sync = tab.props.children.find(n => n?.props?.children?.startsWith?.('Canonical sync cadence'));
+  assert.equal(sync.props.style.overflowWrap, 'anywhere');
   timeline.props.onSelect(item);
   reset(); tree = api.ProjectDetail(props);
   assert.match(JSON.stringify(tree), /Selected canonical task/);

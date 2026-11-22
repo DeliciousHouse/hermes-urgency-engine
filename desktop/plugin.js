@@ -514,8 +514,10 @@ export function RecordList({query, empty, columns, row, onMore}) {
 export function ExecutionTimeline({items, start, end, now, onSelect}) {
   const left = Date.parse(start), right = Date.parse(end);
   const position = value => Math.max(0, Math.min(100, 100 * (Date.parse(value) - left) / (right - left)));
+  const band = (from, to) => ({position: 'absolute', left: `${position(from)}%`,
+    width: `${position(to) - position(from)}%`, minWidth: 3, maxWidth: '100%', height: 44});
   return jsxs('section', {'aria-label': 'Observed task execution', children: [
-    jsx('p', {children: 'Solid bar: recorded run start to end or last heartbeat, not continuous activity or verified delivery. Missing intervals stay unknown. Dependencies use canonical board/task IDs; this page is not a complete critical path.'}),
+    jsx('p', {children: 'Solid bar: recorded run start to end or last heartbeat. Dashed band: reported blocker start through its last explicit observation. Neither proves continuous activity or a complete history. Dependencies use canonical board/task IDs; this page is not a complete critical path.'}),
     jsx('div', {className: 'ue-scroll', tabIndex: 0, 'aria-label': 'Execution timeline, scroll horizontally', children:
       jsxs('div', {style: {minWidth: 720}, children: [
         jsxs('div', {className: 'ue-toolbar', children: [date(start), ' to ', date(end), ' · Now: ', date(now)]}),
@@ -527,15 +529,24 @@ export function ExecutionTimeline({items, start, end, now, onSelect}) {
           const visible = valid && Date.parse(finish) >= left && Date.parse(worker.started_at) <= right;
           return jsxs('div', {style: {display: 'grid', gridTemplateColumns: '180px 1fr', minHeight: 100,
             borderBottom: '1px solid var(--ui-stroke-secondary)'}, children: [
-            jsx(Button, {style: {position: 'sticky', left: 0, zIndex: 1, background: 'var(--ui-bg)', overflowWrap: 'anywhere'},
+            jsx(Button, {style: {position: 'sticky', left: 0, zIndex: 1, background: 'var(--ui-bg-editor)',
+              color: 'var(--ui-text-primary)', whiteSpace: 'normal', overflowWrap: 'anywhere'},
               onClick: () => onSelect(item), children: `${item.board_id}/${item.task_id} · ${item.title}`}),
             jsxs('div', {children: [jsx('div', {style: {position: 'relative', height: 44}, children: visible
               ? jsx('button', {type: 'button', 'aria-label': `Observed execution: ${date(worker.started_at)} to ${date(finish)}`,
                 title: `Run ${worker.run_id}: ${date(worker.started_at)} to ${date(finish)}`,
-                onClick: () => onSelect(item), style: {position: 'absolute', left: `${position(worker.started_at)}%`,
-                  width: `${position(finish) - position(worker.started_at)}%`, height: 44,
+                onClick: () => onSelect(item), style: {...band(worker.started_at, finish),
                   background: 'var(--ui-accent)', border: '1px solid var(--ui-text-primary)'}, children: ''})
               : jsx('span', {children: valid ? 'Recorded interval outside this range' : 'Execution timing unknown'})}),
+              ...(item.blocked_periods || []).filter(p => Date.parse(p.last_observed_at) >= left
+                && Date.parse(p.started_at) <= right).map(p => {
+                const label = `Observed blocker: ${date(p.started_at)} to ${date(p.last_observed_at)} · ${p.clear_observed_at
+                  ? `Clear observation ${date(p.clear_observed_at)}` : 'No retained clear observation'}`;
+                return jsx('div', {style: {position: 'relative', height: 44}, children:
+                  jsx('button', {type: 'button', 'aria-label': label, title: label, onClick: () => onSelect(item),
+                    style: {...band(p.started_at, p.last_observed_at), background: 'transparent',
+                      border: '2px dashed var(--ui-text-primary)'}})}, `${p.started_at}/${p.last_observed_at}`);
+              }),
               jsx('div', {children: `${item.status} · ${item.stale ? 'stale' : 'observed'} ${date(item.observed_at)}`}),
               jsx('div', {children: `Depends on: ${item.parents?.map(id => `${item.board_id}/${id}`).join(', ') || 'None recorded'}`})]})]}, JSON.stringify([item.board_id, item.task_id]));
         })]})})]});
@@ -582,7 +593,8 @@ export function TimelineView({commitments = [], sourceTasks, now, onSelect}) {
   const zoom = factor => setHours(value => Math.max(1, Math.min(8784, value * factor)));
   function fit() {
     const times = (sourceTasks ? sourceTasks.flatMap(item => [item.worker?.started_at,
-      item.worker?.ended_at, item.worker?.heartbeat_at]) : commitments.flatMap(item => [item.original_at, item.target_at,
+      item.worker?.ended_at, item.worker?.heartbeat_at,
+      ...(item.blocked_periods || []).flatMap(p => [p.started_at, p.last_observed_at])]) : commitments.flatMap(item => [item.original_at, item.target_at,
       item.forecast_at, item.actual_verified_at])).map(Date.parse).filter(Number.isFinite);
     if (!times.length) {setCenter(null); setHours(168); return;}
     const first = Math.min(...times), last = Math.max(...times);
@@ -666,6 +678,8 @@ export function ProjectDetail({ctx, scope, sender, project, disabled, onSaved}) 
     'source-tasks': () => jsxs('section', {children: [
       jsx(TimelineView, {sourceTasks: records.data?.items || [], now: project.observed_at,
         onSelect: item => setSourceTask(JSON.stringify([item.board_id, item.task_id]))}),
+      records.data?.blocker_coverage === 'partial' && jsx('p', {children: 'Blocked-period history is partial; showing the latest retained observations.'}),
+      records.data?.blocker_coverage === 'not_observed' && jsx('p', {children: 'No explicit blocker observations retained for this page.'}),
       selectedSource && jsxs('section', {children: [jsx('h3', {children: 'Selected canonical task'}),
         jsx('p', {children: `${selectedSource.board_id}/${selectedSource.task_id} · ${selectedSource.title}`}),
         jsxs('dl', {children: [jsx('dt', {children: 'Assigned agent'}), jsx('dd', {children: selectedSource.assignee || 'Unassigned'}),
@@ -673,7 +687,7 @@ export function ProjectDetail({ctx, scope, sender, project, disabled, onSaved}) 
           jsx('dt', {children: 'Current run'}), jsx('dd', {children: selectedSource.worker?.run_id ?? 'Unknown'}),
           jsx('dt', {children: 'Dependency IDs'}), jsx('dd', {children: selectedSource.parents?.map(id => `${selectedSource.board_id}/${id}`).join(', ') || 'None recorded'})]}),
         jsx(Button, {onClick: () => setTab('scope'), children: 'Inspect acceptance evidence in Verified work'})]}),
-      jsx('p', {className: 'ue-note', children: records.data
+      jsx('p', {className: 'ue-note', style: {overflowWrap: 'anywhere'}, children: records.data
         ? `Canonical sync cadence ${records.data.sync_seconds}s, distinct from this page's 10s read. Sync health: ${JSON.stringify(records.data.sync_health)}`
         : 'Reading canonical source coverage…'}),
       jsx(RecordList, {query: records, empty: 'No canonical source tasks bound to this project.', onMore: setCursor,
