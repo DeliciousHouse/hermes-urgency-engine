@@ -33,6 +33,7 @@ async function load(overrides = {}) {
     useEffect: () => {}, useRef: value => ({current: value})};
   Object.assign(react, overrides);
   const jsx = (type, props, key) => ({type, props: props || {}, key});
+  Object.assign(sdk, overrides.sdk || {});
   const modules = {'@hermes/plugin-sdk': sdk, react, 'react/jsx-runtime': {jsx, jsxs: jsx}};
   const source = new vm.SourceTextModule(await readFile(new URL('../desktop/plugin.js', import.meta.url), 'utf8'), {context});
   await source.link(name => {
@@ -42,7 +43,7 @@ async function load(overrides = {}) {
     }, {context});
   });
   await source.evaluate();
-  return {api: source.namespace, navigate, requests, reset, mount};
+  return {api: source.namespace, sdk, navigate, requests, reset, mount};
 }
 
 function expand(node) {
@@ -61,6 +62,77 @@ test('reads reject results after a gateway activation changes', async () => {
   const valid = api.scopedRead({rest: async () => ({ok: true, data: {items: []}})}, '/portfolio',
     {connection: 'local', profile: 'default', epoch: 1});
   assert.equal((await valid).items.length, 0);
+});
+
+// protects=bounded live reads and stale-write refusal; fails_when=every event
+// starts I/O or disconnected scopes keep polling; seam=SDK hooks; no_claim=native routing.
+test('event bursts invalidate once and disconnected reads are disabled', async () => {
+  const effects = [], queries = [], invalidations = [], callbacks = [];
+  const {api, sdk} = await load({useEffect: callback => effects.push(callback), sdk: {
+    useQuery: options => {queries.push(options); return {isPending: true};},
+    useQueryClient: () => ({invalidateQueries: value => invalidations.push(value)})}});
+  sdk.host.state.gateway.set('closed');
+  const contributions = [];
+  const ctx = {register: c => contributions.push(c), onEvent: (name, fn) => {callbacks.push(fn); return () => {};}};
+  api.default.register(ctx);
+  expand(contributions.find(c => c.area === 'routes').render());
+  assert.ok(queries.length >= 2);
+  assert.ok(queries.every(q => q.enabled === false), 'disconnected queries must not read');
+  effects.forEach(fn => fn());
+  for (let i = 0; i < 50; i++) callbacks.forEach(fn => fn());
+  assert.equal(invalidations.length, 0, 'events cannot refresh a disconnected scope');
+});
+
+test('live event bursts do not bypass the polling interval', async () => {
+  const effects = [], invalidations = [], callbacks = [];
+  const {api} = await load({useEffect: callback => effects.push(callback), sdk: {
+    useQueryClient: () => ({invalidateQueries: value => invalidations.push(value)})}});
+  const contributions = [];
+  const ctx = {register: c => contributions.push(c), onEvent: (name, fn) => {callbacks.push(fn); return () => {};}};
+  api.default.register(ctx);
+  expand(contributions.find(c => c.area === 'routes').render());
+  effects.forEach(fn => fn());
+  for (let i = 0; i < 50; i++) callbacks.forEach(fn => fn());
+  assert.equal(invalidations.length, 1);
+});
+
+test('stale detail measurements disable every management control', async () => {
+  const project = {project_id: 'a', title: 'A', revision: 1, observed_at: '2030-01-01T00:00:00Z'};
+  const {api} = await load({useState: initial => [initial === null ? 'a' : initial, () => {}],
+    sdk: {useQuery: () => ({data: project, isError: true, error: new Error('offline')})}});
+  const contributions = [];
+  api.default.register({register: c => contributions.push(c)});
+  const page = contributions.find(c => c.area === 'routes').render();
+  const scoped = page.type(page.props);
+  const tree = scoped.type(scoped.props);
+  let detail;
+  (function walk(node) {
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (!node || typeof node !== 'object') return;
+    if (node.type?.name === 'ProjectDetail') detail = node;
+    walk(node.props?.children);
+  })(tree);
+  assert.ok(detail);
+  assert.equal(detail.props.disabled, true);
+});
+
+test('deadline and membership editors keep their identity across background revisions', async () => {
+  const {api} = await load({useState: initial => [initial === null ? 'd' : initial, () => {}]});
+  function keys(revision) {
+    const project = {project_id: 'a', revision, title: 'A', observed_at: '2030-01-01T00:00:00Z',
+      commitments: [{deadline_id: 'd', revision, kind: 'soft'}]};
+    const tree = api.ProjectDetail({ctx: {}, scope: {}, sender: {}, project});
+    const editors = [];
+    (function walk(node) {
+      if (Array.isArray(node)) return node.forEach(walk);
+      if (!node || typeof node !== 'object') return;
+      if (['ReviseForm', 'MembershipForm'].includes(node.type?.name)) editors.push(node.key);
+      walk(node.props?.children);
+    })(tree);
+    return editors;
+  }
+  assert.equal(keys(1).length, 2);
+  assert.deepEqual(keys(1), keys(2), 'server revisions must not unmount unsaved drafts');
 });
 
 test('portfolio renders authoritative project names and risk without status-derived progress', async () => {
@@ -87,6 +159,32 @@ test('command sender retains exact payload after lost reply and refuses another 
   assert.equal(sent.length, 2);
   assert.equal(sent[0], sent[1]);
   assert.equal(sent[0].arguments.project_id, 'a');
+});
+
+// protects=correction after a confirmed no-effect refusal; fails_when=409 traps the
+// operator in endless replay; seam=real sender with SDK transport replaced;
+// why_new=first reusable command path; no_claim=host authentication.
+test('confirmed no-effect refusal releases intent, unknown outcomes stay retained', async () => {
+  const {api} = await load();
+  let response = {ok: false, error: {code: 'REVISION_CONFLICT', side_effects: 'none', next_action: 'Reload current state'}};
+  const sender = api.commandSender({rest: async () => response}, {connection: 'local', profile: 'default', epoch: 1});
+  await assert.rejects(sender.send('edit_project', {project_id: 'a'}), /REVISION_CONFLICT/);
+  assert.equal(sender.pending(), null);
+  response = {ok: false, error: {code: 'INTERNAL_ERROR', side_effects: 'unknown'}};
+  await assert.rejects(sender.send('edit_project', {project_id: 'a'}), /INTERNAL_ERROR/);
+  assert.ok(sender.pending());
+});
+
+test('SDK thrown envelope releases only a structured no-effect refusal', async () => {
+  const {api} = await load();
+  let error = new Error('Error invoking remote method: 409: ' + JSON.stringify({ok: false,
+    error: {code: 'REVISION_CONFLICT', side_effects: 'none', next_action: 'Reload'}}));
+  const sender = api.commandSender({rest: async () => {throw error;}}, {connection: 'local', profile: 'default', epoch: 1});
+  await assert.rejects(sender.send('edit_project', {}), /REVISION_CONFLICT/);
+  assert.equal(sender.pending(), null);
+  error = new Error('409 REVISION_CONFLICT connection lost');
+  await assert.rejects(sender.send('edit_project', {}), /connection lost/);
+  assert.ok(sender.pending(), 'unstructured text cannot establish no effects');
 });
 
 test('open legacy gateway without a registry id is not labeled disconnected', async () => {
@@ -141,6 +239,27 @@ test('edit form waits for loaded data and pins its draft revision across refresh
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(sent[0].title, 'My draft');
   assert.equal(sent[0].expected_revision, 4);
+});
+
+test('explicit reload adopts the current revision without dropping the draft', async () => {
+  const {api, reset} = await load();
+  const sent = [];
+  const props = {sender: {send: async (op, args) => {sent.push(args); return args;}}, onSaved() {},
+    project: {project_id: 'a', title: 'Loaded title', revision: 4}};
+  let tree = api.ProjectForm(props);
+  labelled(tree, 'Project name').props.onChange({target: {value: 'My draft'}});
+  reset();
+  const current = {...props, project: {...props.project, title: 'Other editor', revision: 5}};
+  tree = api.ProjectForm(current);
+  const reload = tree.props.children.find(n => n?.props?.children === 'Use current revision and keep draft');
+  assert.ok(reload, 'a revision conflict needs a usable recovery control');
+  reload.props.onClick();
+  reset();
+  tree = api.ProjectForm(current);
+  tree.props.onSubmit({preventDefault() {}});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(sent[0].title, 'My draft');
+  assert.equal(sent[0].expected_revision, 5);
 });
 
 test('unified plugin registers page, sidebar, palette and status', async () => {

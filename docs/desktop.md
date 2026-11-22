@@ -82,8 +82,10 @@ anything; rescheduling is an explicit form with a required reason.
 ### Settings and cadence
 
 The page polls every 10 seconds while visible and backs off to 60 seconds after a
-failed read; the canonical inventory refreshes every 30 seconds. Host events are used
-only as invalidation hints, never as data. `ctx.socket` is a no-op on OAuth remotes,
+failed read; the canonical inventory refreshes every 30 seconds. Reads stop while
+the gateway is disconnected. Host events only mark the scoped cache stale (at most
+once per five seconds); they never bypass the polling cadence or supply data.
+`ctx.socket` is a no-op on OAuth remotes,
 so polling is the floor, not an optimisation. The canonical Kanban sync cadence is
 separate and is displayed on the Source tasks tab.
 
@@ -218,8 +220,18 @@ a second effect. Do this:
 2. If it did not, press **Reconcile same request**. The identical payload is replayed
    and the Ledger's idempotency rules make a duplicate a no-op rather than a second
    mutation.
-3. If the revision moved under you, the save returns 409. Your typed draft is
-   preserved; reload the record and resubmit deliberately.
+3. If the revision moved under you, the save returns 409. A structured backend
+   refusal with `side_effects: none` releases that failed request; a transport error
+   without that receipt does not. Your draft and its original revision stay pinned
+   through background refresh. Once the current record arrives, choose **Use current
+   revision and keep draft**, review your changes, and save deliberately. This
+   explicit action keeps dirty fields and adopts current values for untouched fields.
+
+Project, deadline and milestone-membership edits keep their component identity across
+background revisions. Failed measurement reads disable management controls until a
+successful read. Unknown requests are currently retained only while the page is
+mounted; closing or reloading it loses that in-memory request. Durable request
+recovery across Desktop restarts is not implemented yet.
 
 ### Act on a risk the page cannot fix
 

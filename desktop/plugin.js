@@ -53,9 +53,18 @@ export function commandSender(ctx, scope) {
     try {
       const result = await ctx.rest('/commands', {method: 'POST', body: retained, timeoutMs: 15000});
       if (!sameScope(scope)) throw new Error('Connection changed. Return to the original scope to reconcile.');
-      if (!result.ok) throw new Error(result.error?.code || 'Command refused');
+      if (!result.ok) throw new Error(JSON.stringify(result));
       retained = null;
       return result.data;
+    } catch (error) {
+      // Only the host's structured no-effect receipt releases an intent. A
+      // timeout, generic HTTP status or lost reply still requires exact replay.
+      const message = String(error?.message || '');
+      try {
+        const envelope = JSON.parse(message.slice(message.indexOf('{')));
+        if (envelope.ok === false && envelope.error?.side_effects === 'none') retained = null;
+      } catch { /* An unstructured transport error has an unknown outcome. */ }
+      throw error;
     } finally { busy = false; }
   }
   return {
@@ -79,13 +88,10 @@ function useScope() {
   return {connection, profile, epoch};
 }
 function useRead(ctx, path, scope) {
-  const client = useQueryClient();
-  const query = useQuery({queryKey: ['urgency', scope.connection, scope.profile, scope.epoch, path],
-    queryFn: () => scopedRead(ctx, path, scope), retry: false, staleTime: 5000,
+  const gateway = useValue(host.state.gateway);
+  return useQuery({queryKey: ['urgency', scope.connection, scope.profile, scope.epoch, path],
+    queryFn: () => scopedRead(ctx, path, scope), retry: false, staleTime: 5000, enabled: gateway === 'open',
     refetchInterval: query => query.state.error ? 60000 : 10000, refetchIntervalInBackground: false});
-  useEffect(() => ctx.onEvent('*', () => client.invalidateQueries({queryKey: ['urgency', scope.connection, scope.profile, scope.epoch]})),
-    [ctx, client, scope.connection, scope.profile, scope.epoch]);
-  return query;
 }
 
 // Canonical identity only. Two projects sharing a name, slug, board or path are
@@ -175,7 +181,11 @@ export function CommandForm({sender, title, submitLabel, fields, base, build, on
   const [failure, setFailure] = useState(null);
   const [pending, setPending] = useState(false);
   const lock = useRef(false);
-  const set = (name, value) => setDraft(current => ({...current, [name]: value}));
+  const [dirty, setDirty] = useState({});
+  const set = (name, value) => {
+    setDirty(current => ({...current, [name]: true}));
+    setDraft(current => ({...current, [name]: value}));
+  };
   async function submit(reconcile = false) {
     if (lock.current || disabled) return;
     // Named inline before anything is sent, so a misread field never becomes a
@@ -204,6 +214,15 @@ export function CommandForm({sender, title, submitLabel, fields, base, build, on
   return jsxs('form', {onSubmit: event => {event.preventDefault(); void submit();}, children: [
     jsx('h2', {children: title}), ...(preamble || []),
     ...fields.map(field => jsxs('label', {children: [field.label, control(field)]}, field.name)),
+    base?.revision !== undefined && base.revision !== pinned?.revision && jsx('p', {role: 'status',
+      children: `The record changed (draft revision ${pinned?.revision}, current ${base.revision}). Review current values before keeping your changes.`}),
+    base?.revision !== undefined && base.revision !== pinned?.revision && jsx(Button, {type: 'button',
+      disabled: disabled || pending || !!sender.pending?.(), onClick: () => {
+        setPinned(base);
+        setDraft(current => Object.fromEntries(fields.map(field => [field.name, dirty[field.name] ? current[field.name]
+          : field.initial ? field.initial(base) : base?.[field.name] ?? (field.options ? field.options[0][0] : '')])));
+        setFailure(null); setSaved('Current revision loaded. Draft edits retained; review before saving.');
+      }, children: 'Use current revision and keep draft'}),
     jsx(Button, {type: 'submit', disabled: disabled || pending || !!sender.pending?.(), children: pending ? 'Saving…' : submitLabel}),
     failure && jsxs('div', {role: 'alert', className: 'ue-alert', children: [
       jsx('strong', {children: 'Save not confirmed.'}), ' ', failure.headline,
@@ -432,7 +451,7 @@ export function ProjectDetail({ctx, scope, sender, project, disabled, onSaved}) 
       jsx('dt', {children: 'Last verified progress'}), jsx('dd', {children: date(project.progress?.last_verified_progress_at)})]}),
     jsx(DetailTabs, {tab, query: tab === 'commitments' ? null : records,
       onTab: value => {setCursor(null); setTab(value);}, children: tabs[tab]()}),
-    chosen && jsx(ReviseForm, {sender, commitment: chosen, disabled, onSaved}, `${chosen.deadline_id}:${chosen.revision}`),
+    chosen && jsx(ReviseForm, {sender, commitment: chosen, disabled, onSaved}, chosen.deadline_id),
     jsxs('details', {children: [jsx('summary', {children: 'Add a deadline'}),
       jsx(DeadlineForm, {sender, projectId: project.project_id, disabled, onSaved})]}),
     jsxs('details', {children: [jsx('summary', {children: 'Add a milestone'}),
@@ -442,7 +461,7 @@ export function ProjectDetail({ctx, scope, sender, project, disabled, onSaved}) 
         onChange: event => setMilestone(event.target.value)})]}),
       milestone
         ? jsx(MembershipForm, {sender, milestoneId: milestone, projectRevision: project.revision,
-          disabled, onSaved}, `${milestone}:${project.revision}`)
+          disabled, onSaved}, milestone)
         : jsx('p', {children: 'Name a milestone from the Milestones tab to edit its membership.'})]})]});
 }
 
@@ -457,10 +476,21 @@ function ScopedPage({ctx, scope, sender}) {
   const [selected, setSelected] = useState(null);
   const [after, setAfter] = useState(null);
   const gateway = useValue(host.state.gateway);
+  const client = useQueryClient();
+  useEffect(() => {
+    let last = -Infinity;
+    return ctx.onEvent('*', () => {
+      if (!sameScope(scope) || host.state.gateway.get() !== 'open' || Date.now() - last < 5000) return;
+      last = Date.now();
+      // Mark stale, but let the bounded visible polling cadence perform I/O.
+      // A busy gateway's event stream must not become one read per token.
+      client.invalidateQueries({queryKey: ['urgency', scope.connection, scope.profile, scope.epoch], refetchType: 'none'});
+    });
+  }, [ctx, client, scope.connection, scope.profile, scope.epoch]);
   const path = selected ? `/projects/${encodeURIComponent(selected)}` : `/portfolio?limit=100${after ? '&after=' + encodeURIComponent(after) : ''}`;
   const query = useRead(ctx, path, scope);
   const inventory = useQuery({queryKey: ['urgency', scope.connection, scope.profile, scope.epoch, 'canonical'],
-    queryFn: () => canonicalProjects(scope), retry: false, staleTime: 5000, enabled: !selected,
+    queryFn: () => canonicalProjects(scope), retry: false, staleTime: 5000, enabled: !selected && gateway === 'open',
     refetchInterval: state => state.state.error ? 60000 : 30000, refetchIntervalInBackground: false});
   return jsxs('main', {className: 'ue', 'aria-label': 'Urgency Engine', children: [
     jsx('style', {children: styles}), jsx('h1', {children: 'Urgency Engine'}),
@@ -475,7 +505,7 @@ function ScopedPage({ctx, scope, sender}) {
     query.data && jsxs('section', {children: [
       jsx('p', {className: 'ue-note', children: `Observed ${date(query.data.observed_at)} · Coverage: ${query.data.coverage}. Artifact byte identity does not prove semantic acceptance.`}),
       selected ? jsx(ProjectDetail, {ctx, scope, sender, project: query.data,
-        disabled: gateway !== 'open', onSaved: () => query.refetch()}, selected) : jsxs('section', {children: [
+        disabled: gateway !== 'open' || query.isError || query.isPending, onSaved: () => query.refetch()}, selected) : jsxs('section', {children: [
           inventoryNotice(inventory) && jsx('p', {className: 'ue-note', role: 'status', children: inventoryNotice(inventory)}),
           jsx(Portfolio, {rows: mergeInventory(inventory.data, query.data.items), onSelect: setSelected}),
           !query.data.items.length && !inventory.data?.length && jsx('p', {children: 'No configured projects in this scope. Create a project to begin measuring verified work.'}),
