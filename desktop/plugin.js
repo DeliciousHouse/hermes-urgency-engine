@@ -600,6 +600,14 @@ export function TaskScope({ctx, scope, sender, project, disabled, onSaved}) {
         jsx('dt', {children: 'Measured execution'}), jsx('dd', {children: seconds(task.actual_seconds)}),
         jsx('dt', {children: 'Estimated remaining'}), jsx('dd', {children: seconds(task.remaining_seconds)}),
         jsx('dt', {children: 'Verified completion'}), jsx('dd', {children: date(task.actual_verified_at)})]}),
+      jsx('h3', {children: 'Acceptance evidence'}),
+      ...(task.criterion_evidence || []).map(item => jsxs('details', {children: [
+        jsx('summary', {children: `${item.description} · ${item.verified ? 'Verified bytes' : 'Not verified'} · weight ${item.weight}${item.required ? ' · required' : ''}`}),
+        jsxs('dl', {children: [jsx('dt', {children: 'Evidence receipt'}), jsx('dd', {children: item.evidence_id || 'None'}),
+          jsx('dt', {children: 'Checked at'}), jsx('dd', {children: date(item.checked_at)}),
+          jsx('dt', {children: 'Expected SHA-256'}), jsx('dd', {children: item.expected_sha256 || 'Unknown'}),
+          jsx('dt', {children: 'Observed SHA-256'}), jsx('dd', {children: item.observed_sha256 || 'Unknown'})]})]}, item.criterion_id)),
+      !task.criterion_evidence?.length && jsx('p', {children: 'No current acceptance evidence recorded.'}),
       jsx(CriteriaForm, {task, sender, disabled: disabled || query.isError || query.isPending, onSaved: saved}, selected)]}),
     jsx(BaselineForm, {project, sender, disabled, onSaved})]});
 }

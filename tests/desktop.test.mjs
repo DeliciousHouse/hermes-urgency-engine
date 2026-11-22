@@ -838,7 +838,10 @@ test('criteria and baseline controls submit pinned revisions and preserve loaded
 
 test('verified work inspector exposes loaded criteria and scope controls on the detail page', async () => {
   const task = {board_id: 'b', task_id: 't', goal: 'Ship artifact', revision: 4, criteria: [],
-    actual_seconds: 3600, remaining_seconds: null, status: 'running'};
+    actual_seconds: 3600, remaining_seconds: null, status: 'running',
+    criterion_evidence: [{criterion_id: 'bundle', description: 'Bundle matches', weight: 2,
+      required: true, verified: true, evidence_id: 'evidence-one', checked_at: '2030-01-01T00:00:00Z',
+      expected_sha256: 'a'.repeat(64), observed_sha256: 'a'.repeat(64)}]};
   const {api, reset} = await load({sdk: {useQuery: () => ({data: {items: [task], has_more: false}})}});
   const props = {ctx: {}, scope: {}, sender: {}, project: {project_id: 'a', revision: 1,
     observed_at: '2030-01-01T00:00:00Z'}, onSaved() {}};
@@ -858,6 +861,9 @@ test('verified work inspector exposes loaded criteria and scope controls on the 
   assert.match(text, /Measured execution/);
   assert.match(text, /Unknown/);
   assert.match(text, /Record immutable baseline/);
+  assert.match(text, /Bundle matches/);
+  assert.match(text, /Verified bytes/);
+  assert.match(text, /evidence-one/);
 });
 
 test('detail tabs expose every audited read surface with its own state', async () => {

@@ -208,6 +208,27 @@ class DesktopViewTests(unittest.TestCase):
         self.assertEqual(rest[-1]['reason'], 'Rename review')
         self.assertNotIn('Foreign', str(rows + rest))
 
+    def test_task_inspector_exposes_current_criterion_evidence_and_removes_reopened_credit(self):
+        """protects=inspectable earned credit; fails_when=claims appear verified;
+        why_new=criterion inspector; seam=real Ledger; no_claim=semantic quality.
+        """
+        from urgency_engine.desktop import Views
+        view = Views(self.ledger, clock=lambda:self.now)
+        args = dict(start='2030-01-01T00:00:00Z', end='2030-01-02T00:00:00Z')
+        before = view.timeline('a', **args)['items'][0]
+        self.assertEqual(before['criterion_evidence'][0]['verified'], False)
+        self.assertIsNone(before['criterion_evidence'][0]['checked_at'])
+        self.ledger.verify_artifact('board', 'task', 'bytes', 'proof', expected_revision=2,
+            reason='Verify bytes', request_id='evidence-view', actor='operator')
+        after = view.timeline('a', **args)['items'][0]
+        self.assertTrue(after['criterion_evidence'][0]['verified'])
+        self.assertEqual(after['criterion_evidence'][0]['observed_sha256'], hashlib.sha256(b'proof').hexdigest())
+        self.assertEqual(after['criterion_evidence'][0]['checked_at'], self.now.isoformat())
+        self.assertNotIn('artifact_relative_path', after['criterion_evidence'][0])
+        self.ledger.reopen_task('board', 'task', expected_revision=after['revision'],
+            reason='Reopen', request_id='reopen-evidence', actor='operator')
+        self.assertFalse(view.timeline('a', **args)['items'][0]['criterion_evidence'][0]['verified'])
+
     def test_timeline_pages_tasks_without_inventing_execution_dates(self):
         from urgency_engine.desktop import Views
         from urgency_engine.ledger import LedgerError

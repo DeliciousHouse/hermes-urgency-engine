@@ -209,8 +209,24 @@ class Views:
         keys = self.ledger.list_tasks(project_id, limit, cursor)
         next_key = [keys[-1]['board_id'], keys[-1]['task_id']] if keys else None
         more = bool(keys and self.ledger.list_tasks(project_id, 1, next_key))
-        tasks = [{**self.ledger.get_task(**key), 'started_at': None,
-                  'dependencies': None, 'blocked_periods': None} for key in keys]
+        tasks = []
+        with self.ledger._transaction('desktop_timeline'):
+            for key in keys:
+                task = self.ledger._task(**key)
+                if task['project_id'] != project_id:
+                    raise LedgerError('REVISION_CONFLICT', 'timeline')
+                evidence = [dict(row) for row in self.ledger.connection.execute(
+                    'SELECT c.criterion_id,c.criterion_revision,c.description,c.weight,c.required,'
+                    'c.expected_sha256,e.observed_sha256,e.checked_at,e.evidence_id,'
+                    '(e.observed_sha256=c.expected_sha256) AS verified '
+                    'FROM criteria c LEFT JOIN evidence e ON e.board_id=c.board_id AND e.task_id=c.task_id '
+                    'AND e.criterion_id=c.criterion_id AND e.criterion_revision=c.criterion_revision AND e.invalidated_at IS NULL '
+                    'WHERE c.board_id=? AND c.task_id=? AND c.active=1 ORDER BY c.criterion_id',
+                    (key['board_id'], key['task_id']))]
+                for criterion in evidence:
+                    criterion['verified'] = bool(criterion['verified'])
+                tasks.append({**task, 'criterion_evidence': evidence, 'started_at': None,
+                              'dependencies': None, 'blocked_periods': None})
         return {'items': tasks, 'next': json.dumps(next_key, separators=(',', ':')) if more else None,
                 'has_more': more, 'start': left.isoformat(), 'end': right.isoformat(),
                 'now': self.clock().astimezone(timezone.utc).isoformat(),

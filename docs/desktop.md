@@ -118,7 +118,11 @@ milestone title and membership. Both editors first load the existing record, so
 opening membership never starts with an empty replacement for existing members.
 
 Verified work pages measured tasks and opens their goal, agent, recorded execution
-duration, remaining estimate, completion timestamp and criteria. The criteria editor
+duration, remaining estimate, completion timestamp and criteria. **Acceptance evidence**
+lists each current criterion's description, weight, required flag and verified-byte
+state. Expand it for the receipt ID, check time and expected/observed SHA-256. No
+artifact path or file content is returned. Reopened or replaced criteria lose credit;
+invalidated receipts are not shown as current evidence. The criteria editor
 uses a labelled JSON array, preloaded with the complete current criteria. Replacing
 criteria invalidates previous verification; it cannot mark work complete. Record
 original scope creates the immutable weighted baseline once, with a required reason.
