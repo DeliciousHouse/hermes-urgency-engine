@@ -450,12 +450,22 @@ Author testing is not independent QA. Cases 12, 13 and 15 are the weakest: they 
 proven at the module boundary and by operator spot checks, not by a full matrix of
 live remote gateways, assistive technology and window geometries.
 
+### Synthetic native Desktop captures
+
+These are crops of the upper **Verified work and scope** pane from a real installed
+Hermes Desktop at source `45cfb2489043cf15a2ed9d0786fc224e58c8def8`, not HTML mocks.
+The fixture uses synthetic `qa-board/qa-task` data. The lower criteria editor and
+save controls are outside these crops. They illustrate this pane only, not current
+recovery controls or completion of the sixteen-scenario acceptance matrix.
+
+![Synthetic scope inspector at a 390px window: measured execution is 2h and remaining work is unknown](images/scope-390.png)
+
+![Synthetic scope inspector at a 1280px window, including the start of the criteria editor](images/scope-1280.png)
+
 ### Known gaps in this release
 
-- **No release screenshots ship in this repository yet.** The captures taken so far
-  come from a disposable operator home whose chrome shows a private harness
-  identifier, so publishing them would leak a local identifier for no user benefit.
-  Publishable captures from a clean synthetic home are a downstream QA deliverable.
+- **Current recovery controls still need native captures and acceptance.** The
+  scoped screenshots above do not establish those newer interactions.
 - **Portfolio-level timeline and deadline-collision view are not implemented.** The
   portfolio shows each project's next commitment; it does not yet draw a cross-project
   timeline or highlight contention for shared agents. Project timelines currently
