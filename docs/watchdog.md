@@ -6,6 +6,8 @@ small Python launcher; the plugin starts no monitoring daemon, background evalua
 model call or OS service. Canonical collection uses a bounded child-output reader
 thread only for the duration of each source call.
 Use [native installation](runtime.md#compatibility-and-installation) first.
+To observe the gateway when its own scheduler can't run, use the separate,
+opt-in [external liveness check](#external-gateway-liveness).
 
 ## Reference
 
@@ -264,6 +266,137 @@ Revert plugin source through the normal reviewed workflow. Older code
 ignores `watchdog.db`; do not downgrade/delete it or assume uninstall purges history.
 No OS supervisor is installed by this plugin.
 
+## External gateway liveness
+
+### Probe reference
+
+Run `python3 scripts/gateway_liveness.py PORT` from the plugin source directory
+with Python 3.11 or later. Supply one decimal TCP port (`1`–`65535`). The probe
+sends one unauthenticated `GET /health` to `127.0.0.1` on that port. It does not
+follow redirects, use proxy settings, retry, or read Hermes config. The total
+network deadline is 3 seconds, including connect, headers and body. It accepts
+at most 8 KiB of HTTP headers and 4 KiB of UTF-8 JSON, with one `Content-Length`
+and no transfer encoding.
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | HTTP 200 with the documented JSON `{"status":"ok"}`, or the pinned native form with exactly `status: "ok"`, `platform: "hermes-agent"`, and a nonempty string `version`. Silent success. |
+| `1` | Unreachable, timed out, or not an accepted response. A fixed error goes to stderr. |
+| `2` | Invalid arguments. A fixed usage line goes to stderr. |
+
+The probe does not print headers, response bodies or caller input.
+
+### Why this is separate from watchdog health
+
+`hermes urgency watchdog health` reads the last recorded evaluation; it can
+remain unchanged when the gateway is down. An OS timer can run without the
+gateway and tell you whether its [API Server health endpoint][api-health]
+answered this time. It does not prove scheduler freshness, provider readiness,
+Desktop or dashboard availability, or the identity of a process answering on the
+port. Keep checking the watchdog's `last_success` for evaluation freshness.
+Neither plugin installation nor `hermes urgency watchdog install` enables the
+external check. It does not restart the gateway, launch agents or change the queue.
+
+### How to enable or disable a Linux systemd user timer
+
+Use a Linux systemd user manager with a working user journal, and a Hermes API
+Server already enabled on `127.0.0.1`. Use its **API Server port**, not the
+dashboard port. Configure the API Server securely through Hermes if needed;
+do not put its key in the unit. Pick a stable absolute path to the installed
+probe, run it manually, and proceed only if it exits `0`.
+
+Create `~/.config/systemd/user/urgency-gateway-liveness.service` and paste the
+following. Replace the quoted path and the sample port with yours, and change
+`/usr/bin/python3` if it is not your absolute Python 3.11+ path.
+
+```ini
+[Unit]
+Description=Urgency Engine gateway liveness check
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 "/absolute/path/to/scripts/gateway_liveness.py" 18765
+TimeoutStartSec=5s
+StandardOutput=journal
+StandardError=journal
+```
+
+Create `~/.config/systemd/user/urgency-gateway-liveness.timer`:
+
+```ini
+[Unit]
+Description=Check Hermes gateway liveness every minute
+
+[Timer]
+OnActiveSec=5s
+OnUnitInactiveSec=60s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now urgency-gateway-liveness.timer
+systemctl --user list-timers urgency-gateway-liveness.timer
+journalctl --user -u urgency-gateway-liveness.service -n 20
+```
+
+A healthy run logs no probe output. A failure records a nonzero exit in the
+unit journal; no restart or external notification is configured. If it fails,
+check the loopback listener and configured port, then run the probe manually to
+separate an endpoint failure from a Python or unit-path problem. The interval
+is approximate. The user manager must stay running; without that, the check
+does not run after logout. No recipe for other operating systems is provided.
+
+To opt out, run `systemctl --user disable --now urgency-gateway-liveness.timer`,
+remove the two unit files you created, then run `systemctl --user daemon-reload`.
+Verify the timer no longer appears in `systemctl --user list-timers`. Disable the
+timer before removing or moving the plugin checkout. No database or cron cleanup
+is needed for the external probe.
+
+### Tutorial: see an endpoint come and go
+
+From the repository root, run this synthetic journey. It binds a temporary
+loopback port and runs the same probe command as the timer. It installs no unit
+and uses no Hermes process or credentials.
+
+```sh
+python3 - <<'PY'
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import threading
+
+with tempfile.TemporaryDirectory() as root:
+    Path(root, 'health').write_text('{"status":"ok"}', encoding='utf-8')
+    handler = partial(SimpleHTTPRequestHandler, directory=root)
+    with ThreadingHTTPServer(('127.0.0.1', 0), handler) as server:
+        cmd = [sys.executable, 'scripts/gateway_liveness.py', str(server.server_port)]
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            up = subprocess.run(cmd, timeout=5).returncode
+        finally:
+            server.shutdown()
+            thread.join()
+    stopped = subprocess.run(cmd, timeout=5).returncode
+    print(f'up={up}, stopped={stopped}')
+    assert (up, stopped) == (0, 1)
+PY
+```
+
+Expect `up=0, stopped=1` and one probe failure line. You built a disposable
+example that distinguishes a responding endpoint from a stopped listener, not
+a native gateway or scheduler test. See the [probe reference](#probe-reference)
+and [timer recipe](#how-to-enable-or-disable-a-linux-systemd-user-timer) for real use.
+
+[api-health]: https://hermes-agent.nousresearch.com/docs/user-guide/features/api-server#get-health
+
 ## Tutorial: produce one independent incident
 
 Use a disposable Hermes home with the plugin installed, Python from that Hermes
@@ -333,5 +466,7 @@ python tests/host_watchdog.py --hermes-root /path/to/hermes-agent --installed-ho
 
 This real-host journey observes an executed read tool, waits for a naturally due
 cron scan, tests quiet/pause/restart/disable/uninstall behavior and preserves data.
+It also verifies the installed probe sees a disposable native API Server up,
+stopped and restored. The journey does not install or execute the systemd timer.
 It is not evidence of remote delivery, continuous gateway availability, model
 compliance, native Desktop functionality or autonomous recovery.
