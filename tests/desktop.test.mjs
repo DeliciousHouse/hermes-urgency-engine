@@ -117,9 +117,11 @@ test('stale detail measurements disable every management control', async () => {
 });
 
 test('deadline and membership editors keep their identity across background revisions', async () => {
+  let currentRevision = 1;
   const {api} = await load({useState: initial => [initial === null ? 'd' : initial, () => {}],
-    sdk: {useQuery: () => ({data: {items: [{deadline_id: 'd', kind: 'soft'}]}})}});
+    sdk: {useQuery: () => ({data: {items: [{deadline_id: 'd', kind: 'soft', revision: currentRevision}]}})}});
   function keys(revision) {
+    currentRevision = revision;
     const project = {project_id: 'a', revision, title: 'A', observed_at: '2030-01-01T00:00:00Z',
       commitments: [{deadline_id: 'd', revision, kind: 'soft'}]};
     const tree = api.ProjectDetail({ctx: {}, scope: {}, sender: {}, project});
