@@ -1,0 +1,12 @@
+{
+  "project_id": "example-studio",
+  "board_id": "example-board",
+  "task_id": "example-proof",
+  "goal": "Prepare a synthetic proof file",
+  "remaining_seconds": 600,
+  "verification_seconds": 120,
+  "deployment_seconds": 60,
+  "expected_revision": 0,
+  "reason": "Initial synthetic estimate",
+  "request_id": "example-task-v1"
+}

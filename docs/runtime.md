@@ -3,8 +3,9 @@
 This development plugin exposes the ledger through `hermes urgency`, `/urgency`
 and the read-only `urgency_query` tool. It adds advisory context before a model
 turn. An opt-in [independent watchdog](watchdog.md) records incidents and recommended
-plans through no-agent cron. It does not interrupt inference or coordinate workers,
-control external services, or provide a Desktop dashboard. Optional
+plans through no-agent cron. It does not interrupt inference, coordinate workers,
+or control external services. The unified package also includes the
+[native Desktop page](desktop.md). Optional
 [canonical Kanban synchronization](kanban.md) imports explicitly bound board tasks.
 Byte identity is **not independent semantic quality acceptance**.
 
