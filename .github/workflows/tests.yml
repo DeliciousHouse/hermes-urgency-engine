@@ -14,15 +14,20 @@ concurrency:
 
 jobs:
   forecast:
-    name: Forecast (${{ matrix.os }}, Python ${{ matrix.python }})
+    name: ${{ matrix.name || format('Forecast ({0}, Python {1})', matrix.os, matrix.python) }}
     runs-on: ${{ matrix.os }}
-    # Includes the 10000-source disk-backed restart/reconciliation journey.
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        python: ['3.11', '3.14']
+        # Windows 3.14 runs both disjoint partitions in parallel. The existing
+        # check name is reserved for the gate that requires both to pass.
+        include:
+          - {os: ubuntu-latest, python: '3.11', partition: all}
+          - {os: ubuntu-latest, python: '3.14', partition: all}
+          - {os: windows-latest, python: '3.11', partition: all}
+          - {os: windows-latest, python: '3.14', partition: fast, name: 'Forecast remainder (windows-latest, Python 3.14)'}
+          - {os: windows-latest, python: '3.14', partition: slow, name: 'Forecast restart (windows-latest, Python 3.14)'}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -32,10 +37,19 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Run forecast, ledger and runtime regressions
-        run: >-
-          python -c "import unittest;
-          result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.discover('tests'));
-          raise SystemExit(not (result.wasSuccessful() and result.testsRun and not result.skipped))"
+        run: python tests/run_suite.py --partition ${{ matrix.partition }}
+
+  forecast-windows-314-gate:
+    name: Forecast (windows-latest, Python 3.14)
+    needs: [forecast]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all forecast jobs, including both Windows 3.14 partitions
+        env:
+          FORECAST_RESULT: ${{ needs.forecast.result }}
+        run: test "$FORECAST_RESULT" = success
 
   desktop-ui:
     name: Desktop renderer (Node ${{ matrix.node }})
