@@ -819,6 +819,19 @@ function ScopedPage({ctx, scope, identity, sender, writer, requestWriter}) {
           query.data.has_more && jsx(Button, {onClick: () => {setAfter(query.data.next); setInventoryPage(0);}, children: 'Next projects'})]})]})]});
 }
 
+export function StatusChip({ctx}) {
+  const scope = useScope();
+  const gateway = useValue(host.state.gateway);
+  const query = useRead(ctx, '/portfolio?limit=100', scope);
+  const items = query.data?.items || [];
+  const urgent = items.reduce((chosen, item) => (item.urgency?.level || 0) > (chosen?.urgency?.level || 0) ? item : chosen, null);
+  const label = gateway !== 'open' ? 'disconnected' : query.isError ? 'stale / unavailable'
+    : !query.data ? 'loading' : query.data.has_more || items.some(item => item.risk_coverage === 'partial')
+      ? 'partial coverage' : risk(urgent);
+  return jsx(Button, {onClick: () => host.navigate('/urgency'), title: 'Recorded Ledger commitments; open portfolio for source coverage.',
+    children: `Urgency: ${label}`});
+}
+
 export default {
   id: 'hermes-urgency-engine', name: 'Urgency Engine',
   register(ctx) {
@@ -826,7 +839,6 @@ export default {
     ctx.register({id: 'nav', area: SIDEBAR_NAV_AREA, data: {path: '/urgency', label: 'Urgency Engine', codicon: 'watch'}});
     ctx.register({id: 'open', area: PALETTE_AREA, data: {id: 'urgency.open', label: 'Open Urgency Engine',
       keywords: ['deadline', 'progress', 'milestone'], run: () => host.navigate('/urgency')}});
-    ctx.register({id: 'status', area: STATUSBAR_AREAS.right, render: () => jsx(Button, {
-      onClick: () => host.navigate('/urgency'), children: 'Urgency'})});
+    ctx.register({id: 'status', area: STATUSBAR_AREAS.right, render: () => jsx(StatusChip, {ctx})});
   }
 };

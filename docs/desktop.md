@@ -4,6 +4,11 @@ The plugin ships one unified package: the Python engine, a scoped REST adapter a
 `dashboard/plugin_api.py`, and a native renderer at `desktop/plugin.js` built on
 `@hermes/plugin-sdk`. Enabling the plugin in Hermes Desktop adds an **Urgency Engine**
 sidebar entry, a command-palette entry, and a status-bar button, all opening `/urgency`.
+The status bar shares the first unfiltered portfolio query with the page. It shows the
+highest backend urgency among recorded active commitments only when that measurement
+page is complete, otherwise `partial coverage`. Loading, failed reads and disconnected
+gateways are labeled instead of retaining a seemingly current risk. Unconfigured
+canonical projects are not included in this recorded-Ledger risk summary.
 
 - [Reference: routes, controls and settings](#reference)
 - [Explanation: what the page can and cannot tell you](#explanation)

@@ -562,6 +562,17 @@ test('conflict review displays current field values beside retained draft before
   assert.match(text, /Current saved value/);
 });
 
+test('status bar shows measured urgency but never certifies a partial or disconnected portfolio', async () => {
+  let data = {items: [{urgency: {level: 4}}, {urgency: {level: 6}}], has_more: false};
+  const {api, sdk} = await load({sdk: {useQuery: () => ({data})}});
+  let text = JSON.stringify(api.StatusChip({ctx: {}}));
+  assert.match(text, /Overdue \/ recovery required/);
+  data = {...data, has_more: true};
+  assert.match(JSON.stringify(api.StatusChip({ctx: {}})), /partial/i);
+  sdk.host.state.gateway.set('closed');
+  assert.match(JSON.stringify(api.StatusChip({ctx: {}})), /disconnected/i);
+});
+
 test('unified plugin registers page, sidebar, palette and status', async () => {
   const {api, navigate} = await load();
   const contributions = [];
