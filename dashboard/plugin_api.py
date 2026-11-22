@@ -260,4 +260,3 @@ async def commands(request: Request):
             return JSONResponse(_runtime.Runtime.error(_ledger.LedgerError('INVALID_INPUT', 'desktop', 'body'), 'desktop'), status_code=400)
         raw.extend(chunk)
     return await asyncio.to_thread(respond, lambda: execute_command(bytes(raw)))
-

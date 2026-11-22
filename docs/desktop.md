@@ -513,24 +513,25 @@ and is not satisfied by this table.**
 |---|---|---|---|
 | 1 | Progress changes when work is verified | `test_desktop_views.py::test_paged_portfolio_reads_real_progress_without_crediting_claims`; tutorial above | Automated |
 | 2 | Percentages cannot reach 100% on claims alone | same test (`claim_complete` leaves 0); `desktop.test.mjs` progress test renders only backend values | Automated |
-| 3 | Reopened tasks and scope changes handled | same test (reopen returns the project to 0) | Automated |
+| 3 | Reopened tasks and scope changes handled | same test; prior native fixtures revised weighted scope and reopened verified work, then observed withdrawn credit | Automated plus scoped native observation |
 | 4 | Multiple projects update independently | same test (project `b` stays indeterminate while `a` reaches 100) | Automated |
 | 5 | Changes made outside the dashboard appear | `desktop.test.mjs` scoped-read and invalidation tests; operator observed an external rename appearing in 5.28 s and 3.12 s on two independent native runs | Automated plus independent native observation |
 | 6 | Hard deadlines never move automatically | `test_desktop_acceptance.py::test_case_6_hard_deadline_never_moves_automatically` | Automated |
-| 7 | Soft deadlines retain original baselines | `test_desktop_views.py::test_commitments_expose_independent_forecasts_and_preserved_targets` | Automated |
+| 7 | Soft deadlines retain original baselines | `test_desktop_views.py::test_commitments_expose_independent_forecasts_and_preserved_targets`; a prior native fixture revised a soft target and read back the unchanged original | Automated plus scoped native observation |
 | 8 | Forecasts update without changing commitments | same test (`forecast_at` moves, `target_at` does not, no snapshot is written) | Automated |
 | 9 | Membership changes recalculate schedule risk | `test_desktop_acceptance.py::test_case_9_milestone_membership_change_recalculates_risk` | Automated |
 | 10 | Escalation changes the displayed urgency level | `test_desktop_acceptance.py::test_case_10_escalation_changes_the_displayed_urgency_level` | Automated |
-| 11 | Long-running work represented accurately | `test_desktop_acceptance.py::test_case_11_long_running_and_unestimated_work_is_not_invented` | Automated |
-| 12 | Live updates recover after disconnection | `desktop.test.mjs` rejects results from a changed activation epoch; the page backs off to 60 s and resumes at 10 s | Automated at the module boundary only; real remote recovery is not proven here |
-| 13 | Multiple profiles and remote connections isolated | queries keyed by connection, epoch and profile; `test_desktop_views.py` scope tests; `mergeInventory` refuses a same-named project from another scope | Automated at the module boundary; **host routing across two live gateways is NOT proven by the author** |
+| 11 | Long-running work represented accurately | `test_desktop_acceptance.py::test_case_11_long_running_and_unestimated_work_is_not_invented`; prior native runs ended bars at the retained end or heartbeat, with no invented bar for an untimed task | Automated plus scoped native observation |
+| 12 | Live updates recover after disconnection | `desktop.test.mjs` rejects results from a changed activation epoch; prior native run showed the disconnected status | **Live reconnect with populated readback still pending** |
+| 13 | Multiple profiles and remote connections isolated | queries keyed by connection, epoch and profile; prior native fixture switched live gateways without exposing or replaying the other scope's pending command | Scoped two-gateway observation; **same-gateway profile switch still pending** |
 | 14 | Large task boards remain responsive | `test_desktop_acceptance.py::test_case_14_large_board_detail_stays_bounded_and_paged` (10,000 tasks, bounded pages, printed timing) | Automated; one machine, not a latency guarantee |
-| 15 | Dark/light themes, resizing, keyboard navigation | operator inspected 620 px light and dark captures of the installed page; the renderer uses host theme variables, 44 px targets, visible focus rings and a 640 px responsive breakpoint | Partly independent; **full keyboard and theme QA is downstream** |
-| 16 | Clean installation exposes the page without source edits | CI installs the exact public revision into a clean home, asserts the installed tree matches the published SHA with no diff, and exercises the native Desktop routes; operator loaded the whole package in the real Electron build and reached the page through Rescan, the sidebar and `Ctrl+K` | Automated plus independent native observation at pre-publication candidates |
+| 15 | Dark/light themes, resizing, keyboard navigation | prior native fixtures checked 390–1280 px, both themes, keyboard filter controls, and task selection after timeline scrolling | Scoped native observations; **complete exact-candidate accessibility still pending** |
+| 16 | Clean installation exposes the page without source edits | CI checks the installed public revision and clean tree; prior exact-public native installs enabled the whole package and opened the page in Electron | Automated install and scoped native observations at earlier revisions; current candidate still requires native readback |
 
-Author testing is not independent QA. Cases 12, 13 and 15 are the weakest: they are
-proven at the module boundary and by operator spot checks, not by a full matrix of
-live remote gateways, assistive technology and window geometries.
+Author testing is not independent QA. Previous native observations establish only
+the named journeys on their tested revisions. In particular, the disconnect status
+does not prove recovery, and bounded API pages do not prove native responsiveness
+with 10,000 tasks.
 
 ### Synthetic native Desktop captures
 
@@ -546,9 +547,9 @@ recovery controls or completion of the sixteen-scenario acceptance matrix.
 
 ### Known gaps in this release
 
-- **Current portfolio controls still need native captures and acceptance.** The
-  scoped screenshots above do not establish these newer interactions. Recovery and
-  single-writer handoff have scoped native operator evidence, not full release QA.
+- **Current candidate still needs full installed acceptance.** Prior native
+  portfolio, recovery, and single-writer checks are scoped observations, not full
+  release QA. The captures above illustrate only the scope inspector.
 - **Portfolio coordination covers loaded pages only.** Shared assignments and
   same-day targets do not establish actual resource overload. The dependency-only
   path is not a capacity-aware planning overlay.
