@@ -37,7 +37,7 @@ payload cannot choose a database or claim a permission. Responses are
 | `GET /projects/{project_id}/milestones` | `limit`, `after` | `items`, `has_more`, `next` |
 | `GET /projects/{project_id}/milestones/{milestone_id}` | — | scoped milestone title, member task IDs and owning `project_revision` |
 | `GET /projects/{project_id}/history` | `limit`, `after` (decimal sequence) | project and member task/milestone/deadline audit records, `has_more`, `next` |
-| `GET /projects/{project_id}/source-tasks` | `limit`, `after` | canonical Sync rows plus `sync_health` and `sync_seconds` |
+| `GET /projects/{project_id}/source-tasks` | `limit`, `after` | canonical Sync rows with `remaining_seconds` and `critical_path_step`, `dependency_bound`, blocker observations, `sync_health` and `sync_seconds` |
 | `GET /projects/{project_id}/interventions` | `limit`, `after` | receipts, `recovery_creation`, `next_action` |
 
 An unknown query parameter, a repeated parameter, a non-decimal `limit`, or a limit
@@ -148,6 +148,10 @@ clear is shown separately on the band. The source-task response adds
 board/task IDs) and `blocker_coverage` (`not_observed`, `partial`, or
 `retained_observations`). Only the latest 500 matching signals on the loaded
 source-task page are considered. A missing band is not proof there was no blocker.
+The `dependency_bound` result has `lower_bound_seconds`, `path_tasks` and `reason`.
+When unavailable, the duration is `null`, path count is zero and `reason` names
+the limiting input. `critical_path_step` is the one-based path position or `null`.
+Known task estimates remain readable even when the path is unknown.
 Interventions uses the actual requested/observed effect and attribution fields;
 matching requested and observed values alone never implies an attributed effect.
 
@@ -203,6 +207,22 @@ so nothing in the engine can extend an external commitment.
 
 A forecast is absent, not optimistic, when any contributing task has no remaining
 estimate. The page prints `Unknown` rather than inventing a bar endpoint.
+
+### Dependency-only critical path
+
+The lower bound is the longest prerequisite chain, summed using recorded remaining-work
+estimates. Independent branches can overlap in this calculation. They may not overlap
+in a real schedule if they share an agent, so the number is **not** a finish date,
+capacity estimate, or replacement for the commitment forecast. It does not add
+verification, deployment, waiting time, or inferred future blocker durations.
+
+The read requires fresh, complete retained source coverage for the current binding,
+exact canonical and Ledger task membership, known durations, and an acyclic graph
+with dependencies resolvable within the same project and board. A stale scan, missing
+estimate, unresolved dependency, cycle, or exceeded graph budget (configured task
+limit and 50,000 dependency edges) yields an explicit unknown instead of a partial
+number. The path is computed across supported project scope, not just the displayed
+page. The response returns only the requested page and the aggregate bound.
 
 ### Scope: what the page can see
 
@@ -313,6 +333,16 @@ commitment.
 A stale task revision refuses the write. Read the current values before using the
 explicit current-revision control. Invalid JSON is refused inline; invalid criterion
 fields are refused by the Ledger without changing scope.
+
+### How to inspect the dependency-only path
+
+1. Open **Source tasks** on a measured project and read **Dependency-only critical path**.
+2. Select a numbered path task to see its dependencies, estimate, assignment and any
+   recorded blockers. Use **Next records** if only part of the path is on this page.
+3. If the bound is unknown, read the reason and sync health. Check the configured
+   source scope, refresh it using the supported sync workflow, or record the missing
+   estimates. If a dependency is outside the supported scope or the graph is cyclic,
+   do not treat an individual estimate as the project bound.
 
 ### Recover from a save whose result you never saw
 
@@ -520,11 +550,12 @@ recovery controls or completion of the sixteen-scenario acceptance matrix.
   scoped screenshots above do not establish these newer interactions. Recovery and
   single-writer handoff have scoped native operator evidence, not full release QA.
 - **Portfolio coordination covers loaded pages only.** Shared assignments and
-  same-day targets do not establish actual resource overload. The full dependency
-  graph and capacity-aware planning overlay are still unfinished.
+  same-day targets do not establish actual resource overload. The dependency-only
+  path is not a capacity-aware planning overlay.
 - **The Ledger task timeline still reports execution/dependency/blocked-period
   fields as `null`.** The separate Source tasks view draws canonical current-run
-  observations, retained blocker bands and dependency IDs, not a complete history
-  or critical path. No elapsed interval or source status earns progress credit.
+  observations, retained blocker bands and dependency IDs, not a complete run
+  history. It computes a dependency-only critical path only for supported complete
+  inputs. No elapsed interval or source status earns progress credit.
 - **Recovery-card creation remains unavailable** (`CAPABILITY_UNAVAILABLE`) because
   the installed host exposes no supported route for it.

@@ -57,6 +57,44 @@ class ReconciliationTests(unittest.TestCase):
         # 100 detail reads consume the scanner's 20-second collection window.
         return patch.object(kanban, 'monotonic', lambda: self.source.calls / 5)
 
+    def test_desktop_graph_requires_a_fresh_complete_scan_for_the_current_binding(self):
+        """Real scan and retained store; no native board I/O or live-state claim."""
+        def read(cfg=None):
+            return self.sync.page('project', 1, cfg=cfg or self.cfg, with_graph=True)
+        self.assertEqual(read()['graph']['reason'], 'source_incomplete')
+        self.source.rows.append(dict(id='second', tenant='synthetic'))
+        self.assertEqual(self.scan()['state'], 'complete')
+        page = read()
+        self.assertTrue(page['has_more'])
+        self.assertEqual([row['task_id'] for row in page['graph']['items']], ['second', 'task'])
+        self.assertIsNone(page['graph']['reason'])
+        other = dict(BINDING, board='second-board')
+        self.assertEqual(read(dict(self.cfg, kanban_bindings=[BINDING, other]))['graph']['reason'], 'source_incomplete')
+        self.now += timedelta(seconds=61)
+        self.assertEqual(read()['graph']['reason'], 'source_stale')
+        self.scan('fresh')
+        with self.sync.transaction():
+            self.sync.put('dirty_bindings', [BINDING])
+        self.assertEqual(read()['graph']['reason'], 'source_incomplete')
+        self.source.rows.pop()
+        self.scan('withdrawn')
+        self.assertEqual(read()['graph']['reason'], 'source_incomplete')
+
+    def test_desktop_graph_refuses_new_inventory_before_a_resumed_cursor(self):
+        """protects=inventory coverage; fails_when=tail completion certifies an unseen prefix;
+        why_new=Desktop graph receipt; seam=source reads and injected clock; no_claim=native timing.
+        """
+        self.source.rows = [dict(id=task_id, tenant='synthetic') for task_id in ('middle', 'tail')]
+        with patch.object(kanban, 'monotonic', lambda: self.source.calls * 21):
+            self.assertEqual(self.scan('partial')['state'], 'partial')
+        self.source.rows.insert(0, dict(id='first', tenant='synthetic'))
+        self.assertEqual(self.scan('resumed')['state'], 'complete')
+        page = self.sync.page('project', cfg=self.cfg, with_graph=True)
+        self.assertEqual([r['task_id'] for r in page['items']], ['middle', 'tail'])
+        self.assertEqual(page['graph']['reason'], 'source_incomplete')
+        self.assertEqual(self.scan('fresh-prefix')['state'], 'complete')
+        self.assertIsNone(self.sync.page('project', cfg=self.cfg, with_graph=True)['graph']['reason'])
+
     def test_adaptive_intent_commit_boundaries(self):
         for low, high, size in ((1, 30, 10), (31, 60, 60), (61, 100, 100),
                                 (101, 200, 200), (201, 400, 400), (401, 800, 800),

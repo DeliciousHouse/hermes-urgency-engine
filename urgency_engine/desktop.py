@@ -1,5 +1,6 @@
 """Bounded Desktop read models. The Ledger remains the authority for progress."""
 from datetime import datetime, timezone
+from graphlib import CycleError, TopologicalSorter
 import json
 import re
 
@@ -162,6 +163,59 @@ def blocker_observations(path, project_id, tasks, *, clock):
 class Views:
     def __init__(self, ledger, *, clock):
         self.ledger, self.clock = ledger, clock
+
+    def dependency_bound(self, project_id, graph, page):
+        """Longest recorded remaining-work chain; never a resource forecast."""
+        key = lambda row: (row['board_id'], row['task_id'])
+        rows = {key(row): row for row in graph['items']}
+        sql = 'SELECT board_id,task_id,remaining_seconds,remaining_known FROM tasks WHERE project_id=?'
+        def load(clause, argument):
+            return {key(r): r['remaining_seconds'] if r['remaining_known'] else None
+                    for r in self.ledger.connection.execute(sql + clause, (project_id, argument))}
+        reason = graph['reason']
+        estimates = {}
+        with self.ledger._transaction('desktop_dependency_bound'):
+            self.ledger._project(project_id)
+            if not reason:
+                # One extra row detects a larger Ledger scope without reading it all.
+                estimates = load(' ORDER BY board_id,task_id LIMIT ?', len(rows) + 1)
+                if rows.keys() != estimates.keys():
+                    reason = 'project_scope_incomplete'
+            if reason:
+                estimates = load(" AND (board_id,task_id) IN (SELECT json_extract(value,'$[0]'),"
+                                 "json_extract(value,'$[1]') FROM json_each(?))", json.dumps([key(item) for item in page])) if page else {}
+        for item in page:
+            item.update(remaining_seconds=estimates.get(key(item)), critical_path_step=None)
+        def unknown(reason):
+            return dict(reason=reason, lower_bound_seconds=None, path_tasks=0)
+        if reason:
+            return unknown(reason)
+        if not rows:
+            return unknown('no_tasks')
+        parents = {task: [(task[0], p) for p in row['parents']] for task, row in rows.items()}
+        if any(p not in rows for dependencies in parents.values() for p in dependencies):
+            return unknown('dependency_outside_project')
+        try:
+            order = list(TopologicalSorter(parents).static_order())
+        except CycleError:
+            return unknown('dependency_cycle')
+        if None in estimates.values():
+            return unknown('missing_estimates')
+        lengths, previous = {}, {}
+        for task in order:
+            parent = max(parents[task], key=lambda p: (lengths[p], p), default=None)
+            previous[task] = parent
+            lengths[task] = lengths.get(parent, 0) + estimates[task]
+        task = max(lengths, key=lambda t: (lengths[t], t))
+        bound = lengths[task]
+        path = []
+        while task is not None:
+            path.append(task)
+            task = previous[task]
+        steps = {task: step for step, task in enumerate(reversed(path), 1)}
+        for item in page:
+            item['critical_path_step'] = steps.get(key(item))
+        return dict(reason=None, lower_bound_seconds=bound, path_tasks=len(path))
 
     def summary(self, project_id, commitments, partial):
         # Aggregate owned Ledger rows, never native board SQL or a subprocess per

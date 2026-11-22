@@ -56,6 +56,60 @@ class DesktopViewTests(unittest.TestCase):
         self.assertEqual(blocker_observations(path, 'b', [task], clock=lambda: self.now)[0], [])
         self.assertEqual(blocker_observations(path, 'a', [{**task, 'board_id': 'foreign'}], clock=lambda: self.now)[0], [])
 
+    def test_project_dependency_bound_uses_the_longest_chain_not_sum_or_page(self):
+        """protects=duration and exact project membership; fails_when=a page or sum is treated as a path;
+        why_new=dependency overlay; seam=disposable real Ledger; no_claim=scheduled finish.
+        """
+        from urgency_engine.desktop import Views
+        for board, task, project, estimate in [('board', 'long', 'a', 7200),
+                                                ('board', 'short', 'a', 1800),
+                                                ('other-board', 'long', 'a', 9000),
+                                                ('board', 'foreign', 'b', None)]:
+            self.ledger.upsert_task(board, task, project_id=project, goal='Deliver',
+                remaining_seconds=estimate, expected_revision=0, reason='Plan',
+                request_id=board + '-' + task, actor='operator')
+        def source(board, task, parents=(), status='todo', assignee=None):
+            return dict(board_id=board, task_id=task, parents=list(parents), status=status, assignee=assignee)
+        root = source('board', 'task', ['long', 'short'])
+        graph = [root, source('board', 'long', status='blocked', assignee='builder'),
+                 source('board', 'short'), source('other-board', 'long')]
+        # Give the joined task enough work for its chain to exceed the independent branch.
+        self.ledger.upsert_task('board', 'task', project_id='a', goal='Deliver', remaining_seconds=3600,
+            expected_revision=2, reason='Estimate', request_id='estimate', actor='operator')
+        view = Views(self.ledger, clock=lambda: self.now)
+        page = [dict(root)]
+        result = view.dependency_bound('a', dict(items=graph, reason=None), page)
+        self.assertEqual(result, dict(reason=None, lower_bound_seconds=10800, path_tasks=2))
+        self.assertEqual(page[0]['critical_path_step'], 2)
+        self.assertEqual(page[0]['remaining_seconds'], 3600)
+        offpage = [dict(graph[1])]
+        view.dependency_bound('a', dict(items=graph, reason=None), offpage)
+        self.assertEqual(offpage[0]['critical_path_step'], 1)
+        self.assertEqual(offpage[0]['remaining_seconds'], 7200)
+
+    def test_project_dependency_bound_withholds_number_for_incomplete_inputs(self):
+        """protects=unknown is not zero; fails_when=cycles or missing inputs look complete;
+        why_new=dependency overlay; seam=real Ledger; no_claim=source freshness.
+        """
+        from urgency_engine.desktop import Views
+        self.ledger.upsert_task('board', 'missing', project_id='a', goal='Deliver', remaining_seconds=None,
+            expected_revision=0, reason='Plan', request_id='missing', actor='operator')
+        base = dict(board_id='board', task_id='task', parents=[], status='done', assignee=None)
+        missing = dict(base, task_id='missing')
+        view = Views(self.ledger, clock=lambda: self.now)
+        for graph, reason, expected in [([base], None, 'project_scope_incomplete'),
+                ([base, missing], 'source_stale', 'source_stale'),
+                ([base, dict(missing, parents=['outside'])], None, 'dependency_outside_project'),
+                ([dict(base, parents=['missing']), dict(missing, parents=['task'])], None, 'dependency_cycle'),
+                ([base, missing], None, 'missing_estimates')]:
+            with self.subTest(expected=expected):
+                page = [dict(base), dict(missing)]
+                result = view.dependency_bound('a', dict(items=graph, reason=reason), page)
+                self.assertEqual(result['reason'], expected)
+                self.assertIsNone(result['lower_bound_seconds'])
+                self.assertIsNone(page[1]['remaining_seconds'])
+                self.assertIsNone(page[0]['critical_path_step'])
+
     def test_paged_portfolio_reads_real_progress_without_crediting_claims(self):
         from urgency_engine.desktop import Views
         view = Views(self.ledger, clock=lambda:self.now)

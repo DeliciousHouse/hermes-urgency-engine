@@ -182,7 +182,9 @@ def source_tasks(project_id: str, request: Request):
             del arguments['after']
         read_view(lambda view: view.ledger.get_project(project_id))
         runtime = scoped_runtime()
-        data = runtime.kanban_read('tasks', {'project_id': project_id, **arguments})
+        data = runtime.kanban_read('tasks', {'project_id': project_id, **arguments, 'with_graph': True})
+        graph = data.pop('graph', {'items': [], 'reason': 'source_unbound'})
+        data['dependency_bound'] = read_view(lambda view: view.dependency_bound(project_id, graph, data['items']))
         data['sync_health'] = runtime.kanban_read('health', {})
         data['sync_seconds'] = runtime.kanban_config()['kanban_sync_seconds']
         periods, data['blocker_coverage'] = _desktop.blocker_observations(

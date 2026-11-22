@@ -69,6 +69,9 @@ test('execution timeline ends open runs at last observation and exposes exact de
   assert.ok(Math.abs(Number.parseFloat(bars[0].props.style.width) - 100 / 24) < 1e-9);
   assert.match(JSON.stringify(tree), /stale/);
   assert.match(JSON.stringify(tree), /b\/parent/);
+  assert.ok(nodes(tree, node => typeof node.props?.children === 'string' &&
+    node.props.children.startsWith('Scroll the timeline horizontally')).length,
+    'narrow timeline needs a visible scroll hint, not only an accessible name');
   const label = nodes(tree, n => n.props?.children === 'b/work · Work')[0];
   assert.equal(label.props.style.color, 'var(--ui-text-primary)');
   assert.equal(label.props.style.background, 'var(--ui-bg-editor)');
@@ -835,6 +838,28 @@ test('source task rows show canonical title, run times, dependencies and stale c
   const text = JSON.stringify(expand(api.ProjectDetail({ctx: {}, scope: {}, sender: {},
     project: {project_id: 'a', title: 'A', observed_at: '2030-01-01T12:00:00Z'}})));
   for (const value of ['Canonical deliverable', 'parent-task', '2030-01-01T10:00:00Z', 'stale', 'unknown']) assert.ok(text.includes(value), value);
+});
+
+// protects=dependency bound and contributing rows; fails_when=unknown or a page looks like a forecast;
+// why_new=dependency-only estimate; seam=SDK read boundary; no_claim=native geometry.
+test('Source tasks labels the lower bound, contributing steps, agents and blockers', async () => {
+  const records = {items: [{board_id: 'b', task_id: 't', title: 'Canonical deliverable', parents: ['older'],
+    remaining_seconds: 1800, critical_path_step: 2, status: 'blocked', assignee: 'builder'}],
+    dependency_bound: {reason: null, lower_bound_seconds: 7200, path_tasks: 2}};
+  let isError = false;
+  const {api} = await load({useState: initial => [initial === 'commitments' ? 'source-tasks' : initial, () => {}],
+    sdk: {useQuery: () => ({data: records, isError})}});
+  const render = () => JSON.stringify(expand(api.ProjectDetail({ctx: {}, scope: {}, sender: {},
+    project: {project_id: 'a', title: 'A', observed_at: '2030-01-01T12:00:00Z'}})));
+  for (const value of ['Dependency-only critical path', '2.0 h', '1 of 2 path tasks on this page',
+    'b/t · Canonical deliverable · 0.5 h · builder · Recorded blocker', 'not a finish forecast']) assert.ok(render().includes(value), value);
+  isError = true;
+  assert.match(render(), /Source read unavailable/);
+  assert.doesNotMatch(render(), /2\.0 h/);
+  isError = false;
+  records.dependency_bound = {reason: 'dependency_cycle', lower_bound_seconds: null, path_tasks: 0};
+  assert.match(render(), /Dependency cycle/);
+  assert.doesNotMatch(render(), /2\.0 h/);
 });
 
 test('history renders the actual audit timestamp and action fields', async () => {

@@ -97,6 +97,47 @@ def child():
         'arguments': {'project_id': 'synthetic', 'title': 'Changed', 'expected_revision': 1, 'reason': 'Edit'}}, headers=headers)
     assert denied_command.status_code == 403, (denied_command.status_code, denied_command.text)
     assert client.get(url + '/projects/synthetic', headers=headers).json()['data']['title'] == 'Synthetic project'
+    # Canonical source is synthetic; the persisted Sync/Ledger and mounted read
+    # route are real. A page of one must still explain a two-task dependency path.
+    from urgency_engine.kanban import Sync, settings
+    from yaml import safe_dump, safe_load
+    binding = dict(board='board', tenant='synthetic', project_id='synthetic')
+    source_settings = dict(kanban_sync_enabled=True, kanban_bindings=[binding])
+    config = get_hermes_home() / 'config.yaml'
+    values = safe_load(config.read_text(encoding='utf-8'))
+    values['plugins']['entries'] = {PLUGIN: {'settings': source_settings}}
+    config.write_text(safe_dump(values), encoding='utf-8')
+
+    class SyntheticSource:
+        def inventory(self, binding):
+            return [dict(id=task, tenant=binding['tenant']) for task in ('prepare', 'task')]
+
+        def detail(self, binding, task_id):
+            return dict(task=dict(id=task_id, tenant=binding['tenant'], title=task_id, status='todo'),
+                        parents=['prepare'] if task_id == 'task' else [])
+
+    def now():
+        return datetime.now(timezone.utc)
+
+    with Ledger(sqlite3.connect(root / 'data.db'), clock=now, artifact_root=root) as ledger, \
+            Sync(sqlite3.connect(root / 'kanban.db'), clock=now, redact=str) as sync:
+        assert sync.scan(settings(source_settings), ledger, None, root / 'data.db', SyntheticSource(),
+                         request_id='source-scan', reason='Synthetic graph')['state'] == 'complete'
+        for task, duration in [('prepare', 1800), ('task', 3600)]:
+            ledger.upsert_task('board', task, project_id='synthetic', goal=task, remaining_seconds=duration,
+                               expected_revision=ledger.get_task('board', task)['revision'],
+                               reason='Estimate', request_id='estimate-' + task, actor='operator')
+    source_url = url + '/projects/synthetic/source-tasks'
+    assert client.get(source_url).status_code == 401
+    source_page = client.get(source_url, params={'limit': 1}, headers=headers)
+    assert source_page.status_code == 200, (source_page.status_code, source_page.text)
+    source_data = source_page.json()['data']
+    assert 'graph' not in source_data and source_data['has_more']
+    assert source_data['dependency_bound'] == dict(reason=None, lower_bound_seconds=5400, path_tasks=2)
+    assert len(source_data['items']) == 1 and source_data['items'][0]['critical_path_step'] == 1
+    tail = client.get(source_url, params={'limit': 1, 'after': source_data['next']}, headers=headers).json()['data']
+    assert tail['dependency_bound'] == source_data['dependency_bound']
+    assert tail['items'][0]['critical_path_step'] == 2 and tail['items'][0]['parents'] == ['prepare']
     malformed = client.post(url + '/commands', json={'actor': 'operator'}, headers=headers)
     assert malformed.status_code == 400, (malformed.status_code, malformed.text)
     for raw in ('{', '{"operation":"edit_project","operation":"set_deadline"}'):
