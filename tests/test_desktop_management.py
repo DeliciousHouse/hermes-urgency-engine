@@ -1,0 +1,139 @@
+"""Desktop management's real storage contract.
+
+protects=audited title edits with optimistic concurrency and exact replay;
+fails_when=an edit loses history or overwrites concurrent scope;
+why_new=Desktop needs project and milestone editing, not just creation;
+seam=temporary real SQLite; no_claim=HTTP authorization or native UI acceptance.
+"""
+from pathlib import Path
+import sqlite3
+import tempfile
+import unittest
+from datetime import datetime, timezone
+
+from urgency_engine.ledger import Ledger, LedgerError
+
+
+class ManagementTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.ledger = Ledger(sqlite3.connect(self.root / 'data.db'),
+                             clock=lambda: datetime(2030, 1, 1, tzinfo=timezone.utc), artifact_root=self.root)
+        self.addCleanup(self.ledger.connection.close)
+        self.ledger.create_project('p', 'Original', request_id='create', actor='operator')
+
+    def test_project_edit_is_revision_checked_audited_and_replayable(self):
+        command = dict(title='Revised', expected_revision=1, reason='Clarify objective',
+                       request_id='edit', actor='operator')
+        result = self.ledger.edit_project('p', **command)
+        self.assertEqual(result['title'], 'Revised')
+        self.assertEqual(result['revision'], 2)
+        self.assertEqual(self.ledger.edit_project('p', **command), result)
+        history = self.ledger.history('project', 'p')
+        self.assertEqual(len(history), 2)
+        self.assertIn('Original', history[-1]['before_json'])
+        self.assertEqual(history[-1]['reason'], 'Clarify objective')
+        with self.assertRaises(LedgerError) as caught:
+            self.ledger.edit_project('p', **{**command, 'request_id': 'stale'})
+        self.assertEqual(caught.exception.code, 'REVISION_CONFLICT')
+        self.assertEqual(self.ledger.get_project('p'), result)
+
+    def test_management_envelope_rejects_forged_actor_and_replays_exact_edit(self):
+        from urgency_engine.desktop import management_command
+        payload = dict(operation='edit_project', request_id='edit', arguments=dict(
+            project_id='p', title='Changed', expected_revision=1, reason='Rename'))
+        result = management_command(self.ledger, payload)
+        self.assertEqual(result['title'], 'Changed')
+        self.assertEqual(management_command(self.ledger, payload), result)
+        self.assertEqual(self.ledger.history('project', 'p')[-1]['actor'], 'desktop-operator')
+        for bad in ({**payload, 'actor': 'operator'}, {**payload, 'operation': 'verify_artifact'},
+                    {**payload, 'arguments': {**payload['arguments'], 'actor': 'operator'}}):
+            with self.subTest(bad=bad), self.assertRaises(LedgerError):
+                management_command(self.ledger, bad)
+        self.assertEqual(len(self.ledger.history('project', 'p')), 2)
+
+    def test_scoped_command_accepts_only_an_opaque_namespace(self):
+        from urgency_engine.desktop import command_arguments
+        payload = dict(operation='edit_project', request_id='scoped', scope_id='a' * 32,
+                       arguments=dict(project_id='p', title='Scoped', expected_revision=1, reason='Rename'))
+        operation, arguments = command_arguments(payload)
+        self.assertEqual(operation, 'edit_project')
+        self.assertNotIn('scope_id', arguments, 'namespace is checked by host, never passed as actor')
+        for value in (None, '', 'path/to/home', 123, 'a' * 33):
+            with self.subTest(value=value), self.assertRaises(LedgerError):
+                command_arguments({**payload, 'scope_id': value})
+
+    def test_scope_control_payloads_use_real_ledger_replay_and_baseline(self):
+        """protects=renderer scope payload compatibility; seam=real adapter/store;
+        no_claim=installed form input; supplements the renderer's exact field test.
+        """
+        from urgency_engine.desktop import management_command
+        self.ledger.upsert_task('b', 't', project_id='p', goal='Deliver', expected_revision=0,
+                               reason='Plan', request_id='task', actor='operator')
+        payload = dict(operation='set_criteria', request_id='criteria', arguments=dict(
+            board_id='b', task_id='t', expected_revision=1, reason='Clarify scope',
+            criteria=[dict(criterion_id='test', description='Tests pass', weight=3,
+                           required=True, expected_sha256=None)]))
+        result = management_command(self.ledger, payload)
+        self.assertEqual(result['criteria'][0]['weight'], 3)
+        self.assertEqual(management_command(self.ledger, payload), result)
+        baseline = dict(operation='baseline_scope', request_id='baseline', arguments=dict(
+            project_id='p', expected_revision=self.ledger.get_project('p')['revision'], reason='Freeze original'))
+        first = management_command(self.ledger, baseline)
+        self.assertEqual(management_command(self.ledger, baseline), first)
+        self.assertEqual(self.ledger.progress('p')['baseline_weight'], 3)
+        self.assertEqual(self.ledger.progress('p')['percent'], 0)
+
+    def test_datetime_control_payload_creates_and_revises_real_commitment(self):
+        """protects=working native datetime controls; fails_when=naive form times
+        never reach Ledger; seam=synthetic zone files; no_claim=installed UI.
+        """
+        from urgency_engine.desktop import management_command
+        from test_ledger import fixture_zones, TZPATH, reset_tzpath, ZoneInfo
+        fixture_zones(self.root)
+        self.addCleanup(lambda: (reset_tzpath(TZPATH), ZoneInfo.clear_cache()))
+        payload = dict(operation='set_deadline', request_id='civil', arguments=dict(
+            deadline_id='d', project_id='p', kind='soft', at='2030-01-02T09:30:00',
+            timezone='Synthetic', owner='operator', source='Plan'))
+        result = management_command(self.ledger, payload)
+        self.assertEqual(result['target_at'], '2030-01-02T14:30:00+00:00')
+        self.assertEqual(management_command(self.ledger, payload), result)
+        revised = management_command(self.ledger, dict(operation='revise_deadline', request_id='civil-revise',
+            arguments=dict(deadline_id='d', at='2030-07-02T09:30:00', timezone='Synthetic',
+                           expected_revision=1, reason='Move review')))
+        self.assertEqual(revised['target_at'], '2030-07-02T13:30:00+00:00')
+        self.assertEqual(revised['original_at'], result['original_at'])
+        for value in ('2030-03-10T02:30:00', '2030-11-03T01:30:00', '2030-02-30T09:30:00'):
+            with self.subTest(value=value), self.assertRaises(LedgerError):
+                management_command(self.ledger, dict(operation='revise_deadline', request_id='refused-' + value,
+                    arguments=dict(deadline_id='d', at=value, timezone='Synthetic', expected_revision=2, reason='Invalid')))
+        self.assertEqual(self.ledger.get_deadline('d'), revised)
+
+    def test_milestone_edit_preserves_membership_and_uses_project_revision(self):
+        self.ledger.upsert_task('b', 't', project_id='p', goal='Deliver', expected_revision=0,
+                                reason='Plan', request_id='task', actor='operator')
+        self.ledger.create_milestone('m', project_id='p', title='Original milestone', request_id='m', actor='operator')
+        self.ledger.set_milestone_tasks('m', [['b', 't']], expected_revision=3,
+                                        reason='Scope', request_id='membership', actor='operator')
+        command = dict(title='Renamed milestone', expected_revision=4, reason='Clarify milestone',
+                       request_id='rename', actor='operator')
+        result = self.ledger.edit_milestone('m', **command)
+        self.assertEqual(result['title'], 'Renamed milestone')
+        self.assertEqual(result['tasks'], [['b', 't']])
+        self.assertEqual(self.ledger.get_project('p')['revision'], 5)
+        self.assertEqual(self.ledger.edit_milestone('m', **command), result)
+        self.assertEqual(self.ledger.get_milestone('m'), result)
+        self.assertEqual(self.ledger.list_milestones('p', limit=1), [result])
+        self.assertEqual(self.ledger.list_milestones('p', after='m'), [])
+        self.ledger.create_project('other', 'Other', request_id='other', actor='operator')
+        self.assertEqual(self.ledger.list_milestones('other'), [])
+        with self.assertRaises(LedgerError) as caught:
+            self.ledger.edit_milestone('m', **{**command, 'request_id': 'stale'})
+        self.assertEqual(caught.exception.code, 'REVISION_CONFLICT')
+        self.assertEqual(len(self.ledger.history('milestone', 'm')), 3)
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -311,6 +311,23 @@ class Ledger:
                 'SELECT * FROM audit WHERE entity_type=? AND entity_id=? AND sequence>? ORDER BY sequence LIMIT ?',
                 (entity_type, entity_id, after or 0, limit))]
 
+    def project_history(self, project_id, limit=100, after=None):
+        """Page recorded project, task, milestone and commitment changes together.
+
+        Resolve ownership from the audit snapshot rather than querying live
+        entity rows. Evidence results inherit ownership from their prior task.
+        """
+        _integer(limit, 'limit', 1, 500)
+        if after is not None:
+            _integer(after, 'after')
+        with self._transaction('project_history'):
+            self._project(project_id)
+            return [dict(row) for row in self.connection.execute(
+                "SELECT * FROM audit WHERE sequence>? AND ((entity_type='project' AND entity_id=?) "
+                "OR (entity_type IN ('task','milestone','deadline') AND "
+                "COALESCE(json_extract(after_json,'$.project_id'),json_extract(before_json,'$.project_id'))=?)) "
+                "ORDER BY sequence LIMIT ?", (after or 0, project_id, project_id, limit))]
+
     @_command
     def create_project(self, project_id, title, *, request_id, actor):
         _id(project_id, 'project_id')
@@ -319,6 +336,15 @@ class Ledger:
             raise LedgerError('REVISION_CONFLICT', 'create_project', 'project_id')
         self.connection.execute('INSERT INTO projects VALUES(?,?,1,?)', (project_id, title, self._now()))
         return self._project(project_id), 'project', project_id, None
+
+    @_command
+    def edit_project(self, project_id, *, title, expected_revision, reason, request_id, actor):
+        before = self._project(project_id)
+        self._check_revision(before, expected_revision)
+        _text(title, 'title')
+        self.connection.execute('UPDATE projects SET title=? WHERE project_id=?', (title, project_id))
+        self._bump(project_id)
+        return self._project(project_id), 'project', project_id, before
 
     def _check_revision(self, record, expected):
         if record['revision'] != expected:
@@ -577,6 +603,30 @@ class Ledger:
         if not row:
             raise LedgerError('NOT_FOUND', 'read', 'milestone_id')
         return {**dict(row), 'tasks': [list(r) for r in self.connection.execute('SELECT board_id,task_id FROM milestone_tasks WHERE milestone_id=? ORDER BY board_id,task_id', (milestone_id,))]}
+
+    def get_milestone(self, milestone_id):
+        with self._transaction('get_milestone'):
+            return self._milestone(milestone_id)
+
+    def list_milestones(self, project_id, limit=100, after=None):
+        _integer(limit, 'limit', 1, 500)
+        if after is not None:
+            _id(after, 'after')
+        with self._transaction('list_milestones'):
+            self._project(project_id)
+            keys = self.connection.execute(
+                'SELECT milestone_id FROM milestones WHERE project_id=? AND milestone_id>? ORDER BY milestone_id LIMIT ?',
+                (project_id, after or '', limit)).fetchall()
+            return [self._milestone(row[0]) for row in keys]
+
+    @_command
+    def edit_milestone(self, milestone_id, *, title, expected_revision, reason, request_id, actor):
+        before = self._milestone(milestone_id)
+        self._check_revision(self._project(before['project_id']), expected_revision)
+        _text(title, 'title')
+        self.connection.execute('UPDATE milestones SET title=? WHERE milestone_id=?', (title, milestone_id))
+        self._bump(before['project_id'])
+        return self._milestone(milestone_id), 'milestone', milestone_id, before
 
     @_command
     def create_milestone(self, milestone_id, *, project_id, title, request_id, actor):

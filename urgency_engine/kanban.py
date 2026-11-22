@@ -330,7 +330,7 @@ class Sync:
     def put(self, key, value):
         self.db.execute('INSERT INTO sync_meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json', (key, _json(value)))
 
-    def page(self, project_id, limit=100, after=None, *, cfg=None):
+    def page(self, project_id, limit=100, after=None, *, cfg=None, with_graph=False) -> dict:
         _id(project_id, 'project_id')
         _integer(limit, 'limit', 1, 500)
         if after is None:
@@ -352,6 +352,7 @@ class Sync:
             parameters = [value for b in bindings for value in (b['board'], b['tenant'])]
         with self.transaction(False):
             rows = self.db.execute('SELECT projection_json FROM sources WHERE project_id=? AND (board_id,task_id)>(?,?)' + scope + ' ORDER BY board_id,task_id LIMIT ?', (project_id, *key, *parameters, limit + 1)).fetchall()
+            graph = self._desktop_graph(cfg, project_id, scope, parameters) if with_graph else None
         items = [json.loads(r[0]) for r in rows[:limit]]
         if cfg is not None:
             for item in items:
@@ -361,7 +362,42 @@ class Sync:
                     item['coverage'] = 'unknown'
         more = len(rows) > limit
         after = _json([items[-1]['board_id'], items[-1]['task_id']]).encode().hex() if more else None
-        return dict(items=items, has_more=more, next=after)
+        page: dict = dict(items=items, has_more=more, next=after)
+        if graph is not None:
+            page['graph'] = graph
+        return page
+
+    def _desktop_graph(self, cfg, project_id, scope, parameters):
+        # Called in the same read snapshot as the displayed page. A retained
+        # projection alone is not proof that every binding was inventoried.
+        unknown = dict(items=[], reason='source_incomplete')
+        if not cfg or not cfg['kanban_sync_enabled'] or not parameters:
+            return dict(items=[], reason='source_unbound')
+        if (self.meta('paused') or self.meta('incomplete_scan') or self.meta('dirty_bindings')
+                or self.meta('cursor') or self.meta('last_error')
+                or self.meta('desktop_complete_scope') != hashlib.sha256(_json(cfg).encode()).hexdigest()
+                or (self.meta('last_result') or {}).get('state') != 'complete'):
+            return unknown
+        now = self.clock()
+        def fresh(value):
+            return bool(value) and 0 <= (now - datetime.fromisoformat(value)).total_seconds() <= cfg['kanban_sync_seconds']
+        if not fresh(self.meta('last_success')):
+            return dict(items=[], reason='source_stale')
+        items, edges = [], 0
+        for row in self.db.execute("SELECT board_id,task_id,observed_at,coverage,"
+                                   "source_digest=applied_digest AS applied,json_extract(projection_json,'$.parents') AS parents "
+                                   'FROM sources WHERE project_id=?' + scope + ' ORDER BY board_id,task_id LIMIT ?',
+                                   (project_id, *parameters, cfg['kanban_max_tasks'] + 1)):
+            if len(items) >= cfg['kanban_max_tasks'] or row['coverage'] == 'unknown' or not row['applied']:
+                return unknown
+            if not fresh(row['observed_at']):
+                return dict(items=[], reason='source_stale')
+            parents = json.loads(row['parents'])
+            edges += len(parents)
+            if edges > 50000:
+                return unknown
+            items.append(dict(board_id=row['board_id'], task_id=row['task_id'], parents=parents))
+        return dict(items=items, reason=None)
 
     def action_scope(self, binding, task_id, source, max_age):
         """Require fresh unchanged facts and complete retained dependency coverage."""
@@ -533,12 +569,15 @@ class Sync:
                     fail('duplicate_task')
                 seen.add(key)
             inventories.append((binding, rows))
-        for row in self.db.execute('SELECT board_id,task_id FROM sources').fetchall():
-            if (row['board_id'], row['task_id']) not in seen:
-                self.mark_unknown((row['board_id'], row['task_id']), 'SOURCE_ABSENT')
+        retained = {(r['board_id'], r['task_id']): (r['tenant'], r['project_id'])
+                    for r in self.db.execute('SELECT board_id,task_id,tenant,project_id FROM sources')}
+        for key in retained:
+            if key not in seen:
+                self.mark_unknown(key, 'SOURCE_ABSENT')
         plans = []
         batch_bytes = 0
         detail_deadline = monotonic() + 20
+        prefix_covered = True
 
         def apply_collected():
             nonlocal batch_bytes
@@ -562,6 +601,9 @@ class Sync:
                 task_id = _id(row.get('id'), 'task_id')
                 position = [binding['board'], binding['tenant'], task_id]
                 if cursor and position <= cursor:
+                    # A fresh inventory can insert a task behind a resumed cursor.
+                    # Traversing the remaining tail does not prove we saw that task.
+                    prefix_covered &= retained.get((binding['board'], task_id)) == (binding['tenant'], binding['project_id'])
                     continue
                 key = binding['board'], task_id
                 try:
@@ -634,6 +676,7 @@ class Sync:
         self.admit_graph(cfg, monitor, seen, ledger_path)
         with self.transaction():
             self.put('cursor', None)
+            self.put('desktop_complete_scope', hashlib.sha256(_json(cfg).encode()).hexdigest() if prefix_covered else None)
         return dict(state='complete', count=count)
 
     def admit_graph(self, cfg, monitor, inventory, ledger_path):

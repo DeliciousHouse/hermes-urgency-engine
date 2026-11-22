@@ -14,15 +14,21 @@ concurrency:
 
 jobs:
   forecast:
-    name: Forecast (${{ matrix.os }}, Python ${{ matrix.python }})
+    name: ${{ matrix.name || format('Forecast ({0}, Python {1})', matrix.os, matrix.python) }}
     runs-on: ${{ matrix.os }}
-    # Includes the 10000-source disk-backed restart/reconciliation journey.
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        python: ['3.11', '3.14']
+        # Both Windows versions retain the full suite across two disjoint jobs.
+        # The original Windows check names belong to the aggregate gates below.
+        include:
+          - {os: ubuntu-latest, python: '3.11', partition: all}
+          - {os: ubuntu-latest, python: '3.14', partition: all}
+          - {os: windows-latest, python: '3.11', partition: fast, name: 'Forecast remainder (windows-latest, Python 3.11)'}
+          - {os: windows-latest, python: '3.11', partition: slow, name: 'Forecast restart (windows-latest, Python 3.11)'}
+          - {os: windows-latest, python: '3.14', partition: fast, name: 'Forecast remainder (windows-latest, Python 3.14)'}
+          - {os: windows-latest, python: '3.14', partition: slow, name: 'Forecast restart (windows-latest, Python 3.14)'}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -32,10 +38,46 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Run forecast, ledger and runtime regressions
+        run: python tests/run_suite.py --partition ${{ matrix.partition }}
+
+  forecast-windows-gate:
+    name: Forecast (windows-latest, Python ${{ matrix.python }})
+    needs: [forecast]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.14']
+    steps:
+      - name: Require all forecast jobs, including both partitions on each Windows version
+        env:
+          FORECAST_RESULT: ${{ needs.forecast.result }}
+        run: test "$FORECAST_RESULT" = success
+
+  desktop-ui:
+    name: Desktop renderer (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Run renderer module-boundary tests
+        # The harness refuses any import other than the official SDK, react and
+        # react/jsx-runtime, so a forbidden dependency fails here.
         run: >-
-          python -c "import unittest;
-          result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.discover('tests'));
-          raise SystemExit(not (result.wasSuccessful() and result.testsRun and not result.skipped))"
+          node --experimental-vm-modules --test-reporter=spec
+          --test tests/desktop.test.mjs
 
   native:
     name: ${{ matrix.name }}
@@ -79,7 +121,8 @@ jobs:
           .host/.venv/bin/python .host/hermes plugins doctor "$RUNNER_TEMP/plugin" --ci
           .host/.venv/bin/python .host/hermes plugins validate "$RUNNER_TEMP/plugin" --install-deps
           .host/.venv/bin/python "$RUNNER_TEMP/plugin/tests/host_runtime.py" --hermes-root "$GITHUB_WORKSPACE/.host"
-      - name: Install exact public revision and exercise installed lifecycle and tutorial
+          .host/.venv/bin/python "$RUNNER_TEMP/plugin/tests/host_desktop.py"
+      - name: Install exact public revision and exercise lifecycle, tutorial and Desktop REST
         # Exercise capability-positive or explicit-unknown facts on each host.
         env:
           PLUGIN_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -119,3 +162,18 @@ jobs:
           cp "$scratch/home/config.yaml" "$interventions_home/config.yaml"
           "${clean[@]}" timeout 8m "$python" "$RUNNER_TEMP/plugin/tests/host_interventions.py" \
             --hermes-root "$host" --installed-home "$interventions_home"
+          # Start with no Ledger state and keep the installer-produced enablement
+          # for the first mount. No source archive or copied install is used here.
+          desktop_home="$scratch/desktop-home"
+          mkdir "$desktop_home"
+          "${clean[@]}" HERMES_HOME="$desktop_home" timeout 6m "$python" "$host/hermes" plugins install \
+            DeliciousHouse/hermes-urgency-engine --ref "$PLUGIN_SHA" --yes-deps --enable </dev/null
+          desktop_installed="$desktop_home/plugins/hermes-urgency-engine"
+          test "$("${clean[@]}" git -C "$desktop_installed" rev-parse HEAD)" = "$PLUGIN_SHA"
+          desktop_status=$("${clean[@]}" git -C "$desktop_installed" status --porcelain)
+          test -z "$desktop_status"
+          "${clean[@]}" HERMES_HOME="$desktop_home" timeout 2m "$python" \
+            "$desktop_installed/tests/host_desktop.py" --installed
+          desktop_status=$("${clean[@]}" git -C "$desktop_installed" status --porcelain)
+          test -z "$desktop_status"
+          printf 'Public install Desktop REST passed at %s\n' "$PLUGIN_SHA"
