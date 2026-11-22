@@ -200,7 +200,9 @@ commitment.
 
 1. Add a milestone, then open **Edit milestone membership**.
 2. Name the milestone, list its member tasks one `board_id/task_id` per line, and give
-   a reason.
+   a reason. Only the first `/` splits a line, so a task id may contain one. A line
+   that does not name both halves is refused by name before anything is sent, rather
+   than guessed at.
 3. Save, then return to Commitments. A milestone-scoped deadline now measures exactly
    those tasks, so binding work that cannot finish in time raises the urgency level
    while leaving the committed target untouched.

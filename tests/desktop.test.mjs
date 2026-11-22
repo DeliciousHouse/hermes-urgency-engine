@@ -284,6 +284,9 @@ test('milestone control creates and edits membership through named commands', as
   create = api.MilestoneForm(createProps);
   create.props.onSubmit({preventDefault() {}});
   await new Promise(resolve => setImmediate(resolve));
+  // The sent payload is built inside the vm realm, so deepStrictEqual rejects a
+  // structurally identical object on prototype identity alone. Comparing the
+  // serialized value still checks every key and value.
   assert.equal(sent[0][0], 'create_milestone');
   assert.deepEqual(JSON.parse(JSON.stringify(sent[0][1])), {milestone_id: 'm1', project_id: 'proj-alpha', title: 'Beta ready'});
   mount();
@@ -378,4 +381,43 @@ test('the command form announces a failure as an alert and explains reconcile', 
   assert.match(text, /lost reply/);
   assert.match(text, /Reconcile same request/);
   assert.match(text, /resends the identical request/i);
+});
+
+// protects=operator-typed task references; fails_when=a line without a separator is
+// silently split into a wrong board/task pair; why_new=membership is the only control
+// that parses free text; seam=SDK module boundary; no_claim=not Ledger validation.
+test('member task lines must name a board and a task, or the form refuses', async () => {
+  const {api} = await load();
+  assert.deepEqual(JSON.parse(JSON.stringify(api.memberTasks('b1/t1\n  b1/t2  \n\n'))),
+    {tasks: [['b1', 't1'], ['b1', 't2']], rejected: []});
+  // A task id may contain a separator; only the first one splits.
+  assert.deepEqual(JSON.parse(JSON.stringify(api.memberTasks('b1/group/t3'))),
+    {tasks: [['b1', 'group/t3']], rejected: []});
+  const bad = api.memberTasks('b1t1\nb1/\n/t2');
+  assert.deepEqual(JSON.parse(JSON.stringify(bad.tasks)), []);
+  assert.deepEqual(JSON.parse(JSON.stringify(bad.rejected)), ['b1t1', 'b1/', '/t2']);
+});
+
+test('membership refuses to send when a line is unparseable', async () => {
+  const {api, reset} = await load();
+  const sent = [];
+  const props = {sender: {send: async (op, args) => {sent.push([op, args]); return args;}},
+    milestoneId: 'm1', projectRevision: 2, onSaved() {}, disabled: false};
+  let tree = api.MembershipForm(props);
+  const field = (function find(node) {
+    if (Array.isArray(node)) {for (const item of node) {const hit = find(item); if (hit) return hit;}  return null;}
+    if (!node || typeof node !== 'object') return null;
+    if (node.type === 'label' && String(node.props.children[0]).startsWith('Member tasks')) return node.props.children[1];
+    return find(node.props?.children);
+  })(tree);
+  field.props.onChange({target: {value: 'b1t1'}});
+  reset();
+  tree = api.MembershipForm(props);
+  tree.props.onSubmit({preventDefault() {}});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(sent.length, 0, 'an unparseable line must not reach the backend');
+  reset();
+  const text = JSON.stringify(api.MembershipForm(props));
+  assert.match(text, /b1t1/);
+  assert.match(text, /board_id\/task_id/);
 });

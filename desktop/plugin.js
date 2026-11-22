@@ -167,7 +167,7 @@ export function commandFailure(error) {
 // One audited command path for every control: the submitted revision is the one
 // the draft began on, an unknown outcome is retained rather than resent, and no
 // form can name an actor or an authorization.
-export function CommandForm({sender, title, submitLabel, fields, base, build, onSaved, disabled, preamble}) {
+export function CommandForm({sender, title, submitLabel, fields, base, build, onSaved, disabled, preamble, validate}) {
   const [pinned, setPinned] = useState(base);
   const [draft, setDraft] = useState(() => Object.fromEntries(fields.map(field =>
     [field.name, field.initial ? field.initial(base) : base?.[field.name] ?? (field.options ? field.options[0][0] : '')])));
@@ -178,6 +178,10 @@ export function CommandForm({sender, title, submitLabel, fields, base, build, on
   const set = (name, value) => setDraft(current => ({...current, [name]: value}));
   async function submit(reconcile = false) {
     if (lock.current || disabled) return;
+    // Named inline before anything is sent, so a misread field never becomes a
+    // backend error the operator has to decode.
+    const invalid = reconcile ? null : validate?.(draft);
+    if (invalid) {setSaved(''); setFailure({headline: invalid, detail: null}); return;}
     lock.current = true; setPending(true);
     try {
       const [operation, args] = build(draft, pinned);
@@ -269,6 +273,20 @@ export function MilestoneForm({sender, projectId, projectRevision, milestone, on
       : ['create_milestone', {milestone_id: draft.milestone_id, project_id: projectId, title: draft.title}]});
 }
 
+// Only the first separator splits, because a task id may itself contain one.
+// A line that does not name both halves is reported back, never guessed at: an
+// absent separator would otherwise silently become a wrong board/task pair.
+export function memberTasks(text) {
+  const tasks = [];
+  const rejected = [];
+  for (const line of String(text ?? '').split('\n').map(entry => entry.trim()).filter(Boolean)) {
+    const at = line.indexOf('/');
+    if (at <= 0 || at === line.length - 1) rejected.push(line);
+    else tasks.push([line.slice(0, at), line.slice(at + 1)]);
+  }
+  return {tasks, rejected};
+}
+
 export function MembershipForm({sender, milestoneId, projectRevision, onSaved, disabled}) {
   return CommandForm({sender, onSaved, disabled,
     base: {milestone_id: milestoneId, revision: projectRevision},
@@ -276,9 +294,14 @@ export function MembershipForm({sender, milestoneId, projectRevision, onSaved, d
     fields: [{name: 'tasks', label: 'Member tasks, one board/task per line', multiline: true,
       maxLength: 65536, required: false, initial: () => ''},
       {name: 'reason', label: 'Reason for the change'}],
+    validate: draft => {
+      const {rejected} = memberTasks(draft.tasks);
+      return rejected.length
+        ? `Write each member task as board_id/task_id. Not understood: ${rejected.join(', ')}`
+        : null;
+    },
     build: (draft, pinned) => ['set_milestone_tasks', {milestone_id: pinned.milestone_id,
-      tasks: String(draft.tasks).split('\n').map(line => line.trim()).filter(Boolean)
-        .map(line => [line.slice(0, line.indexOf('/')), line.slice(line.indexOf('/') + 1)]),
+      tasks: memberTasks(draft.tasks).tasks,
       expected_revision: pinned.revision, reason: draft.reason}]});
 }
 
