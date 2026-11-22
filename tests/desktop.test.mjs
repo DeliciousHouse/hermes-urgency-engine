@@ -46,6 +46,54 @@ async function load(overrides = {}) {
   return {api: source.namespace, sdk, navigate, requests, reset, mount};
 }
 
+// protects=observed execution, not inferred uptime; fails_when=bars extend to now;
+// why_new=native execution timeline; seam=SDK module boundary; no_claim=host pixels.
+test('execution timeline ends open runs at last observation and exposes exact dependencies', async () => {
+  const {api} = await load();
+  const selected = [];
+  const nodes = (tree, predicate) => {
+    if (Array.isArray(tree)) return tree.flatMap(n => nodes(n, predicate));
+    if (!tree || typeof tree !== 'object') return [];
+    return [...(predicate(tree) ? [tree] : []), ...nodes(tree.props?.children, predicate)];
+  };
+  const item = {board_id: 'b', task_id: 'work', title: 'Work', parents: ['parent'],
+    status: 'running', observed_at: '2030-01-01T03:00:00Z', stale: true, coverage: 'unknown',
+    worker: {run_id: 3, state: 'running', started_at: '2030-01-01T01:00:00Z',
+      heartbeat_at: '2030-01-01T02:00:00Z', ended_at: null}};
+  const tree = expand(api.ExecutionTimeline({items: [item], start: '2030-01-01T00:00:00Z',
+    end: '2030-01-02T00:00:00Z', now: '2030-01-01T20:00:00Z', onSelect: value => selected.push(value)}));
+  const bars = nodes(tree, node => node.props?.['aria-label']?.startsWith('Observed execution:'));
+  assert.equal(bars.length, 1);
+  assert.ok(Math.abs(Number.parseFloat(bars[0].props.style.width) - 100 / 24) < 1e-9);
+  assert.match(JSON.stringify(tree), /stale/);
+  assert.match(JSON.stringify(tree), /b\/parent/);
+  bars[0].props.onClick();
+  assert.equal(selected[0], item);
+  const unknown = expand(api.ExecutionTimeline({items: [{...item, worker: {}}],
+    start: '2030-01-01T00:00:00Z', end: '2030-01-02T00:00:00Z', now: '2030-01-01T20:00:00Z', onSelect() {}}));
+  assert.equal(nodes(unknown, n => n.props?.['aria-label']?.startsWith('Observed execution:')).length, 0);
+  assert.match(JSON.stringify(unknown), /Execution timing unknown/);
+});
+
+test('source execution is reachable with range controls and task inspection', async () => {
+  const item = {board_id: 'b', task_id: 'work', title: 'Work', status: 'running', parents: ['parent'], worker: {run_id: 3}};
+  const {api, reset} = await load({sdk: {useQuery: () => ({data: {items: [item]}})}});
+  const props = {ctx: {}, scope: {}, sender: {}, project: {project_id: 'a', observed_at: '2030-01-01T00:00:00Z'}};
+  let tree = api.ProjectDetail(props);
+  tree.props.children.find(n => n?.type?.name === 'DetailTabs').props.onTab('source-tasks');
+  reset(); tree = api.ProjectDetail(props);
+  const tab = tree.props.children.find(n => n?.type?.name === 'DetailTabs').props.children;
+  const timeline = tab.props.children.find(n => n?.type?.name === 'TimelineView');
+  assert.ok(timeline, 'source tab must mount execution timeline');
+  assert.equal(timeline.props.sourceTasks[0], item);
+  timeline.props.onSelect(item);
+  reset(); tree = api.ProjectDetail(props);
+  assert.match(JSON.stringify(tree), /Selected canonical task/);
+  const rendered = expand(api.TimelineView({...timeline.props, sourceTasks: [item]}));
+  assert.match(JSON.stringify(rendered), /Observed task execution/);
+  assert.match(JSON.stringify(rendered), /Zoom in/);
+});
+
 function expand(node) {
   if (Array.isArray(node)) return node.map(expand);
   if (!node || typeof node !== 'object') return node;

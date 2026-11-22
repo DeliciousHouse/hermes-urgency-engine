@@ -131,8 +131,16 @@ invalidated receipts are not shown as current evidence. The criteria editor
 uses a labelled JSON array, preloaded with the complete current criteria. Replacing
 criteria invalidates previous verification; it cannot mark work complete. Record
 original scope creates the immutable weighted baseline once, with a required reason.
-Source tasks separately shows canonical dependencies and the latest recorded run's
-start/end/heartbeat with source freshness. A missing end does not establish completion.
+Source tasks shows a paged execution timeline using the latest canonical run's
+start and end, or its last heartbeat when no end is known. The bar never advances
+to the present merely because the task says running. A bar establishes only the
+interval between recorded observations, not continuous activity or verified work.
+Unknown timing has no bar; stale source rows remain explicitly stale. Canonical
+board/task dependency IDs appear beside each row. Select a label or bar to inspect
+the task, then open Verified work for acceptance evidence. Range presets, zoom,
+Earlier/Later and **Fit observed runs** affect only the loaded page's axis. Runs
+outside that range have an explicit notice. The complete source table preserves
+exact start/end/heartbeat values; a missing end does not establish completion.
 Interventions uses the actual requested/observed effect and attribution fields;
 matching requested and observed values alone never implies an attributed effect.
 
@@ -507,8 +515,10 @@ recovery controls or completion of the sixteen-scenario acceptance matrix.
 - **Portfolio coordination covers loaded pages only.** Shared assignments and
   same-day targets do not establish actual resource overload. The full dependency
   graph and capacity-aware planning overlay are still unfinished.
-- **Task intervals, dependencies, blocked periods and critical path are reported as
-  `null`,** not computed. The timeline is commitment-based; the task read model
-  deliberately returns explicit nulls rather than invented execution periods.
+- **The Ledger task timeline still reports execution/dependency/blocked-period
+  fields as `null`.** The separate Source tasks view draws canonical current-run
+  observations and lists dependency IDs, not a full historical graph. Blocked
+  intervals and critical-path analysis remain unfinished. No elapsed interval
+  or source status earns progress credit.
 - **Recovery-card creation remains unavailable** (`CAPABILITY_UNAVAILABLE`) because
   the installed host exposes no supported route for it.

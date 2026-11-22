@@ -511,6 +511,36 @@ export function RecordList({query, empty, columns, row, onMore}) {
       children: 'Next records'}) : jsx('p', {className: 'ue-note', children: 'End of recorded page.'})]});
 }
 
+export function ExecutionTimeline({items, start, end, now, onSelect}) {
+  const left = Date.parse(start), right = Date.parse(end);
+  const position = value => Math.max(0, Math.min(100, 100 * (Date.parse(value) - left) / (right - left)));
+  return jsxs('section', {'aria-label': 'Observed task execution', children: [
+    jsx('p', {children: 'Solid bar: recorded run start to end or last heartbeat, not continuous activity or verified delivery. Missing intervals stay unknown. Dependencies use canonical board/task IDs; this page is not a complete critical path.'}),
+    jsx('div', {className: 'ue-scroll', tabIndex: 0, 'aria-label': 'Execution timeline, scroll horizontally', children:
+      jsxs('div', {style: {minWidth: 720}, children: [
+        jsxs('div', {className: 'ue-toolbar', children: [date(start), ' to ', date(end), ' · Now: ', date(now)]}),
+        ...items.map(item => {
+          const worker = item.worker || {};
+          const finish = worker.ended_at || worker.heartbeat_at;
+          const valid = Number.isFinite(Date.parse(worker.started_at)) && Number.isFinite(Date.parse(finish))
+            && Date.parse(finish) >= Date.parse(worker.started_at);
+          const visible = valid && Date.parse(finish) >= left && Date.parse(worker.started_at) <= right;
+          return jsxs('div', {style: {display: 'grid', gridTemplateColumns: '180px 1fr', minHeight: 100,
+            borderBottom: '1px solid var(--ui-stroke-secondary)'}, children: [
+            jsx(Button, {style: {position: 'sticky', left: 0, zIndex: 1, background: 'var(--ui-bg)', overflowWrap: 'anywhere'},
+              onClick: () => onSelect(item), children: `${item.board_id}/${item.task_id} · ${item.title}`}),
+            jsxs('div', {children: [jsx('div', {style: {position: 'relative', height: 44}, children: visible
+              ? jsx('button', {type: 'button', 'aria-label': `Observed execution: ${date(worker.started_at)} to ${date(finish)}`,
+                title: `Run ${worker.run_id}: ${date(worker.started_at)} to ${date(finish)}`,
+                onClick: () => onSelect(item), style: {position: 'absolute', left: `${position(worker.started_at)}%`,
+                  width: `${position(finish) - position(worker.started_at)}%`, height: 44,
+                  background: 'var(--ui-accent)', border: '1px solid var(--ui-text-primary)'}, children: ''})
+              : jsx('span', {children: valid ? 'Recorded interval outside this range' : 'Execution timing unknown'})}),
+              jsx('div', {children: `${item.status} · ${item.stale ? 'stale' : 'observed'} ${date(item.observed_at)}`}),
+              jsx('div', {children: `Depends on: ${item.parents?.map(id => `${item.board_id}/${id}`).join(', ') || 'None recorded'}`})]})]}, JSON.stringify([item.board_id, item.task_id]));
+        })]})})]});
+}
+
 export function Timeline({commitments, start, end, now, onSelect}) {
   const left = Date.parse(start), width = Date.parse(end) - left;
   const position = value => Math.max(0, Math.min(100, 100 * (Date.parse(value) - left) / width));
@@ -544,15 +574,16 @@ const styles = `.ue {font:inherit;color:var(--ui-text-primary);padding:20px;over
 @media(max-width:640px){.ue{padding:12px}.ue th,.ue td{padding-right:12px}.ue dl{grid-template-columns:1fr}.ue dd{margin-bottom:8px}}`;
 
 const RANGES = [[6, '6 hours'], [24, '24 hours'], [168, '7 days'], [720, '30 days'], [2160, '90 days']];
-export function TimelineView({commitments, now, onSelect}) {
+export function TimelineView({commitments = [], sourceTasks, now, onSelect}) {
   const [hours, setHours] = useState(168);
   const [center, setCenter] = useState(null);
   const anchor = center ?? Date.parse(now);
   const span = hours * 3600000;
   const zoom = factor => setHours(value => Math.max(1, Math.min(8784, value * factor)));
   function fit() {
-    const times = commitments.flatMap(item => [item.original_at, item.target_at,
-      item.forecast_at, item.actual_verified_at]).map(Date.parse).filter(Number.isFinite);
+    const times = (sourceTasks ? sourceTasks.flatMap(item => [item.worker?.started_at,
+      item.worker?.ended_at, item.worker?.heartbeat_at]) : commitments.flatMap(item => [item.original_at, item.target_at,
+      item.forecast_at, item.actual_verified_at])).map(Date.parse).filter(Number.isFinite);
     if (!times.length) {setCenter(null); setHours(168); return;}
     const first = Math.min(...times), last = Math.max(...times);
     setCenter((first + last) / 2);
@@ -567,8 +598,8 @@ export function TimelineView({commitments, now, onSelect}) {
         jsx(Button, {onClick: () => zoom(2), children: 'Zoom out'}),
         jsx(Button, {onClick: () => setCenter(anchor - span / 2), children: 'Earlier'}),
         jsx(Button, {onClick: () => setCenter(anchor + span / 2), children: 'Later'}),
-        jsx(Button, {onClick: fit, children: 'Fit commitments'})]})]}),
-    jsx(Timeline, {commitments, now, onSelect, start: new Date(anchor - span / 2).toISOString(),
+        jsx(Button, {onClick: fit, children: sourceTasks ? 'Fit observed runs' : 'Fit commitments'})]})]}),
+    jsx(sourceTasks ? ExecutionTimeline : Timeline, {commitments, items: sourceTasks, now, onSelect, start: new Date(anchor - span / 2).toISOString(),
       end: new Date(anchor + span / 2).toISOString()})]});
 }
 const seconds = value => value === null || value === undefined ? 'Unknown'
@@ -617,6 +648,7 @@ export function ProjectDetail({ctx, scope, sender, project, disabled, onSaved}) 
   const [inspected, setInspected] = useState(null);
   const [cursor, setCursor] = useState(null);
   const [milestone, setMilestone] = useState(null);
+  const [sourceTask, setSourceTask] = useState(null);
   const base = `/projects/${encodeURIComponent(project.project_id)}`;
   // One hook, one scoped key per tab: switching tabs reads the selected surface
   // and never renders another tab's rows.
@@ -625,11 +657,22 @@ export function ProjectDetail({ctx, scope, sender, project, disabled, onSaved}) 
   const commitments = tab === 'commitments' && records.data?.items
     ? records.data.items : cursor ? [] : project.commitments || [];
   const chosen = commitments.find(item => item.deadline_id === inspected) || null;
+  const selectedSource = tab === 'source-tasks' && records.data?.items?.find(item =>
+    JSON.stringify([item.board_id, item.task_id]) === sourceTask);
   const tabs = {
     scope: () => jsx(TaskScope, {ctx, scope, sender, project, disabled, onSaved}, project.project_id),
     milestones: () => jsx(RecordList, {query: records, empty: 'No milestones recorded.', onMore: setCursor,
       columns: ['Milestone', 'Name', 'Revision'], row: item => [item.milestone_id, item.title, item.revision]}),
     'source-tasks': () => jsxs('section', {children: [
+      jsx(TimelineView, {sourceTasks: records.data?.items || [], now: project.observed_at,
+        onSelect: item => setSourceTask(JSON.stringify([item.board_id, item.task_id]))}),
+      selectedSource && jsxs('section', {children: [jsx('h3', {children: 'Selected canonical task'}),
+        jsx('p', {children: `${selectedSource.board_id}/${selectedSource.task_id} · ${selectedSource.title}`}),
+        jsxs('dl', {children: [jsx('dt', {children: 'Assigned agent'}), jsx('dd', {children: selectedSource.assignee || 'Unassigned'}),
+          jsx('dt', {children: 'Recorded state'}), jsx('dd', {children: selectedSource.status}),
+          jsx('dt', {children: 'Current run'}), jsx('dd', {children: selectedSource.worker?.run_id ?? 'Unknown'}),
+          jsx('dt', {children: 'Dependency IDs'}), jsx('dd', {children: selectedSource.parents?.map(id => `${selectedSource.board_id}/${id}`).join(', ') || 'None recorded'})]}),
+        jsx(Button, {onClick: () => setTab('scope'), children: 'Inspect acceptance evidence in Verified work'})]}),
       jsx('p', {className: 'ue-note', children: records.data
         ? `Canonical sync cadence ${records.data.sync_seconds}s, distinct from this page's 10s read. Sync health: ${JSON.stringify(records.data.sync_health)}`
         : 'Reading canonical source coverage…'}),
