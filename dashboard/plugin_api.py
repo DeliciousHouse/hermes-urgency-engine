@@ -58,7 +58,7 @@ def read_view(action):
             raise
         import sqlite3
         storage = _ledger.Ledger(sqlite3.connect(':memory:'), clock=clock, artifact_root=path.parent)
-    with storage as ledger:
+    with storage as ledger, scoped_runtime().forecast_scope(ledger):
         return action(_desktop.Views(ledger, clock=clock))
 
 

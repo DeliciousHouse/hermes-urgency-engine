@@ -347,9 +347,7 @@ class Sync:
         scope, parameters = '', []
         if cfg is not None:
             cfg = settings(cfg)
-            bindings = [b for b in cfg['kanban_bindings'] if b['project_id'] == project_id]
-            scope = ' AND (' + (' OR '.join('(board_id=? AND tenant=?)' for _ in bindings) or '0') + ')'
-            parameters = [value for b in bindings for value in (b['board'], b['tenant'])]
+            scope, parameters = self._project_scope(cfg, project_id)
         with self.transaction(False):
             rows = self.db.execute('SELECT projection_json FROM sources WHERE project_id=? AND (board_id,task_id)>(?,?)' + scope + ' ORDER BY board_id,task_id LIMIT ?', (project_id, *key, *parameters, limit + 1)).fetchall()
             graph = self._desktop_graph(cfg, project_id, scope, parameters) if with_graph else None
@@ -367,7 +365,21 @@ class Sync:
             page['graph'] = graph
         return page
 
-    def _desktop_graph(self, cfg, project_id, scope, parameters):
+    @staticmethod
+    def _project_scope(cfg, project_id):
+        bindings = [b for b in cfg['kanban_bindings'] if b['project_id'] == project_id]
+        scope = ' AND (' + (' OR '.join('(board_id=? AND tenant=?)' for _ in bindings) or '0') + ')'
+        return scope, [value for b in bindings for value in (b['board'], b['tenant'])]
+
+    def forecast_graph(self, cfg, project_id, now):
+        scope, parameters = self._project_scope(cfg, project_id)
+        with self.transaction(False):
+            if not parameters and not self.db.execute(
+                    'SELECT 1 FROM sources WHERE project_id=? LIMIT 1', (project_id,)).fetchone():
+                return None  # Standalone Ledger, not a withdrawn synced project.
+            return self._desktop_graph(cfg, project_id, scope, parameters, now=now)
+
+    def _desktop_graph(self, cfg, project_id, scope, parameters, *, now=None):
         # Called in the same read snapshot as the displayed page. A retained
         # projection alone is not proof that every binding was inventoried.
         unknown = dict(items=[], reason='source_incomplete')
@@ -378,7 +390,7 @@ class Sync:
                 or self.meta('desktop_complete_scope') != hashlib.sha256(_json(cfg).encode()).hexdigest()
                 or (self.meta('last_result') or {}).get('state') != 'complete'):
             return unknown
-        now = self.clock()
+        now = self.clock() if now is None else now
         def fresh(value):
             return bool(value) and 0 <= (now - datetime.fromisoformat(value)).total_seconds() <= cfg['kanban_sync_seconds']
         if not fresh(self.meta('last_success')):

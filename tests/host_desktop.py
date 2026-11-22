@@ -19,7 +19,7 @@ PLUGIN_CONFIG = {'enabled': [PLUGIN], 'isolation': 'in_process'}
 
 
 def child():
-    from datetime import datetime, timezone
+    from datetime import datetime, timedelta, timezone
     from inspect import getfile
     import sqlite3
     from fastapi.testclient import TestClient
@@ -117,7 +117,8 @@ def child():
     # route are real. A page of one must still explain a two-task dependency path.
     from urgency_engine.kanban import Sync, settings
     binding = dict(board='board', tenant='synthetic', project_id='synthetic')
-    source_settings = dict(kanban_sync_enabled=True, kanban_bindings=[binding])
+    source_settings = dict(kanban_sync_enabled=True, kanban_bindings=[binding], forecast_capacity={
+        'synthetic': dict(slots=2, observed_at=datetime.now(timezone.utc).isoformat())})
     config = get_hermes_home() / 'config.yaml'
     # JSON is valid YAML; let the pinned host load it with its own parser.
     config.write_text(json.dumps({'plugins': {
@@ -125,24 +126,49 @@ def child():
     }}), encoding='utf-8')
 
     class SyntheticSource:
+        edge = False
+
         def inventory(self, binding):
             return [dict(id=task, tenant=binding['tenant']) for task in ('prepare', 'task')]
 
         def detail(self, binding, task_id):
             return dict(task=dict(id=task_id, tenant=binding['tenant'], title=task_id, status='todo'),
-                        parents=['prepare'] if task_id == 'task' else [])
+                        parents=['prepare'] if task_id == 'task' and self.edge else [])
 
     def now():
         return datetime.now(timezone.utc)
 
+    source = SyntheticSource()
     with Ledger(sqlite3.connect(root / 'data.db'), clock=now, artifact_root=root) as ledger, \
             Sync(sqlite3.connect(root / 'kanban.db'), clock=now, redact=str) as sync:
-        assert sync.scan(settings(source_settings), ledger, None, root / 'data.db', SyntheticSource(),
+        assert sync.scan(settings(source_settings), ledger, None, root / 'data.db', source,
                          request_id='source-scan', reason='Synthetic graph')['state'] == 'complete'
         for task, duration in [('prepare', 1800), ('task', 3600)]:
             ledger.upsert_task('board', task, project_id='synthetic', goal=task, remaining_seconds=duration,
                                expected_revision=ledger.get_task('board', task)['revision'],
                                reason='Estimate', request_id='estimate-' + task, actor='operator')
+        target = (now() + timedelta(seconds=4500)).isoformat()
+        ledger.set_deadline('delivery', project_id='synthetic', kind='soft', at=target, timezone='UTC',
+                            owner='Synthetic', source='Fixture', request_id='delivery', actor='operator')
+
+        # protects=authenticated REST risk; fails_when=only the bound changes;
+        # no_claim=Electron rendering or actual execution capacity.
+        def commitment(work):
+            response = client.get(url + '/projects/synthetic/commitments', headers=headers)
+            assert response.status_code == 200, (response.status_code, response.text)
+            item, = response.json()['data']['items']
+            assert (item['original_at'], item['target_at']) == (target, target)
+            assert item['input']['remaining_seconds'] == work, item['input']
+            assert item['input']['schedule']['method'] == 'operator_declared_capacity'
+            return item['forecast']
+
+        before = commitment(3600)
+        source.edge = True
+        assert sync.scan(settings(source_settings), ledger, None, root / 'data.db', source,
+                         request_id='source-edge', reason='Synthetic edge')['state'] == 'complete'
+        after = commitment(5400)
+        assert before['effective_slack_seconds'] > 0 > after['effective_slack_seconds']
+        assert before['raw_level'] < after['raw_level']
     source_url = url + '/projects/synthetic/source-tasks'
     assert client.get(source_url).status_code == 401
     source_page = client.get(source_url, params={'limit': 1}, headers=headers)

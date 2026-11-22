@@ -17,7 +17,7 @@ Track whether a task has enough time left for work, verification, and deployment
 
 ## Know the limits
 
-A matching artifact hash is evidence of bytes, not independent acceptance. The dependency-only lower bound and potential contention indicators are not an authoritative dependency- or capacity-aware forecast. The watchdog records incidents and recommends next steps; it does not perform autonomous recovery. Supported supervised actions are bounded to priority, remaining-work estimates, and soft-target revisions. External task-system integrations such as GitHub Issues and YouTrack are not included.
+A matching artifact hash is evidence of bytes, not independent acceptance. Bound project and milestone forecasts use fresh canonical dependencies and [operator-declared execution capacity](docs/ledger.md#how-to-configure-a-synced-commitment-forecast); the dependency-only lower bound remains a separate diagnostic. The watchdog records incidents and recommends next steps; it does not perform autonomous recovery. Supported supervised actions are bounded to priority, remaining-work estimates, and soft-target revisions. External task-system integrations such as GitHub Issues and YouTrack are not included.
 
 ## Contribute
 
