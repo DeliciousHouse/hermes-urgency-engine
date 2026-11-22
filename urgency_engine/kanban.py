@@ -374,7 +374,7 @@ class Sync:
     def forecast_graph(self, cfg, project_id, now):
         scope, parameters = self._project_scope(cfg, project_id)
         with self.transaction(False):
-            if not parameters and not cfg['kanban_sync_enabled'] and not self.db.execute(
+            if not parameters and not self.db.execute(
                     'SELECT 1 FROM sources WHERE project_id=? LIMIT 1', (project_id,)).fetchone():
                 return None  # Standalone Ledger, not a withdrawn synced project.
             return self._desktop_graph(cfg, project_id, scope, parameters, now=now)
