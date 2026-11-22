@@ -57,9 +57,42 @@ All reads use a consistent transaction and write nothing.
 - `history`: audit rows ordered by `sequence`, strictly after the optional integer cursor. Limit is 1–500. `entity_type` is `project`, `task`, `milestone` or `deadline`; task entity IDs are compact JSON arrays such as `["demo-board","demo-task"]`. Other entity IDs are their plain IDs. `before_json` and `after_json` are JSON strings. History includes successful commands only.
 - `project_history`: the same audit row shape and sequence cursor, combining project, task, milestone and deadline changes for one project. Membership comes from recorded before/after snapshots, not arbitrary caller IDs. Successful commands only; limit 1–500.
 - `progress`: `{project_id, baseline_weight, current_weight, verified_weight, percent, state, unscoped_task_count, last_verified_progress_at, revision}`. No baseline yields `baseline_weight=null`. No active criteria or any unscoped task yields `percent=null`, `state='insufficient_evidence'`; otherwise state is `determinate`. Progress is the weighted fraction of active criterion revisions with accepted, uninvalidated matching evidence. A missing required criterion prevents 100%, even if floating-point rounding would conceal its weight. `last_verified_progress_at` is historical: reopening invalidates credit without erasing the last accepted-evidence time.
-- `explain_deadline`: deadline columns plus `forecast`, `forecast_at`, nullable `actual_verified_at`, `baseline_variance_seconds`, `target_variance_seconds`, `input`, and `input_revisions`. Variance is actual verified completion minus the respective date when all scoped tasks have verified completion; otherwise it is projected completion minus that date. Positive means late. `forecast_at` is clock + summed stored work/buffers, not an empirical percentile. Work/buffers include every scoped task exactly once; callers update estimates explicitly. An empty scope has no actual completion. `input_revisions` records deadline/project revisions and `[board_id,task_id,revision]` tuples; `input` records aggregate seconds and evaluation time.
+- `explain_deadline`: deadline columns plus `forecast`, `forecast_at`, nullable `actual_verified_at`, `baseline_variance_seconds`, `target_variance_seconds`, `input`, and `input_revisions`. Variance uses verified completion if known, otherwise the forecast. Positive means late. `forecast_at` is clock + forecast work + verification and deployment buffers, not an empirical percentile. `input_revisions` records deadline/project revisions and `[board_id,task_id,revision]` tuples for known contributors; `input` records seconds and evaluation time.
 
 Forecasts reuse the unchanged [forecast policy](forecast.md#forecast-api), with the stored target and default policy. The latest explicitly stored forecast supplies cooldown state; read-only explanations do not advance it. No completion samples are invented: P50/P90 and on-time probability remain null. Unrepresentable projected dates return a named `INVALID_INPUT` rather than overflowing or inventing a date.
+
+### Synced commitment schedule reference
+
+For project and milestone deadlines, `input.schedule.method` is `operator_declared_capacity`, `unknown`, or `ledger_only`. A scheduled result includes `slots` and `observed_at`; `input.remaining_seconds` is elapsed scheduled work, not total task effort. `ledger_only` retains the estimate sum for a standalone Ledger without canonical source scope. Task deadlines remain task-local and have no schedule field.
+
+An unknown schedule has `forecast_at: null` and a reason: `source_unavailable`, `source_unbound`, `source_incomplete`, `source_stale`, `project_scope_incomplete`, `dependency_outside_project`, `dependency_cycle`, `capacity_unknown`, or `missing_estimates`. Unknown does not establish completion. Where the complete task scope is known, actual verification remains separate from the forecast and uses the latest verified completion across the scope.
+
+### Why the schedule and critical path differ
+
+The [Desktop critical path](desktop.md#dependency-only-critical-path) ignores slot contention. The commitment forecast uses a bounded list scheduler: at each finish time it releases all finished tasks, then assigns the next eligible ready tasks by `(board_id, task_id)`. For a milestone, the schedule includes reachable prerequisites even when they are not milestone members. Execution of unfinished work is followed by the summed verification and deployment buffers, counted once per unfinished contributor. Verified tasks contribute no remaining time. The algorithm gives a repeatable plan, not an optimized schedule, cross-project slot allocation, observed worker availability, or permission to dispatch.
+
+### How to configure a synced commitment forecast
+
+1. Complete a [Kanban sync](runtime.md) for the project and provide estimates for unfinished contributing tasks. The schedule needs complete, fresh retained coverage, matching canonical and Ledger tasks, and dependencies resolvable within the current project and board. The graph uses the configured task cap (at most 10,000) and a 50,000-edge cap.
+2. Under `plugins.entries.hermes-urgency-engine.settings`, set `forecast_capacity` for the Ledger project ID. Each entry has exactly `slots` (integer 1–64) and `observed_at` (UTC timestamp ending in `Z` or `+00:00`). The map accepts up to 32 projects and defaults to empty. For example, a two-slot declaration in a fixture clocked to January 1, 2030 is:
+
+   ```yaml
+   forecast_capacity:
+     example-project:
+       slots: 2
+       observed_at: '2030-01-01T00:00:00Z'
+   ```
+
+   On a real host, declare only slots currently available and eligible for that project. Use the actual observation time; the declaration expires after `kanban_sync_seconds` and a future timestamp is refused. Agent names do not provide a slot count. Refresh the declaration when capacity changes or you can observe it again.
+3. Run `hermes urgency explain DEADLINE` and inspect `input.schedule` and `forecast_at`. Desktop commitments and explicit forecast snapshots use the same forecast. For an unknown result, resolve the reason and rerun: refresh incomplete or stale source coverage, fix scope or dependencies at the source, add missing estimates, or refresh the capacity declaration. The target and original commitment are never changed by a forecast read.
+
+To see the effect without changing a host configuration, run this synthetic example from the checkout root:
+
+```sh
+python -m unittest discover -s tests -p test_kanban_reconciliation.py -k dependency_changes_authoritative -v
+```
+
+It exercises two tasks of 3,600 s and 1,800 s against a target 4,500 s away. With two slots, one added dependency moves the forecast from 3,600 s to 5,400 s and slack from +900 s to −900 s. With one slot, both forecasts take 5,400 s. The example asserts dates, risk, snapshots and guidance; it does not measure real worker capacity.
 
 ### Mutation signatures
 

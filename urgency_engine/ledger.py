@@ -160,6 +160,8 @@ class Ledger:
         _integer(busy_timeout_ms, 'busy_timeout_ms', 0, 5000)
         self.busy_timeout_ms = busy_timeout_ms
         self.connection, self.clock = connection, clock
+        self.forecast_evidence: Any = None
+        self.forecast_now = None
         if connection.in_transaction:
             _invalid('connection')
         try:
@@ -703,6 +705,89 @@ class Ledger:
         self._bump(before['project_id'])
         return self._deadline(deadline_id), 'deadline', deadline_id, before
 
+    def _schedule_input(self, deadline, tasks, now):
+        """Join complete canonical inventory to Ledger without exposing graph IDs."""
+        from graphlib import CycleError, TopologicalSorter
+        from .schedule import MAX_EDGES, MAX_NODES, schedule
+
+        standalone = dict(schedule={'method': 'ledger_only'})
+        if not callable(self.forecast_evidence):
+            return standalone
+        try:
+            evidence = self.forecast_evidence(deadline['project_id'], now)
+        except Exception:
+            evidence = {'reason': 'source_unavailable'}
+        if evidence is None:
+            return standalone
+        def unknown(reason, *, contributors=(), actual=None):
+            return dict(schedule={'method': 'unknown', 'reason': reason}, contributors=contributors,
+                        work=None, verification=0, deployment=0, actual=actual)
+        if not isinstance(evidence, dict):
+            return unknown('source_unavailable')
+        reason = evidence.get('reason')
+        if reason is not None:
+            allowed = {'source_unavailable', 'source_unbound', 'source_incomplete', 'source_stale',
+                       'capacity_unknown', 'project_scope_incomplete'}
+            return unknown(reason if isinstance(reason, str) and reason in allowed else 'source_unavailable')
+        items = evidence.get('items')
+        if not isinstance(items, list) or len(items) > MAX_NODES:
+            return unknown('source_incomplete')
+        graph = {}
+        edges = 0
+        for row in items:
+            if not isinstance(row, dict):
+                return unknown('source_incomplete')
+            board, task, deps = row.get('board_id'), row.get('task_id'), row.get('parents')
+            if not isinstance(board, str) or not isinstance(task, str) or not isinstance(deps, list):
+                return unknown('source_incomplete')
+            edges += len(deps)
+            if edges > MAX_EDGES or (board, task) in graph:
+                return unknown('source_incomplete')
+            if not all(isinstance(dep, str) for dep in deps) or len(set(deps)) != len(deps):
+                return unknown('source_incomplete')
+            graph[(board, task)] = [(board, parent) for parent in deps]
+        project_tasks = tasks if deadline['board_id'] is None and deadline['milestone_id'] is None else [dict(row) for row in self.connection.execute(
+            'SELECT * FROM tasks WHERE project_id=? ORDER BY board_id,task_id LIMIT ?', (deadline['project_id'], MAX_NODES + 1))]
+        ledger_rows = {(t['board_id'], t['task_id']): t for t in project_tasks}
+        if len(project_tasks) > MAX_NODES or set(graph) != set(ledger_rows):
+            return unknown('project_scope_incomplete')
+        if any(parent not in graph for deps in graph.values() for parent in deps):
+            return unknown('dependency_outside_project')
+        try:
+            TopologicalSorter(graph).prepare()
+        except CycleError:
+            return unknown('dependency_cycle')
+        members = {(t['board_id'], t['task_id']) for t in tasks}
+        if not members or not members <= set(graph):
+            return unknown('project_scope_incomplete')
+        closure, pending = set(), list(members)
+        while pending:
+            key = pending.pop()
+            if key not in closure:
+                closure.add(key)
+                pending.extend(graph[key])
+        actual = (max(ledger_rows[key]['actual_verified_at'] for key in closure)
+                  if all(ledger_rows[key]['actual_verified_at'] for key in closure) else None)
+        contributors = [ledger_rows[key] for key in sorted(closure)]
+        slots, observed = evidence.get('slots'), evidence.get('observed_at')
+        try:
+            observed_time = datetime.fromisoformat(observed.replace('Z', '+00:00')) if isinstance(observed, str) else None
+            if observed_time is None or observed_time.utcoffset() is None:
+                raise ValueError
+        except (ValueError, OverflowError):
+            return unknown('capacity_unknown', contributors=contributors, actual=actual)
+        if type(slots) is not int or not 1 <= slots <= 64:
+            return unknown('capacity_unknown', contributors=contributors, actual=actual)
+        unfinished = [row for row in contributors if not row['actual_verified_at']]
+        if any(not t.get('remaining_known', 1) for t in unfinished):
+            return unknown('missing_estimates', contributors=contributors, actual=actual)
+        durations = {key: (0 if ledger_rows[key]['actual_verified_at'] else ledger_rows[key]['remaining_seconds']) for key in closure}
+        work = schedule({key: graph[key] for key in closure}, durations, slots)
+        return dict(schedule={'method': 'operator_declared_capacity', 'reason': None,
+                              'slots': slots, 'observed_at': observed}, contributors=contributors, actual=actual,
+                    work=work, verification=math.fsum(t['verification_seconds'] for t in unfinished),
+                    deployment=math.fsum(t['deployment_seconds'] for t in unfinished))
+
     def _explain(self, deadline_id):
         from dataclasses import asdict
         from datetime import timedelta
@@ -716,11 +801,19 @@ class Ledger:
         elif deadline['milestone_id'] is not None:
             condition += ' AND EXISTS(SELECT 1 FROM milestone_tasks m WHERE m.milestone_id=? AND m.board_id=tasks.board_id AND m.task_id=tasks.task_id)'
             parameters.append(deadline['milestone_id'])
-        tasks = [dict(row) for row in self.connection.execute('SELECT * FROM tasks WHERE ' + condition + ' ORDER BY board_id,task_id', parameters)]
+        tasks = [dict(row) for row in self.connection.execute('SELECT * FROM tasks WHERE ' + condition + ' ORDER BY board_id,task_id LIMIT 10001', parameters)]
         work, verification, deployment = [math.fsum(t[field] for t in tasks) for field in ('remaining_seconds', 'verification_seconds', 'deployment_seconds')]
         if not tasks or any(not t.get('remaining_known', 1) for t in tasks):
             work = None
         now = datetime.fromisoformat(self._now())
+        schedule_input = None
+        if deadline['board_id'] is None:
+            now = self.forecast_now or now
+            schedule_input = self._schedule_input(deadline, tasks, now)
+            if 'work' in schedule_input:
+                work = schedule_input['work']
+                verification = schedule_input['verification']
+                deployment = schedule_input['deployment']
         previous_row = self.connection.execute("SELECT payload_json FROM snapshots WHERE project_id=? AND kind='forecast' AND json_extract(payload_json,'$.deadline_id')=? ORDER BY snapshot_id DESC LIMIT 1", (deadline['project_id'], deadline_id)).fetchone()
         previous = None
         if previous_row:
@@ -735,14 +828,20 @@ class Ledger:
         forecast['level'], forecast['raw_level'] = int(forecast['level']), int(forecast['raw_level'])
         forecast['reasons'] = list(forecast['reasons'])
         actual = max(t['actual_verified_at'] for t in tasks) if tasks and all(t['actual_verified_at'] for t in tasks) else None
+        if schedule_input is not None and 'actual' in schedule_input:
+            actual = schedule_input['actual']
         comparison = datetime.fromisoformat(actual) if actual else projected
+        input_data = dict(remaining_seconds=work, verification_seconds=verification, deployment_seconds=deployment, now=now.isoformat())
+        if schedule_input is not None:
+            input_data['schedule'] = schedule_input['schedule']
+        revision_tasks = tasks if schedule_input is None else schedule_input.get('contributors', tasks)
         return {**deadline, 'forecast': forecast, 'forecast_at': projected.isoformat() if projected else None,
                 'actual_verified_at': actual,
                 'baseline_variance_seconds': (comparison - datetime.fromisoformat(deadline['original_at'])).total_seconds() if comparison else None,
                 'target_variance_seconds': (comparison - datetime.fromisoformat(deadline['target_at'])).total_seconds() if comparison else None,
                 'input_revisions': {'deadline': deadline['revision'], 'project': self._project(deadline['project_id'])['revision'],
-                                    'tasks': [[t['board_id'], t['task_id'], t['revision']] for t in tasks]},
-                'input': dict(remaining_seconds=work, verification_seconds=verification, deployment_seconds=deployment, now=now.isoformat())}
+                                    'tasks': [[t['board_id'], t['task_id'], t['revision']] for t in revision_tasks]},
+                'input': input_data}
 
     def explain_deadline(self, deadline_id):
         with self._transaction('explain_deadline'):

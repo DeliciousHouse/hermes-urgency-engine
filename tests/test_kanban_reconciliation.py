@@ -82,6 +82,9 @@ class ReconciliationTests(unittest.TestCase):
             def get_config(self, key, default):
                 return config.get(key, default)
 
+            def redact_text(self, text, *, force):
+                return text
+
         runtime = Runtime(Context(), clock=lambda: self.now, data_dir=lambda: self.root)
         self.assertEqual(self.scan('independent')['state'], 'complete')
         members = [[board, 'second'], [board, 'task']]
@@ -120,6 +123,60 @@ class ReconciliationTests(unittest.TestCase):
             self.assertEqual(row['forecast_at'], (self.now + timedelta(seconds=seconds)).isoformat())
             self.assertEqual(row['forecast']['effective_slack_seconds'], slack)
         self.assertLess(independent['forecast']['raw_level'], dependent['forecast']['raw_level'])
+
+        # The Desktop domain view, native guidance and a durable snapshot use
+        # the same result. Source is synthetic, not a pinned host or Electron.
+        config['forecast_capacity'][project]['slots'] = 2
+        config['default_project'] = project
+        with runtime.forecast_scope(self.ledger):
+            desktop = Views(self.ledger, clock=lambda: self.now).project(project)['commitments'][0]
+            snapshot = self.ledger.snapshot_forecast('d', expected_revision=1, reason='Evidence',
+                                                     request_id='forecast', actor='operator')
+        for key in ('forecast_at', 'forecast', 'input', 'original_at', 'target_at'):
+            self.assertEqual(desktop[key], dependent[key])
+            self.assertEqual(snapshot[key], dependent[key])
+        guidance = runtime.pre_llm_call()
+        guidance_deadline, = [json.loads(line.removeprefix('Deadline: '))
+                              for line in guidance['context'].splitlines() if line.startswith('Deadline: ')]
+        self.assertEqual(guidance_deadline['input'], dependent['input'])
+
+        # Verified scope and previously snapshotted hysteresis are not changed
+        # by an improved raw forecast.
+        edge = False
+        self.assertEqual(self.scan('independent-again')['state'], 'complete')
+        improving = observed(2, 3600)
+        self.assertEqual(improving['forecast']['raw_level'], independent['forecast']['raw_level'])
+        self.assertEqual(improving['forecast']['level'], dependent['forecast']['level'])
+
+        # A stale capacity declaration stays stale even after a fresh scan.
+        self.now += timedelta(seconds=61)
+        def unknown(reason):
+            result = runtime.run_request('explain', {'deadline_id': 'd'}, surface='cli')
+            self.assertTrue(result['ok'], result)
+            row = result['data']
+            self.assertIsNone(row['forecast_at'])
+            self.assertEqual(row['input']['schedule'], dict(method='unknown', reason=reason))
+            self.assertEqual((row['original_at'], row['target_at']), (target, target))
+
+        unknown('source_stale')
+        self.assertEqual(self.scan('fresh-source')['state'], 'complete')
+        unknown('capacity_unknown')
+        config['forecast_capacity'][project]['observed_at'] = self.now.isoformat()
+        self.assertEqual(observed(2, 3600)['input']['remaining_seconds'], 3600)
+        with runtime.forecast_scope(self.ledger):
+            # Commit a Sync invalidation after the forecast reader records its
+            # version, then restore apparent coverage before the Ledger read.
+            with self.sync.transaction():
+                self.sync.put('incomplete_scan', 'concurrent')
+            with self.sync.transaction():
+                self.sync.put('incomplete_scan', None)
+            self.assertEqual(self.ledger.explain_deadline('d')['input']['schedule']['reason'], 'source_incomplete')
+        with self.sync.transaction():
+            self.sync.put('dirty_bindings', [BINDING])
+        unknown('source_incomplete')
+
+        config.update(kanban_sync_enabled=False, kanban_bindings=[])
+        unknown('source_unbound')
 
     def test_desktop_graph_requires_a_fresh_complete_scan_for_the_current_binding(self):
         """Real scan and retained store; no native board I/O or live-state claim."""

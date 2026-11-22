@@ -205,8 +205,9 @@ slipping forecast is visible as a `◇` to the right of `◆`, and the `◆` sta
 a human moves it. Hard deadlines additionally refuse an automatic revision outright,
 so nothing in the engine can extend an external commitment.
 
-A forecast is absent, not optimistic, when any contributing task has no remaining
-estimate. The page prints `Unknown` rather than inventing a bar endpoint.
+A forecast is absent when required estimates or synced schedule inputs are unknown.
+The page prints `Unknown` rather than inventing a bar endpoint. See the
+[forecast setup and explanation](ledger.md#how-to-configure-a-synced-commitment-forecast).
 
 ### Dependency-only critical path
 
@@ -215,9 +216,9 @@ estimates. Independent branches can overlap in this calculation. They may not ov
 in a real schedule if they share an agent, so the number is **not** a finish date,
 capacity estimate, or replacement for the commitment forecast. It does not add
 verification, deployment, waiting time, or inferred future blocker durations.
-Changing a dependency edge can move this bound past a target without changing
-the Ledger's authoritative forecast, urgency, or committed dates. Changing
-milestone membership is different: it changes which work the milestone forecast counts.
+The commitment forecast uses the same retained source evidence but schedules work
+under a declared slot limit, includes buffers, and respects existing urgency
+hysteresis. An edge can therefore change raw risk without changing committed dates.
 
 The read requires fresh, complete retained source coverage for the current binding,
 exact canonical and Ledger task membership, known durations, and an acyclic graph
@@ -522,7 +523,7 @@ and is not satisfied by this table.**
 | 6 | Hard deadlines never move automatically | `test_desktop_acceptance.py::test_case_6_hard_deadline_never_moves_automatically` | Automated |
 | 7 | Soft deadlines retain original baselines | `test_desktop_views.py::test_commitments_expose_independent_forecasts_and_preserved_targets`; a prior native fixture revised a soft target and read back the unchanged original | Automated plus scoped native observation |
 | 8 | Forecasts update without changing commitments | same test (`forecast_at` moves, `target_at` does not, no snapshot is written) | Automated |
-| 9 | A canonical dependency edit changes schedule risk | `test_desktop_acceptance.py::test_case_9_canonical_edge_changes_bound_not_authoritative_forecast`: one parent edge through Sync raises the dependency-only bound from 3,600 s to 5,400 s against a 4,500 s target. Task estimates, urgency (level 4), forecast and target stay fixed. | Desktop lower bound verified in a synthetic fixture; **authoritative risk change NOT MET**, pending dependency- and resource-aware forecasting |
+| 9 | A canonical dependency edit changes schedule risk | `test_kanban_reconciliation.py::test_dependency_changes_authoritative_milestone_forecast_only_with_parallel_capacity`: with two declared slots, one parent edge moves the forecast from +3,600 s to +5,400 s and changes raw risk against the unchanged +4,500 s target. With one slot both forecasts are +5,400 s. The lower bound remains separate. | Synthetic Sync/Ledger/Views and mounted REST checks; independent Electron retest not established by these tests |
 | 10 | Escalation changes the displayed urgency level | `test_desktop_acceptance.py::test_case_10_escalation_changes_the_displayed_urgency_level` | Automated |
 | 11 | Long-running work represented accurately | `test_desktop_acceptance.py::test_case_11_long_running_and_unestimated_work_is_not_invented`; prior native runs ended bars at the retained end or heartbeat, with no invented bar for an untimed task | Automated plus scoped native observation |
 | 12 | Live updates recover after disconnection | `desktop.test.mjs` rejects results from a changed activation epoch; prior native run showed the disconnected status | **Live reconnect with populated readback still pending** |

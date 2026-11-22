@@ -450,7 +450,9 @@ class Monitor:
                     cursor=self.meta('cursor'), next_due=self.meta('next_due'), coverage=self.meta('coverage', 'not_observed'),
                     emission='unknown_after_commit', limitations=LIMITATIONS)
 
-    def tick(self, ledger_path, cfg, force=False):
+    def tick(self, ledger_path, cfg, force=False, *, forecast_scope=None):
+        from contextlib import nullcontext
+
         cfg = settings(cfg)
         now, started = self.clock(), time.monotonic()
         stamp(now)
@@ -475,7 +477,9 @@ class Monitor:
                 self.put('generation', generation + 1)
             return {**empty, 'reason': 'ledger_uninitialized'}
         # All source I/O precedes the monitor write lock.
-        with open_readonly_ledger(ledger_path, clock=self.clock, deadline=started + 25) as ledger, ledger._transaction('watchdog_sources'):
+        with (open_readonly_ledger(ledger_path, clock=self.clock, deadline=started + 25) as ledger,
+              forecast_scope(ledger, deadline=started + 25) if forecast_scope else nullcontext(),
+              ledger._transaction('watchdog_sources')):
             db = ledger.connection
             deadline_cursor = self.meta('deadline_cursor', '')
             deadlines = [dict(r) for r in db.execute('SELECT * FROM deadlines WHERE deadline_id>? ORDER BY deadline_id LIMIT 501', (deadline_cursor,))]

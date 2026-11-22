@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import re
 import shlex
 import sqlite3
 import sys
@@ -306,7 +308,11 @@ class Runtime:
                     storage = Ledger(sqlite3.connect(':memory:'), clock=self.clock,
                                      artifact_root=Path(__file__).resolve().parent)
             with storage as ledger:
-                if operation in MUTATIONS:
+                if operation in ('explain', 'snapshot_forecast'):
+                    with self.forecast_scope(ledger):
+                        data = (self.mutate(ledger, operation, arguments) if operation in MUTATIONS else
+                                {**ledger.explain_deadline(**arguments), **EVIDENCE})
+                elif operation in MUTATIONS:
                     data = self.mutate(ledger, operation, arguments)
                 elif operation == 'status':
                     project_id = arguments.get('project_id')
@@ -323,8 +329,6 @@ class Runtime:
                             'has_more': has_more, 'next': projects[-1]['project_id'] if projects and has_more else None}
                 elif operation == 'task':
                     data = {**ledger.get_task(**arguments), **EVIDENCE}
-                elif operation == 'explain':
-                    data = {**ledger.explain_deadline(**arguments), **EVIDENCE}
                 elif operation == 'history':
                     items = ledger.history(**arguments)
                     has_more = bool(items and ledger.history(arguments['entity_type'], arguments['entity_id'], 1, items[-1]['sequence']))
@@ -584,6 +588,63 @@ class Runtime:
     def kanban_config(self):
         return kanban_settings({key: self.ctx.get_config(key, default) for key, default in KANBAN_DEFAULTS.items()})
 
+    @contextmanager
+    def forecast_scope(self, ledger, *, deadline=None):
+        """Read one bounded canonical projection at a time, without touching the host board."""
+        previous = ledger.forecast_evidence, ledger.forecast_now
+        unknown = {'reason': 'source_unavailable'}
+        connection = None
+        graphs = {}
+        version = None
+        try:
+            try:
+                cfg = self.kanban_config()
+                capacity = self.ctx.get_config('forecast_capacity', {})
+                path = self.data_dir() / 'kanban.db'
+                if path.exists():
+                    connection = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=.1)
+                    if deadline is not None:
+                        connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+                    sync = Sync(connection, clock=self.clock, redact=None, readonly=True)
+                    version = connection.execute('PRAGMA data_version').fetchone()[0]
+                    ledger.forecast_now = datetime.fromisoformat(ledger._now())
+                else:
+                    sync = None
+
+                def evidence(project_id, now):
+                    if sync is None or connection is None:
+                        bound = any(b['project_id'] == project_id for b in cfg['kanban_bindings'])
+                        return unknown if bound or cfg['kanban_sync_enabled'] or path.exists() else None
+                    if (project_id, now) not in graphs:
+                        graphs.clear()
+                        graphs[project_id, now] = sync.forecast_graph(cfg, project_id, now)
+                    graph = graphs[project_id, now]
+                    if connection.execute('PRAGMA data_version').fetchone()[0] != version:
+                        return {'reason': 'source_incomplete'}
+                    if graph is None or graph['reason']:
+                        return graph
+                    item = capacity.get(project_id) if isinstance(capacity, dict) and len(capacity) <= 32 else None
+                    if not isinstance(item, dict) or set(item) != {'slots', 'observed_at'}:
+                        return graph
+                    stamp = item['observed_at']
+                    if not isinstance(stamp, str) or not re.fullmatch(
+                            r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|\+00:00)', stamp):
+                        return graph
+                    try:
+                        age = (now - datetime.fromisoformat(stamp.replace('Z', '+00:00'))).total_seconds()
+                    except ValueError:
+                        return graph
+                    return {**graph, **item} if 0 <= age <= cfg['kanban_sync_seconds'] else graph
+
+                ledger.forecast_evidence = evidence
+            except (LedgerError, OSError, sqlite3.Error):
+                ledger.forecast_evidence = lambda project_id, now: unknown
+            yield
+        finally:
+            ledger.forecast_evidence, ledger.forecast_now = previous
+            if connection is not None:
+                connection.close()
+
     def kanban_snapshot(self, board, task_id):
         from .kanban import fail, project, _id
         cfg = self.kanban_config()
@@ -734,7 +795,8 @@ class Runtime:
                             return 0
                         data = self.due_source_sync(monitor)
                         if data is None:
-                            data = monitor.tick(self.data_dir() / 'data.db', cfg, args.force)
+                            data = monitor.tick(self.data_dir() / 'data.db', cfg, args.force,
+                                                forecast_scope=self.forecast_scope)
                         if not data['notices']:
                             return 0
                         # Records retain full details; one bounded summary goes to cron.
@@ -1024,7 +1086,8 @@ class Runtime:
                     raise LedgerError('CONTEXT_BUDGET', 'context', next_action='Use hermes urgency explain for an individual deadline.')
 
             check_budget()
-            with open_readonly_ledger(self.data_dir() / 'data.db', clock=self.clock, deadline=stop_at) as ledger:
+            with (open_readonly_ledger(self.data_dir() / 'data.db', clock=self.clock, deadline=stop_at) as ledger,
+                  self.forecast_scope(ledger, deadline=stop_at)):
                 project = ledger.get_project(project_id)
                 progress = ledger.progress(project_id)
                 deadlines, after = [], None

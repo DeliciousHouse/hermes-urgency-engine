@@ -35,6 +35,10 @@ config_schema:
     type: int
     default: 10000
     description: Maximum source inventory tasks, 1 to 10000; excess is refused without claiming full coverage
+  forecast_capacity:
+    type: object
+    default: {}
+    description: Optional project-keyed declarations of available eligible slots and UTC observed_at; no inferred capacity
   context_enabled:
     type: bool
     default: true
