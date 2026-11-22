@@ -63,6 +63,10 @@ class ReconciliationTests(unittest.TestCase):
         """
         from urgency_engine.desktop import Views
         from urgency_engine.runtime import Runtime
+        from test_ledger import fixture_zones, TZPATH, reset_tzpath, ZoneInfo
+
+        fixture_zones(self.root)
+        self.addCleanup(lambda: (reset_tzpath(TZPATH), ZoneInfo.clear_cache()))
 
         board, project = BINDING['board'], BINDING['project_id']
         self.source.rows.append(dict(id='second', tenant=BINDING['tenant']))
