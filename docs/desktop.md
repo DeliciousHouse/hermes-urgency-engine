@@ -24,6 +24,7 @@ payload cannot choose a database or claim a permission. Responses are
 
 | Route | Query | Returns |
 |---|---|---|
+| `GET /identity` | — | `scope_id`: opaque 32-character namespace, or `null` before explicit initialization; never creates storage |
 | `GET /portfolio` | `limit` (1-500, default 100), `after` | `items` (one project summary each), `next`, `has_more`, `observed_at`, `coverage` |
 | `GET /projects/{project_id}` | — | project, `progress`, `commitments`, `commitments_has_more`, `urgency`, `risk_coverage`, `observed_at`, `coverage` |
 | `GET /projects/{project_id}/commitments` | `limit`, `after` (deadline ID) | paged deadline explanations, `has_more`, `next`, `project_revision`, `observed_at` |
@@ -41,8 +42,17 @@ stable code. An unexpected failure is 500 carrying a `diagnostic_id` and no trac
 
 ### Write route
 
-`POST /commands` takes exactly `{"request_id", "operation", "arguments"}` and refuses
-any extra field. The body is bounded by the host's `MAX_INPUT_BYTES` and refused
+`POST /identity` explicitly initializes an opaque profile namespace in the plugin's
+`desktop.db` metadata store and returns the same identity on later calls. It uses
+the host authentication, operator-only and stop fences; no worker gains permission.
+It accepts no domain arguments and changes no Ledger data.
+
+`POST /commands` takes `{"request_id", "operation", "arguments"}` with an optional
+`scope_id` (32 lowercase hexadecimal characters); all other envelope fields are
+refused. The renderer includes the namespace and the backend compares it with the
+current authenticated profile before opening the Ledger writer. A mismatch is
+`SOURCE_DENIED` with field `scope_id`. This is a routing safeguard, not authority.
+The body is bounded by the host's `MAX_INPUT_BYTES` and refused
 before an oversized chunk is retained. The allowlist is exactly:
 
 | Operation | Required arguments | Revision checked against |
@@ -202,6 +212,10 @@ the config entry are separate switches.
 
 Verify it is live: the header shows the selected connection and profile, and the
 coverage line shows an `observed_at` timestamp that advances as you watch.
+Before the first edit, choose **Enable command recovery**. This explicit action
+creates only the opaque profile namespace; reading the page never initializes it.
+If initialization is denied, use the existing operator session, not a worker-launched
+backend with its fences removed.
 
 ### Record a hard deadline
 
@@ -273,9 +287,25 @@ a second effect. Do this:
 
 Project, deadline and milestone-membership edits keep their component identity across
 background revisions. Failed measurement reads disable management controls until a
-successful read. Unknown requests are currently retained only while the page is
-mounted; closing or reloading it loses that in-memory request. Durable request
-recovery across Desktop restarts is not implemented yet.
+successful read. Submitted requests are persisted through the SDK's plugin storage
+before transmission and restored without sending anything after a page reload.
+Inspect **Retained command**, then explicitly choose **Reconcile retained command**.
+The current authenticated route, profile, backend namespace and exact stored payload
+are checked again before replay with the original request ID. Successful readback or
+a structured no-effect refusal clears the record; a scope-identity refusal never
+resolves the outcome in the original scope.
+
+The namespace is not a credential. Known gateway identity and profile must also match,
+so copying a backend store to another known gateway does not permit replay there.
+For a connection without a stable gateway identity, recovery is allowed only within
+the original renderer activation. After switching or restarting, its retained request
+stays unapplied because the route is ambiguous; inspect the original backend via its
+supported CLI rather than guessing a destination. No automatic resend occurs on activation.
+Submitted fields remain in app-level local plugin storage until resolved. Do not
+enter secrets in management fields. Disabling the UI preserves pending records and
+backend metadata; removing Desktop app storage loses those local records, not Ledger
+receipts. There is no cross-window atomic storage lock; use one management window
+per scope. Ledger revisions and request IDs still protect the actual mutations.
 
 ### Act on a risk the page cannot fix
 

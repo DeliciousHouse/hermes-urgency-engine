@@ -43,18 +43,58 @@ export async function canonicalProjects(scope) {
   if (!sameScope(scope)) throw new Error('Connection changed. Reload this view.');
   return payload?.projects || [];
 }
-export function commandSender(ctx, scope) {
-  let retained = null;
+const activationInstance = crypto.randomUUID();
+export function commandSender(ctx, scope, journal = null) {
+  const scopeId = journal?.scopeId;
+  const key = scopeId ? `pending:${scopeId}` : null;
+  let record = key ? ctx.storage.get(key, null) : null;
+  let retained = record?.payload || (record ? {unavailable: true} : null);
   let busy = false;
+  function bindingMatches() {
+    return record?.version === 1 && record.scope_id === scopeId && record.profile === scope.profile
+      && record.connection === scope.connection
+      && (scope.connection !== null || (record.instance === activationInstance && record.epoch === scope.epoch));
+  }
+  function persist() {
+    if (!journal) return;
+    if (!scopeId) throw new Error('Initialize command recovery before editing.');
+    if (!bindingMatches()) throw new Error('Retained scope is ambiguous or different from this scope. Nothing was sent.');
+    if (!retained || retained.scope_id !== scopeId || typeof retained.request_id !== 'string'
+      || !/^[A-Za-z0-9_.:-]{1,128}$/.test(retained.request_id) || typeof retained.operation !== 'string'
+      || !retained.arguments || typeof retained.arguments !== 'object' || Array.isArray(retained.arguments)
+      || Object.keys(retained).sort().join(',') !== 'arguments,operation,request_id,scope_id'
+      || JSON.stringify(retained).length > 65536) throw new Error('Invalid retained payload. Nothing was sent.');
+    const existing = ctx.storage.get(key, null);
+    if (existing && JSON.stringify(existing) !== JSON.stringify(record)) throw new Error('Another retained command exists. Reload before reconciling.');
+    ctx.storage.set(key, record);
+    if (JSON.stringify(ctx.storage.get(key, null)) !== JSON.stringify(record)) throw new Error('Unable to persist command. Nothing was sent.');
+  }
+  function clear() {
+    if (key) {
+      if (JSON.stringify(ctx.storage.get(key, null)) !== JSON.stringify(record)) throw new Error('Stored command changed. Reload before reconciling.');
+      ctx.storage.remove(key);
+      if (ctx.storage.get(key, null) !== null) throw new Error('Unable to clear retained command. Reconcile the same request.');
+    }
+    retained = null; record = null;
+  }
   async function transmit() {
     if (busy) throw new Error('Command already pending');
     if (!sameScope(scope)) throw new Error('Connection changed. Return to the original scope to reconcile.');
     busy = true;
     try {
+      persist();
+      if (journal) {
+        const identity = await scopedRead(ctx, '/identity', scope);
+        if (identity.scope_id !== scopeId) throw new Error('Backend identity changed. Retained request was not sent.');
+        // Re-read after awaiting the network: another window may have changed
+        // storage, or the user may have switched the selected gateway.
+        persist();
+      }
+      if (!sameScope(scope)) throw new Error('Connection changed. Return to the original scope to reconcile.');
       const result = await ctx.rest('/commands', {method: 'POST', body: retained, timeoutMs: 15000});
       if (!sameScope(scope)) throw new Error('Connection changed. Return to the original scope to reconcile.');
       if (!result.ok) throw new Error(JSON.stringify(result));
-      retained = null;
+      clear();
       return result.data;
     } catch (error) {
       // Only the host's structured no-effect receipt releases an intent. A
@@ -62,7 +102,7 @@ export function commandSender(ctx, scope) {
       const message = String(error?.message || '');
       try {
         const envelope = JSON.parse(message.slice(message.indexOf('{')));
-        if (envelope.ok === false && envelope.error?.side_effects === 'none') retained = null;
+        if (envelope.ok === false && envelope.error?.side_effects === 'none' && envelope.error?.field !== 'scope_id') clear();
       } catch { /* An unstructured transport error has an unknown outcome. */ }
       throw error;
     } finally { busy = false; }
@@ -70,14 +110,17 @@ export function commandSender(ctx, scope) {
   return {
     async send(operation, args) {
       if (retained) throw new Error('Reconcile the previous command before submitting another intent.');
-      retained = JSON.parse(JSON.stringify({request_id: crypto.randomUUID(), operation, arguments: args}));
+      retained = JSON.parse(JSON.stringify({request_id: crypto.randomUUID(), operation, arguments: args,
+        ...(journal ? {scope_id: scopeId} : {})}));
+      record = {version: 1, scope_id: scopeId, connection: scope.connection, profile: scope.profile,
+        instance: activationInstance, epoch: scope.epoch, payload: retained};
       return transmit();
     },
     async reconcile() {
       if (!retained) throw new Error('No command to reconcile');
       return transmit();
     },
-    pending: () => retained
+    pending: () => !journal || !retained || bindingMatches() ? retained : {unavailable: true}
   };
 }
 
@@ -218,6 +261,12 @@ export function CommandForm({sender, title, submitLabel, fields, base, build, on
     ...fields.map(field => jsxs('label', {children: [field.label, control(field)]}, field.name)),
     base?.revision !== undefined && base.revision !== pinned?.revision && jsx('p', {role: 'status',
       children: `The record changed (draft revision ${pinned?.revision}, current ${base.revision}). Review current values before keeping your changes.`}),
+    base?.revision !== undefined && base.revision !== pinned?.revision && jsx('div', {className: 'ue-scroll',
+      children: jsxs('table', {children: [jsx('caption', {children: 'Review changed fields before adopting the current revision'}),
+        jsx('thead', {children: jsx('tr', {children: ['Field', 'Your draft', 'Current saved value'].map(label => jsx('th', {scope: 'col', children: label}, label))})}),
+        jsx('tbody', {children: fields.filter(field => field.initial || field.name in base).map(field =>
+          jsxs('tr', {children: [cell(field.label), cell(draft[field.name]),
+            cell(field.initial ? field.initial(base) : base[field.name])]}, field.name))})]})}),
     base?.revision !== undefined && base.revision !== pinned?.revision && jsx(Button, {type: 'button',
       disabled: disabled || pending || !!sender.pending?.(), onClick: () => {
         setPinned(base);
@@ -569,14 +618,53 @@ export function ProjectDetail({ctx, scope, sender, project, disabled, onSaved}) 
         : jsx('p', {children: 'Name a milestone from the Milestones tab to edit its membership.'})]})]});
 }
 
+export function RecoveryControls({ctx, scope, identity, sender, onSaved}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const gateway = useValue(host.state.gateway);
+  const lock = useRef(false);
+  async function act(initialize) {
+    if (lock.current || gateway !== 'open' || !sameScope(scope)) return;
+    lock.current = true; setBusy(true); setError(null);
+    try {
+      if (initialize) {
+        const result = await ctx.rest('/identity', {method: 'POST', timeoutMs: 15000});
+        if (!sameScope(scope)) throw new Error('Connection changed. Read the current scope before continuing.');
+        if (!result.ok) throw new Error(JSON.stringify(result));
+        await identity.refetch();
+      } else {
+        await sender.reconcile();
+        onSaved?.();
+      }
+    } catch (failure) {setError(commandFailure(failure).headline);}
+    finally {lock.current = false; setBusy(false);}
+  }
+  const pending = sender.pending();
+  return jsxs('section', {'aria-label': 'Command recovery', children: [
+    identity.isError && jsx('p', {role: 'alert', children: 'Command recovery identity unavailable. Editing is disabled.'}),
+    identity.data && !identity.data.scope_id && jsxs('div', {children: [
+      jsx('p', {children: 'Enable command recovery before editing. Submitted command fields are retained in this Desktop app until their outcome is confirmed.'}),
+      jsx(Button, {disabled: busy || gateway !== 'open', onClick: () => act(true), children: 'Enable command recovery'})]}),
+    pending && jsxs('div', {children: [
+      jsx('h2', {children: 'Retained command'}),
+      pending.unavailable ? jsx('p', {role: 'alert', children: 'Retained scope is ambiguous or belongs to another gateway/profile. It has not been sent; return to the original scope.'})
+        : jsxs('div', {children: [jsx('p', {children: 'Inspect current state and this exact request before replay. Nothing is sent automatically.'}),
+          jsx('pre', {style: {whiteSpace: 'pre-wrap', overflowWrap: 'anywhere'}, children: JSON.stringify(pending, null, 2)}),
+          jsx(Button, {disabled: busy || gateway !== 'open' || identity.isError,
+            onClick: () => act(false), children: 'Reconcile retained command'})]})]}),
+    error && jsx('p', {role: 'alert', children: error})]});
+}
+
 function Page({ctx}) {
   const scope = useScope();
+  const identity = useRead(ctx, '/identity', scope);
   const senders = useRef(new Map());
-  const key = JSON.stringify(scope);
-  if (!senders.current.has(key)) senders.current.set(key, commandSender(ctx, scope));
-  return jsx(ScopedPage, {ctx, scope, sender: senders.current.get(key)}, key);
+  const key = JSON.stringify([scope, identity.data?.scope_id || null]);
+  if (!senders.current.has(key)) senders.current.set(key,
+    commandSender(ctx, scope, {scopeId: identity.data?.scope_id || null}));
+  return jsx(ScopedPage, {ctx, scope, identity, sender: senders.current.get(key)}, key);
 }
-function ScopedPage({ctx, scope, sender}) {
+function ScopedPage({ctx, scope, identity, sender}) {
   const [selected, setSelected] = useState(null);
   const [after, setAfter] = useState(null);
   const gateway = useValue(host.state.gateway);
@@ -596,11 +684,13 @@ function ScopedPage({ctx, scope, sender}) {
   const inventory = useQuery({queryKey: ['urgency', scope.connection, scope.profile, scope.epoch, 'canonical'],
     queryFn: () => canonicalProjects(scope), retry: false, staleTime: 5000, enabled: !selected && gateway === 'open',
     refetchInterval: state => state.state.error ? 60000 : 30000, refetchIntervalInBackground: false});
+  const writable = gateway === 'open' && !identity.isError && !!identity.data?.scope_id;
   return jsxs('main', {className: 'ue', 'aria-label': 'Urgency Engine', children: [
     jsx('style', {children: styles}), jsx('h1', {children: 'Urgency Engine'}),
     jsx('p', {children: `${connectionLabel(scope.connection, gateway)} / ${scope.profile} · ${gateway}`}),
+    jsx(RecoveryControls, {ctx, scope, identity, sender, onSaved: () => query.refetch()}),
     jsxs('details', {children: [jsx('summary', {children: selected ? 'Edit project' : 'Create project'}),
-      jsx(ProjectEditor, {selected, sender, project: selected ? query.data : null, disabled: gateway !== 'open' || query.isPending || query.isError,
+      jsx(ProjectEditor, {selected, sender, project: selected ? query.data : null, disabled: !writable || query.isPending || query.isError,
         onSaved: () => query.refetch()}, selected || 'new')]}),
     selected && jsx(Button, {onClick: () => setSelected(null), children: 'Back to portfolio'}),
     query.isPending ? jsx('p', {role: 'status', children: 'Loading verified measurements…'}) : null,
@@ -609,7 +699,7 @@ function ScopedPage({ctx, scope, sender}) {
     query.data && jsxs('section', {children: [
       jsx('p', {className: 'ue-note', children: `Observed ${date(query.data.observed_at)} · Coverage: ${query.data.coverage}. Artifact byte identity does not prove semantic acceptance.`}),
       selected ? jsx(ProjectDetail, {ctx, scope, sender, project: query.data,
-        disabled: gateway !== 'open' || query.isError || query.isPending, onSaved: () => query.refetch()}, selected) : jsxs('section', {children: [
+        disabled: !writable || query.isError || query.isPending, onSaved: () => query.refetch()}, selected) : jsxs('section', {children: [
           inventoryNotice(inventory) && jsx('p', {className: 'ue-note', role: 'status', children: inventoryNotice(inventory)}),
           jsx(Portfolio, {rows: mergeInventory(inventory.data, query.data.items,
             {measurementsComplete: !after && !query.data.has_more, canonicalAvailable: !inventory.isError && !inventory.isPending}), onSelect: setSelected}),

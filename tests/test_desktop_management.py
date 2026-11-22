@@ -54,6 +54,17 @@ class ManagementTests(unittest.TestCase):
                 management_command(self.ledger, bad)
         self.assertEqual(len(self.ledger.history('project', 'p')), 2)
 
+    def test_scoped_command_accepts_only_an_opaque_namespace(self):
+        from urgency_engine.desktop import command_arguments
+        payload = dict(operation='edit_project', request_id='scoped', scope_id='a' * 32,
+                       arguments=dict(project_id='p', title='Scoped', expected_revision=1, reason='Rename'))
+        operation, arguments = command_arguments(payload)
+        self.assertEqual(operation, 'edit_project')
+        self.assertNotIn('scope_id', arguments, 'namespace is checked by host, never passed as actor')
+        for value in (None, '', 'path/to/home', 123, 'a' * 33):
+            with self.subTest(value=value), self.assertRaises(LedgerError):
+                command_arguments({**payload, 'scope_id': value})
+
     def test_scope_control_payloads_use_real_ledger_replay_and_baseline(self):
         """protects=renderer scope payload compatibility; seam=real adapter/store;
         no_claim=installed form input; supplements the renderer's exact field test.

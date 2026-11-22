@@ -34,6 +34,18 @@ def child():
     url = '/api/plugins/' + PLUGIN
     assert client.get(url + '/portfolio').status_code == 401
     headers = {'X-Hermes-Session-Token': server._SESSION_TOKEN}
+    assert client.get(url + '/identity').status_code == 401
+    identity = client.get(url + '/identity', headers=headers)
+    assert identity.status_code == 200, (identity.status_code, identity.text)
+    assert identity.json()['data']['scope_id'] is None
+    assert not (root / 'desktop.db').exists()
+    assert client.post(url + '/identity').status_code == 401
+    refused = client.post(url + '/identity', headers=headers)
+    assert refused.status_code == 403, (refused.status_code, refused.text)
+    assert not (root / 'desktop.db').exists(), 'worker fence must precede initialization'
+    from urgency_engine.desktop import scope_identity
+    expected_identity = scope_identity(root / 'desktop.db', initialize=True)
+    assert client.get(url + '/identity', headers=headers).json()['data']['scope_id'] == expected_identity
     response = client.get(url + '/portfolio', headers=headers)
     assert response.status_code == 200, (response.status_code, response.text)
     data = response.json()['data']

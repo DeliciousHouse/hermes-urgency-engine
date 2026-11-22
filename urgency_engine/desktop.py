@@ -14,10 +14,49 @@ MANAGEMENT_FIELDS.update(edit_project=('project_id title expected_revision reaso
                          edit_milestone=('milestone_id title expected_revision reason request_id', ''))
 
 
+def scope_identity(path, *, initialize=False):
+    """Opaque namespace, not authority. Only explicit management initializes it.
+
+    A separate metadata store leaves the Ledger schema and older CLI unchanged.
+    Copied stores retain their identity; the renderer also binds known gateway
+    identity and refuses ambiguous anonymous-route recovery across activations.
+    """
+    import sqlite3
+    import uuid
+    if not initialize and not path.exists():
+        return None
+    if initialize:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    connection = None
+    try:
+        connection = sqlite3.connect(path if initialize else path.resolve().as_uri() + '?mode=ro',
+                                     uri=not initialize, timeout=5)
+        connection.execute('BEGIN IMMEDIATE' if initialize else 'BEGIN')
+        if initialize:
+            connection.execute('CREATE TABLE IF NOT EXISTS desktop_identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), value TEXT NOT NULL)')
+            connection.execute('INSERT OR IGNORE INTO desktop_identity VALUES (1, ?)', (uuid.uuid4().hex,))
+        rows = connection.execute('SELECT singleton,value FROM desktop_identity').fetchall()
+        if len(rows) != 1 or rows[0][0] != 1 or not re.fullmatch(r'[0-9a-f]{32}', rows[0][1]):
+            raise LedgerError('CORRUPT_STATE', 'desktop_identity')
+        connection.commit()
+        return rows[0][1]
+    except sqlite3.Error as exc:
+        code = getattr(exc, 'sqlite_errorcode', 0) & 255
+        raise LedgerError('STORE_BUSY' if code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+                          else 'CORRUPT_STATE', 'desktop_identity') from None
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def command_arguments(payload):
     from .ledger import _id
-    if not isinstance(payload, dict) or set(payload) != {'operation', 'request_id', 'arguments'}:
+    fields = {'operation', 'request_id', 'arguments'}
+    if not isinstance(payload, dict) or set(payload) not in (fields, fields | {'scope_id'}):
         raise LedgerError('INVALID_INPUT', 'desktop', 'command')
+    if 'scope_id' in payload and (not isinstance(payload['scope_id'], str)
+                                or not re.fullmatch(r'[0-9a-f]{32}', payload['scope_id'])):
+        raise LedgerError('INVALID_INPUT', 'desktop', 'scope_id')
     operation, arguments = payload['operation'], payload['arguments']
     if not isinstance(operation, str) or operation not in MANAGEMENT_FIELDS:
         raise LedgerError('INVALID_INPUT', 'desktop', 'operation')

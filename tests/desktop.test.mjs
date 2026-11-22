@@ -190,6 +190,123 @@ test('SDK thrown envelope releases only a structured no-effect refusal', async (
   assert.ok(sender.pending(), 'unstructured text cannot establish no effects');
 });
 
+// protects=restart-safe exact intent bound to authenticated scope;
+// fails_when=reload resends automatically or another gateway acquires the intent;
+// why_new=durable recovery; seam=SDK storage/transport; no_claim=native host routing.
+function journalContext() {
+  const values = new Map(), sent = [];
+  let identity = 'a'.repeat(32), lose = true;
+  const ctx = {
+    storage: {get: (key, fallback) => values.has(key) ? structuredClone(values.get(key)) : fallback,
+      set: (key, value) => values.set(key, structuredClone(value)), remove: key => values.delete(key)},
+    rest: async (path, options) => {
+      if (path === '/identity') return {ok: true, data: {scope_id: identity}};
+      sent.push(structuredClone(options.body));
+      if (lose) throw new Error('lost reply');
+      return {ok: true, data: {project_id: 'a'}};
+    }
+  };
+  return {ctx, values, sent, setIdentity: value => {identity = value;}, succeed: () => {lose = false;}};
+}
+
+test('durable sender restores the exact request without automatic transmission', async () => {
+  const {api} = await load();
+  const probe = journalContext(), scope = {connection: 'local', profile: 'default', epoch: 1};
+  const sender = api.commandSender(probe.ctx, scope, {scopeId: 'a'.repeat(32)});
+  await assert.rejects(sender.send('create_project', {project_id: 'a', title: 'Alpha'}), /lost reply/);
+  assert.equal(probe.values.size, 1, 'intent must survive unload');
+  const fresh = await load();
+  const restored = fresh.api.commandSender(probe.ctx, scope, {scopeId: 'a'.repeat(32)});
+  assert.equal(probe.sent.length, 1, 'activation must not resend');
+  assert.equal(restored.pending().request_id, sender.pending().request_id);
+  probe.succeed();
+  await restored.reconcile();
+  assert.deepEqual(probe.sent[1], probe.sent[0]);
+  assert.equal(probe.values.size, 0);
+});
+
+test('durable recovery refuses changed identity and copied identity on another gateway', async () => {
+  const {api} = await load();
+  const probe = journalContext(), scope = {connection: 'local', profile: 'default', epoch: 1};
+  const sender = api.commandSender(probe.ctx, scope, {scopeId: 'a'.repeat(32)});
+  await assert.rejects(sender.send('create_project', {project_id: 'a', title: 'Alpha'}));
+  probe.setIdentity('b'.repeat(32));
+  await assert.rejects(sender.reconcile(), /identity changed/i);
+  assert.equal(probe.sent.length, 1);
+  probe.setIdentity('a'.repeat(32));
+  const fresh = await load();
+  fresh.sdk.host.state.connectionId.set('other');
+  const copied = fresh.api.commandSender(probe.ctx, {...scope, connection: 'other'}, {scopeId: 'a'.repeat(32)});
+  await assert.rejects(copied.reconcile(), /scope.*ambiguous|different.*scope/i);
+  assert.equal(probe.sent.length, 1);
+  assert.equal(probe.values.size, 1);
+});
+
+test('anonymous route can reconcile in-place but cannot replay after module restart', async () => {
+  const first = await load(); first.sdk.host.state.connectionId.set(null);
+  const probe = journalContext(), scope = {connection: null, profile: 'default', epoch: 1};
+  const sender = first.api.commandSender(probe.ctx, scope, {scopeId: 'a'.repeat(32)});
+  await assert.rejects(sender.send('create_project', {project_id: 'a', title: 'Alpha'}));
+  const fresh = await load(); fresh.sdk.host.state.connectionId.set(null);
+  const restored = fresh.api.commandSender(probe.ctx, scope, {scopeId: 'a'.repeat(32)});
+  await assert.rejects(restored.reconcile(), /scope.*ambiguous/i);
+  assert.equal(probe.sent.length, 1);
+  probe.succeed();
+  await sender.reconcile();
+  assert.equal(probe.sent.length, 2);
+});
+
+test('silent persistence failure prevents a command from leaving the renderer', async () => {
+  const {api} = await load(); const probe = journalContext();
+  probe.ctx.storage.set = () => {};
+  const sender = api.commandSender(probe.ctx, {connection: 'local', profile: 'default', epoch: 1}, {scopeId: 'a'.repeat(32)});
+  await assert.rejects(sender.send('create_project', {project_id: 'a', title: 'Alpha'}), /persist/i);
+  assert.equal(probe.sent.length, 0);
+});
+
+test('recovery controls initialize explicitly and expose the retained request before replay', async () => {
+  const {api, reset} = await load();
+  const sent = [], refreshed = [];
+  const scope = {connection: 'local', profile: 'default', epoch: 1};
+  const props = {ctx: {rest: async (path, options) => {sent.push([path, options]); return {ok: true, data: {scope_id: 'a'.repeat(32)}};}},
+    scope, identity: {data: {scope_id: null}, refetch: () => refreshed.push(true)}, sender: {pending: () => null}};
+  let tree = api.RecoveryControls(props);
+  const find = (node, label) => Array.isArray(node) ? node.map(n => find(n, label)).find(Boolean)
+    : !node || typeof node !== 'object' ? null : node.props?.children === label ? node : find(node.props?.children, label);
+  const initialize = find(tree, 'Enable command recovery');
+  assert.ok(initialize);
+  assert.equal(sent.length, 0);
+  await initialize.props.onClick();
+  assert.equal(sent[0][0], '/identity');
+  assert.equal(sent[0][1].method, 'POST');
+  assert.equal(refreshed.length, 1);
+  reset();
+  let reconciled = 0;
+  tree = api.RecoveryControls({...props, identity: {...props.identity, data: {scope_id: 'a'.repeat(32)}},
+    sender: {pending: () => ({request_id: 'retained', operation: 'edit_project', arguments: {title: 'Draft'}}),
+      reconcile: async () => {reconciled++;}}});
+  assert.match(JSON.stringify(tree), /Draft/);
+  assert.equal(reconciled, 0);
+  await find(tree, 'Reconcile retained command').props.onClick();
+  assert.equal(reconciled, 1);
+});
+
+test('scope refusal preserves the original intent and malformed retained payload is not replayed', async () => {
+  const {api} = await load(); const probe = journalContext();
+  const scope = {connection: 'local', profile: 'default', epoch: 1}, journal = {scopeId: 'a'.repeat(32)};
+  const sender = api.commandSender(probe.ctx, scope, journal);
+  await assert.rejects(sender.send('create_project', {project_id: 'a', title: 'Alpha'}));
+  probe.ctx.rest = async path => path === '/identity' ? {ok: true, data: {scope_id: journal.scopeId}}
+    : {ok: false, error: {code: 'SOURCE_DENIED', field: 'scope_id', side_effects: 'none'}};
+  await assert.rejects(sender.reconcile(), /SOURCE_DENIED/);
+  assert.ok(sender.pending(), 'scope refusal cannot resolve the original scope outcome');
+  const key = [...probe.values.keys()][0], record = probe.values.get(key);
+  delete record.payload.request_id;
+  probe.values.set(key, record);
+  const restored = api.commandSender(probe.ctx, scope, journal);
+  await assert.rejects(restored.reconcile(), /invalid.*payload/i);
+});
+
 test('open legacy gateway without a registry id is not labeled disconnected', async () => {
   const {api} = await load();
   assert.equal(api.connectionLabel(null, 'open'), 'Active gateway (connection identity unavailable)');
@@ -309,6 +426,19 @@ test('explicit reload adopts the current revision without dropping the draft', a
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(sent[0].title, 'My draft');
   assert.equal(sent[0].expected_revision, 5);
+});
+
+test('conflict review displays current field values beside retained draft before adoption', async () => {
+  const {api, reset} = await load();
+  const props = {sender: {}, onSaved() {}, project: {project_id: 'a', title: 'Original', revision: 1}};
+  let tree = api.ProjectForm(props);
+  labelled(tree, 'Project name').props.onChange({target: {value: 'My draft'}});
+  reset();
+  tree = api.ProjectForm({...props, project: {...props.project, title: 'External rename', revision: 2}});
+  const text = JSON.stringify(tree);
+  assert.match(text, /External rename/);
+  assert.match(text, /My draft/);
+  assert.match(text, /Current saved value/);
 });
 
 test('unified plugin registers page, sidebar, palette and status', async () => {

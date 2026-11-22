@@ -75,6 +75,27 @@ def page_arguments(request, extra=()):
     return dict(limit=int(raw), after=request.query_params.get('after'))
 
 
+def identity_data(*, initialize=False):
+    if initialize:
+        _runtime.interventions.operator_only()
+        _runtime.interventions.host_stop()
+    from hermes_constants import get_hermes_home
+    path = get_hermes_home() / 'plugin-data' / 'hermes-urgency-engine' / 'desktop.db'
+    return {'scope_id': _desktop.scope_identity(path, initialize=initialize)}
+
+
+@router.get('/identity')
+def identity():
+    return respond(identity_data)
+
+
+@router.post('/identity')
+def initialize_identity():
+    # Authentication and selected profile are supplied by the native host mount.
+    # This namespace is not an authorization token and grants no new operation.
+    return respond(lambda: identity_data(initialize=True))
+
+
 @router.get('/portfolio')
 def portfolio(request: Request):
     def read():
@@ -196,6 +217,9 @@ def execute_command(raw):
     # A worker-launched backend still cannot acquire operator privileges here.
     _runtime.interventions.operator_only()
     _runtime.interventions.host_stop()
+    if 'scope_id' in payload and payload['scope_id'] != identity_data()['scope_id']:
+        raise _ledger.LedgerError('SOURCE_DENIED', 'desktop', 'scope_id',
+                                  next_action='Return to the original scope to reconcile the retained request.')
     from hermes_cli.plugins import PluginContext, PluginManifest, get_plugin_manager
     ctx = PluginContext(PluginManifest(name='hermes-urgency-engine'), get_plugin_manager())
     runtime = _runtime.Runtime(ctx)
