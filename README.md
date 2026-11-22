@@ -1,23 +1,26 @@
 # Hermes Urgency Engine
 
-Calculate whether a task has enough time left for work, verification, and deployment. The result is repeatable: you supply the evaluation time and, optionally, the last urgency state and historical completion durations.
+Track whether a task has enough time left for work, verification, and deployment. Hermes Urgency Engine records deadlines and evidence in the active Hermes profile and shows the results in the CLI and native Desktop. It keeps hard commitments, revisable soft targets, and forecasts separate: a later forecast does not move a deadline.
 
-This development plugin exposes a local deadline/progress ledger and advisory pre-turn guidance through native Hermes commands, a read-only tool, and a native Hermes Desktop page. It uses Python's standard library (date entry also needs system IANA timezone data or the `tzdata` package). The ledger stores commitments, scope revisions and byte-identity evidence; it can opt in to scoped canonical Kanban synchronization, but does not schedule work or measure empirical completion rates. Matching bytes is not independent semantic quality acceptance.
+## Get started
 
-The Desktop page is a control surface, not a static chart: it lists projects with their verified progress and measured deadline risk, drills into one project's commitment timeline, milestones, canonical source tasks, audit history and intervention receipts, and creates or reschedules projects, milestones and deadlines through the same audited, revision-checked Ledger operations the CLI uses. Every number it shows is read from the backend; the renderer performs no progress or risk arithmetic of its own.
+- **Try it without Hermes:** [Calculate your first forecast](docs/forecast.md#calculate-your-first-forecast) from a source checkout. It needs Python, but no profile, model call, or network access.
+- **Install and diagnose:** Follow the [native runtime setup](docs/runtime.md#compatibility-and-installation) with a reviewed commit and a disposable Hermes profile. `hermes urgency diagnose` reporting `uninitialized` is normal before the first write.
+- **Record a task:** Use the [synthetic project and task files](examples/README.md), then try the [runtime tutorial](docs/runtime.md#tutorial-from-a-commitment-to-byte-evidence) for deadlines and verification.
+- **Open Desktop:** Follow the [unified plugin setup](docs/desktop.md#install-the-desktop-page). The portfolio and timeline show what the selected gateway and profile can report; a project without a matching measurement stays unmeasured.
 
-The optional watchdog uses Hermes no-agent cron to record incidents and recommend next steps. It does not execute recovery actions or treat missing telemetry as proof of health.
+## Operate the plugin
 
-In supervised mode, a local operator can change a bound Kanban task's priority, revise its remaining estimate, or move a soft target. Recovery-card creation and autonomous execution are unavailable.
+- [Runtime commands and profile settings](docs/runtime.md) · [Ledger and evidence](docs/ledger.md) · [Forecast API and policy](docs/forecast.md)
+- [Desktop routes, controls and scope](docs/desktop.md) · [Canonical Kanban synchronization](docs/kanban.md)
+- [No-agent watchdog](docs/watchdog.md) · [Supervised interventions](docs/interventions.md) · [Troubleshooting and safe recovery](docs/troubleshooting.md)
 
-- [Desktop page: routes, controls, scope limits, how-to and synthetic tutorial](docs/desktop.md)
-- [Canonical Kanban synchronization, scope and operating guide](docs/kanban.md)
-- [Independent watchdog, incidents, plans and no-agent tutorial](docs/watchdog.md)
-- [Supervised interventions, outcomes and rollback](docs/interventions.md)
-- [Native installation, commands, configuration and executable tutorial](docs/runtime.md)
-- [Ledger API, evidence limits and temporary-database tutorial](docs/ledger.md)
-- [Forecast API and policy](docs/forecast.md#forecast-api)
-- [Calculate your first forecast](docs/forecast.md#calculate-your-first-forecast)
-- [How to run the regression tests](docs/forecast.md#how-to-run-the-regression-tests)
+## Know the limits
+
+A matching artifact hash is evidence of bytes, not independent acceptance. The dependency-only lower bound and potential contention indicators are not an authoritative dependency- or capacity-aware forecast. The watchdog records incidents and recommends next steps; it does not perform autonomous recovery. Supported supervised actions are bounded to priority, remaining-work estimates, and soft-target revisions. External task-system integrations such as GitHub Issues and YouTrack are not included.
+
+## Contribute
+
+[Architecture and threat model](docs/architecture.md) · [Testing and evidence limits](docs/testing.md) · [Contributing](CONTRIBUTING.md) · [Security reporting](SECURITY.md) · [Changelog](CHANGELOG.md)
 
 Licensed under [Apache 2.0](LICENSE).

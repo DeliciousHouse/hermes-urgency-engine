@@ -1,0 +1,15 @@
+{
+  "plugins": {
+    "entries": {
+      "hermes-urgency-engine": {
+        "settings": {
+          "intervention_mode": "advisory",
+          "context_enabled": true,
+          "default_project": "example-studio",
+          "kanban_sync_enabled": false,
+          "watchdog_enabled": false
+        }
+      }
+    }
+  }
+}
