@@ -57,6 +57,70 @@ class ReconciliationTests(unittest.TestCase):
         # 100 detail reads consume the scanner's 20-second collection window.
         return patch.object(kanban, 'monotonic', lambda: self.source.calls / 5)
 
+    def test_dependency_changes_authoritative_milestone_forecast_only_with_parallel_capacity(self):
+        """protects=authoritative ETA/slack/commitments; fails_when=edges affect only the bound;
+        no_claim=live slots, native rendering or empirical calibration.
+        """
+        from urgency_engine.desktop import Views
+        from urgency_engine.runtime import Runtime
+
+        board, project = BINDING['board'], BINDING['project_id']
+        self.source.rows.append(dict(id='second', tenant=BINDING['tenant']))
+        detail = self.source.detail
+        edge = False
+
+        def read(binding, task_id):
+            row = detail(binding, task_id)
+            if edge and task_id == 'task':
+                row['parents'] = ['second']
+            return row
+
+        self.source.detail = read
+        config = {**self.cfg, 'forecast_capacity': {project: {'slots': 2, 'observed_at': self.now.isoformat()}}}
+
+        class Context:
+            def get_config(self, key, default):
+                return config.get(key, default)
+
+        runtime = Runtime(Context(), clock=lambda: self.now, data_dir=lambda: self.root)
+        self.assertEqual(self.scan('independent')['state'], 'complete')
+        members = [[board, 'second'], [board, 'task']]
+        for (_, task_id), seconds in zip(members, (1800, 3600)):
+            self.ledger.upsert_task(board, task_id, project_id=project, goal='Synthetic work', remaining_seconds=seconds,
+                expected_revision=self.ledger.get_task(board, task_id)['revision'], reason='Estimate',
+                request_id='estimate-' + task_id, actor='operator')
+        self.ledger.create_milestone('m', project_id=project, title='Fixture', request_id='m', actor='operator')
+        self.ledger.set_milestone_tasks('m', members, expected_revision=self.ledger.get_project(project)['revision'],
+                                       reason='Fixture membership', request_id='members', actor='operator')
+        target = (self.now + timedelta(seconds=4500)).isoformat()
+        self.ledger.set_deadline('d', project_id=project, kind='soft', at=target, timezone='UTC', owner='Synthetic',
+                                 source='Fixture', milestone_id='m', request_id='d', actor='operator')
+
+        def observed(slots, lower):
+            config['forecast_capacity'][project]['slots'] = slots
+            result = runtime.run_request('explain', {'deadline_id': 'd'}, surface='cli')
+            self.assertTrue(result['ok'], result)
+            page = self.sync.page(project, cfg=self.cfg, with_graph=True)
+            bound = Views(self.ledger, clock=lambda: self.now).dependency_bound(project, page['graph'], page['items'])
+            self.assertEqual(bound['lower_bound_seconds'], lower)
+            row = result['data']
+            self.assertEqual((row['original_at'], row['target_at']), (target, target))
+            self.assertEqual(self.ledger.get_milestone('m')['tasks'], members)
+            return row
+
+        independent, serial_before = observed(2, 3600), observed(1, 3600)
+        edge = True
+        self.assertEqual(self.scan('dependent')['state'], 'complete')
+        dependent, serial_after = observed(2, 5400), observed(1, 5400)
+        self.assertEqual([r['input']['remaining_seconds'] for r in (independent, dependent)], [3600, 5400],
+                         'Adding only a dependency must change the authoritative two-slot duration')
+        self.assertEqual([r['input']['remaining_seconds'] for r in (serial_before, serial_after)], [5400, 5400])
+        for row, seconds, slack in ((independent, 3600, 900), (dependent, 5400, -900),
+                                     (serial_before, 5400, -900), (serial_after, 5400, -900)):
+            self.assertEqual(row['forecast_at'], (self.now + timedelta(seconds=seconds)).isoformat())
+            self.assertEqual(row['forecast']['effective_slack_seconds'], slack)
+        self.assertLess(independent['forecast']['raw_level'], dependent['forecast']['raw_level'])
+
     def test_desktop_graph_requires_a_fresh_complete_scan_for_the_current_binding(self):
         """Real scan and retained store; no native board I/O or live-state claim."""
         def read(cfg=None):
