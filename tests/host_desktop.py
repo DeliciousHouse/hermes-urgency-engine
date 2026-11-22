@@ -14,6 +14,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = 'hermes-urgency-engine'
+PLUGIN_CONFIG = {'enabled': [PLUGIN], 'isolation': 'in_process'}
 
 
 def child():
@@ -100,13 +101,13 @@ def child():
     # Canonical source is synthetic; the persisted Sync/Ledger and mounted read
     # route are real. A page of one must still explain a two-task dependency path.
     from urgency_engine.kanban import Sync, settings
-    from yaml import safe_dump, safe_load
     binding = dict(board='board', tenant='synthetic', project_id='synthetic')
     source_settings = dict(kanban_sync_enabled=True, kanban_bindings=[binding])
     config = get_hermes_home() / 'config.yaml'
-    values = safe_load(config.read_text(encoding='utf-8'))
-    values['plugins']['entries'] = {PLUGIN: {'settings': source_settings}}
-    config.write_text(safe_dump(values), encoding='utf-8')
+    # JSON is valid YAML; let the pinned host load it with its own parser.
+    config.write_text(json.dumps({'plugins': {
+        **PLUGIN_CONFIG, 'entries': {PLUGIN: {'settings': source_settings}},
+    }}), encoding='utf-8')
 
     class SyntheticSource:
         def inventory(self, binding):
@@ -167,7 +168,7 @@ if __name__ == '__main__':
             for name in ('urgency_engine', 'dashboard'):
                 if (ROOT / name).exists():
                     shutil.copytree(ROOT / name, target / name, ignore=shutil.ignore_patterns('__pycache__'))
-            (home / 'config.yaml').write_text('plugins:\n  enabled: [hermes-urgency-engine]\n  isolation: in_process\n', encoding='utf-8')
+            (home / 'config.yaml').write_text(json.dumps({'plugins': PLUGIN_CONFIG}), encoding='utf-8')
             env = dict(os.environ)
             # Preserve worker fences; this test does not gain operator privileges.
             env.update(HERMES_HOME=str(home), HERMES_KANBAN_HOME=str(home / 'boards'), HERMES_DISABLE_LAZY_INSTALLS='1',
