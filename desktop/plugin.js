@@ -43,6 +43,21 @@ export async function canonicalProjects(scope) {
   if (!sameScope(scope)) throw new Error('Connection changed. Reload this view.');
   return payload?.projects || [];
 }
+// Web Locks serialize same-origin Desktop windows; PluginStorage alone cannot
+// compare-and-set. Unsupported hosts remain readable, never silently unlocked.
+export function acquireWriter(scopeId, onChange, locks = globalThis.navigator?.locks) {
+  let closed = false, release;
+  onChange(false);
+  if (scopeId && locks?.request) {
+    const lifetime = new Promise(resolve => {release = resolve;});
+    void locks.request(`hermes-urgency-engine:${scopeId}`, {ifAvailable: true}, async lock => {
+      if (!lock || closed) return;
+      onChange(true);
+      await lifetime;
+    }).catch(() => {if (!closed) onChange(false);});
+  }
+  return () => {closed = true; onChange(false); release?.();};
+}
 const activationInstance = crypto.randomUUID();
 export function commandSender(ctx, scope, journal = null) {
   const scopeId = journal?.scopeId;
@@ -50,12 +65,16 @@ export function commandSender(ctx, scope, journal = null) {
   let record = key ? ctx.storage.get(key, null) : null;
   let retained = record?.payload || (record ? {unavailable: true} : null);
   let busy = false;
+  function requireWriter() {
+    if (journal?.writable && !journal.writable()) throw new Error('Read-only window. Open one management window for this scope.');
+  }
   function bindingMatches() {
     return record?.version === 1 && record.scope_id === scopeId && record.profile === scope.profile
       && record.connection === scope.connection
       && (scope.connection !== null || (record.instance === activationInstance && record.epoch === scope.epoch));
   }
   function persist() {
+    requireWriter();
     if (!journal) return;
     if (!scopeId) throw new Error('Initialize command recovery before editing.');
     if (!bindingMatches()) throw new Error('Retained scope is ambiguous or different from this scope. Nothing was sent.');
@@ -70,6 +89,7 @@ export function commandSender(ctx, scope, journal = null) {
     if (JSON.stringify(ctx.storage.get(key, null)) !== JSON.stringify(record)) throw new Error('Unable to persist command. Nothing was sent.');
   }
   function clear() {
+    requireWriter();
     if (key) {
       if (JSON.stringify(ctx.storage.get(key, null)) !== JSON.stringify(record)) throw new Error('Stored command changed. Reload before reconciling.');
       ctx.storage.remove(key);
@@ -78,6 +98,7 @@ export function commandSender(ctx, scope, journal = null) {
     retained = null; record = null;
   }
   async function transmit() {
+    requireWriter();
     if (busy) throw new Error('Command already pending');
     if (!sameScope(scope)) throw new Error('Connection changed. Return to the original scope to reconcile.');
     busy = true;
@@ -109,6 +130,7 @@ export function commandSender(ctx, scope, journal = null) {
   }
   return {
     async send(operation, args) {
+      requireWriter();
       if (retained) throw new Error('Reconcile the previous command before submitting another intent.');
       retained = JSON.parse(JSON.stringify({request_id: crypto.randomUUID(), operation, arguments: args,
         ...(journal ? {scope_id: scopeId} : {})}));
@@ -618,13 +640,13 @@ export function ProjectDetail({ctx, scope, sender, project, disabled, onSaved}) 
         : jsx('p', {children: 'Name a milestone from the Milestones tab to edit its membership.'})]})]});
 }
 
-export function RecoveryControls({ctx, scope, identity, sender, onSaved}) {
+export function RecoveryControls({ctx, scope, identity, sender, onSaved, readOnly = false}) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const gateway = useValue(host.state.gateway);
   const lock = useRef(false);
   async function act(initialize) {
-    if (lock.current || gateway !== 'open' || !sameScope(scope)) return;
+    if (lock.current || (!initialize && readOnly) || gateway !== 'open' || !sameScope(scope)) return;
     lock.current = true; setBusy(true); setError(null);
     try {
       if (initialize) {
@@ -650,7 +672,7 @@ export function RecoveryControls({ctx, scope, identity, sender, onSaved}) {
       pending.unavailable ? jsx('p', {role: 'alert', children: 'Retained scope is ambiguous or belongs to another gateway/profile. It has not been sent; return to the original scope.'})
         : jsxs('div', {children: [jsx('p', {children: 'Inspect current state and this exact request before replay. Nothing is sent automatically.'}),
           jsx('pre', {style: {whiteSpace: 'pre-wrap', overflowWrap: 'anywhere'}, children: JSON.stringify(pending, null, 2)}),
-          jsx(Button, {disabled: busy || gateway !== 'open' || identity.isError,
+          jsx(Button, {disabled: readOnly || busy || gateway !== 'open' || identity.isError,
             onClick: () => act(false), children: 'Reconcile retained command'})]})]}),
     error && jsx('p', {role: 'alert', children: error})]});
 }
@@ -658,13 +680,24 @@ export function RecoveryControls({ctx, scope, identity, sender, onSaved}) {
 function Page({ctx}) {
   const scope = useScope();
   const identity = useRead(ctx, '/identity', scope);
-  const senders = useRef(new Map());
+  const [writerKey, setWriterKey] = useState(null);
+  const [attempt, setAttempt] = useState(0);
+  const ownsWriter = useRef(false);
   const key = JSON.stringify([scope, identity.data?.scope_id || null]);
-  if (!senders.current.has(key)) senders.current.set(key,
-    commandSender(ctx, scope, {scopeId: identity.data?.scope_id || null}));
-  return jsx(ScopedPage, {ctx, scope, identity, sender: senders.current.get(key)}, key);
+  useEffect(() => acquireWriter(identity.data?.scope_id, owns => {
+    ownsWriter.current = owns;
+    setWriterKey(owns ? key : null);
+  }), [key, attempt]);
+  const writable = writerKey === key;
+  const sender = useRef(null);
+  const senderKey = JSON.stringify([key, writable]);
+  if (sender.current?.key !== senderKey) sender.current = {key: senderKey,
+    value: commandSender(ctx, scope, {scopeId: identity.data?.scope_id || null,
+      writable: () => ownsWriter.current && sameScope(scope)})};
+  return jsx(ScopedPage, {ctx, scope, identity, sender: sender.current.value, writer: writable,
+    requestWriter: () => setAttempt(value => value + 1)}, key);
 }
-function ScopedPage({ctx, scope, identity, sender}) {
+function ScopedPage({ctx, scope, identity, sender, writer, requestWriter}) {
   const [selected, setSelected] = useState(null);
   const [after, setAfter] = useState(null);
   const gateway = useValue(host.state.gateway);
@@ -684,11 +717,14 @@ function ScopedPage({ctx, scope, identity, sender}) {
   const inventory = useQuery({queryKey: ['urgency', scope.connection, scope.profile, scope.epoch, 'canonical'],
     queryFn: () => canonicalProjects(scope), retry: false, staleTime: 5000, enabled: !selected && gateway === 'open',
     refetchInterval: state => state.state.error ? 60000 : 30000, refetchIntervalInBackground: false});
-  const writable = gateway === 'open' && !identity.isError && !!identity.data?.scope_id;
+  const writable = writer && gateway === 'open' && !identity.isError && !!identity.data?.scope_id;
   return jsxs('main', {className: 'ue', 'aria-label': 'Urgency Engine', children: [
     jsx('style', {children: styles}), jsx('h1', {children: 'Urgency Engine'}),
     jsx('p', {children: `${connectionLabel(scope.connection, gateway)} / ${scope.profile} · ${gateway}`}),
-    jsx(RecoveryControls, {ctx, scope, identity, sender, onSaved: () => query.refetch()}),
+    identity.data?.scope_id && !writer && jsxs('div', {role: 'status', children: [
+      jsx('p', {children: 'Read-only window. Only one window can manage this scope. Close its Urgency page, then try here. Hosts without Web Locks remain read-only.'}),
+      jsx(Button, {onClick: requestWriter, children: 'Try management in this window'})]}),
+    jsx(RecoveryControls, {ctx, scope, identity, sender, readOnly: !writer, onSaved: () => query.refetch()}),
     jsxs('details', {children: [jsx('summary', {children: selected ? 'Edit project' : 'Create project'}),
       jsx(ProjectEditor, {selected, sender, project: selected ? query.data : null, disabled: !writable || query.isPending || query.isError,
         onSaved: () => query.refetch()}, selected || 'new')]}),

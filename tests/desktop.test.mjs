@@ -209,6 +209,69 @@ function journalContext() {
   return {ctx, values, sent, setIdentity: value => {identity = value;}, succeed: () => {lose = false;}};
 }
 
+// protects=one writer and preserved unknown intent; fails_when=a second window
+// overwrites retained work; why_new=single-window contract; seam=Web Locks protocol
+// with a shared in-memory manager; no_claim=native cross-window lock availability.
+test('writer ownership is exclusive, releases on close and fails closed without Web Locks', async () => {
+  const {api} = await load();
+  const held = new Set();
+  const locks = {request: async (key, options, callback) => {
+    assert.equal(options.ifAvailable, true);
+    if (held.has(key)) return callback(null);
+    held.add(key);
+    try {return await callback({name: key});} finally {held.delete(key);}
+  }};
+  const first = [], second = [];
+  const close = api.acquireWriter('scope', value => first.push(value), locks);
+  api.acquireWriter('scope', value => second.push(value), locks);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(first.at(-1), true);
+  assert.equal(second.at(-1), false);
+  close();
+  await new Promise(resolve => setImmediate(resolve));
+  const third = [];
+  const closeThird = api.acquireWriter('scope', value => third.push(value), locks);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(third.at(-1), true);
+  closeThird();
+  const unavailable = [];
+  api.acquireWriter('scope', value => unavailable.push(value), null);
+  assert.equal(unavailable.at(-1), false);
+});
+
+test('read-only window cannot persist or transmit and new owner restores unresolved intent', async () => {
+  const {api} = await load(), probe = journalContext();
+  const scope = {connection: 'local', profile: 'default', epoch: 1};
+  let writable = false;
+  const sender = api.commandSender(probe.ctx, scope, {scopeId: 'a'.repeat(32), writable: () => writable});
+  await assert.rejects(sender.send('create_project', {project_id: 'a', title: 'Alpha'}), /read.only/i);
+  assert.equal(probe.values.size, 0);
+  assert.equal(probe.sent.length, 0);
+  assert.equal(sender.pending(), null);
+  writable = true;
+  await assert.rejects(sender.send('create_project', {project_id: 'a', title: 'Alpha'}), /lost reply/);
+  writable = false;
+  await assert.rejects(sender.reconcile(), /read.only/i);
+  const next = api.commandSender(probe.ctx, scope, {scopeId: 'a'.repeat(32), writable: () => true});
+  await assert.rejects(next.send('create_project', {project_id: 'b'}), /previous command/i);
+  probe.succeed(); await next.reconcile();
+  assert.deepEqual(probe.sent[0], probe.sent[1]);
+});
+
+test('closing the writer during a request preserves the intent for the next owner', async () => {
+  const {api} = await load(), probe = journalContext();
+  const scope = {connection: 'local', profile: 'default', epoch: 1};
+  let writable = true, reply;
+  probe.ctx.rest = async path => path === '/identity' ? {ok: true, data: {scope_id: 'a'.repeat(32)}}
+    : new Promise(resolve => {reply = resolve;});
+  const sender = api.commandSender(probe.ctx, scope, {scopeId: 'a'.repeat(32), writable: () => writable});
+  const pending = sender.send('create_project', {project_id: 'a', title: 'Alpha'});
+  await new Promise(resolve => setImmediate(resolve));
+  writable = false; reply({ok: true, data: {project_id: 'a'}});
+  await assert.rejects(pending, /read.only/i);
+  assert.equal(probe.values.size, 1);
+});
+
 test('durable sender restores the exact request without automatic transmission', async () => {
   const {api} = await load();
   const probe = journalContext(), scope = {connection: 'local', profile: 'default', epoch: 1};

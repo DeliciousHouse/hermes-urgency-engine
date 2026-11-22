@@ -304,8 +304,13 @@ supported CLI rather than guessing a destination. No automatic resend occurs on 
 Submitted fields remain in app-level local plugin storage until resolved. Do not
 enter secrets in management fields. Disabling the UI preserves pending records and
 backend metadata; removing Desktop app storage loses those local records, not Ledger
-receipts. There is no cross-window atomic storage lock; use one management window
-per scope. Ledger revisions and request IDs still protect the actual mutations.
+receipts. A native Web Lock allows one writable Urgency page per scope in the same
+Desktop browser storage partition. Other windows remain readable. Close the owning
+page, then choose **Try management in this window** to acquire the lock and reload
+any outstanding intent before editing. Closing a page while its reply is unresolved
+preserves that intent for explicit reconciliation. Hosts without Web Locks remain
+read-only. Separate app installations do not share this UI lock; Ledger revisions
+and request IDs continue to protect mutations across clients.
 
 ### Act on a risk the page cannot fix
 
