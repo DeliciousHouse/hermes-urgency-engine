@@ -108,8 +108,8 @@ def history(project_id: str, request: Request):
             arguments['after'] = int(after)
         def records(view):
             view.ledger.get_project(project_id)
-            rows = view.ledger.history('project', project_id, **arguments)
-            more = bool(rows and view.ledger.history('project', project_id, 1, rows[-1]['sequence']))
+            rows = view.ledger.project_history(project_id, **arguments)
+            more = bool(rows and view.ledger.project_history(project_id, 1, rows[-1]['sequence']))
             return {'items': rows, 'has_more': more, 'next': rows[-1]['sequence'] if more else None}
         return read_view(records)
     return respond(read)

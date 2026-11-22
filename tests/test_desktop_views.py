@@ -98,6 +98,22 @@ class DesktopViewTests(unittest.TestCase):
                 Views(self.ledger, clock=lambda:self.now).project('a')
         self.assertEqual(caught.exception.code, 'REVISION_CONFLICT')
 
+    def test_project_history_includes_member_changes_without_foreign_records(self):
+        """protects=inspectable schedule revisions; fails_when=history only shows
+        project names; seam=real Ledger; no_claim=native history presentation.
+        """
+        self.ledger.create_milestone('m', project_id='a', title='Review', request_id='m', actor='operator')
+        self.ledger.edit_milestone('m', title='Final review', expected_revision=self.ledger.get_project('a')['revision'],
+            reason='Rename review', request_id='rename-m', actor='operator')
+        self.ledger.edit_project('b', title='Private other', expected_revision=1,
+            reason='Foreign', request_id='foreign', actor='operator')
+        rows = self.ledger.project_history('a', limit=2)
+        self.assertEqual([r['action'] for r in rows], ['create_project', 'upsert_task'])
+        rest = self.ledger.project_history('a', after=rows[-1]['sequence'])
+        self.assertEqual([r['action'] for r in rest], ['set_criteria', 'create_milestone', 'edit_milestone'])
+        self.assertEqual(rest[-1]['reason'], 'Rename review')
+        self.assertNotIn('Foreign', str(rows + rest))
+
     def test_timeline_pages_tasks_without_inventing_execution_dates(self):
         from urgency_engine.desktop import Views
         from urgency_engine.ledger import LedgerError

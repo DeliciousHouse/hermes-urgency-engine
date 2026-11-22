@@ -64,6 +64,9 @@ def child():
     assert milestone.status_code == 200, (milestone.status_code, milestone.text)
     assert milestone.json()['data']['tasks'] == [['board', 'task']]
     assert milestone.json()['data']['project_revision'] == 4
+    audit = client.get(url + '/projects/synthetic/history', headers=headers).json()['data']['items']
+    assert any(row['action'] == 'set_milestone_tasks' for row in audit), audit
+    assert not any(row['entity_id'] == 'other' for row in audit)
     assert client.get(url + '/projects/other/milestones/m', headers=headers).status_code == 404
     assert client.get(url + '/projects/synthetic/milestones/m').status_code == 401
     missing = client.get(url + '/projects/foreign', headers=headers)

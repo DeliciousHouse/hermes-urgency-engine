@@ -1,6 +1,6 @@
 # Durable deadline and progress ledger
 
-Keep original commitments, revised targets and verified progress in one local SQLite database. This page describes the Python library; the [native plugin adapter](runtime.md) supplies CLI, slash/tool queries and advisory runtime hooks. The native adapter also offers opt-in [Kanban synchronization](kanban.md); neither supplies a scheduler, Desktop page or release integration.
+Keep original commitments, revised targets and verified progress in one local SQLite database. This page describes the Python library; the [native plugin adapter](runtime.md) supplies CLI, slash/tool queries and advisory runtime hooks. The native adapter also offers opt-in [Kanban synchronization](kanban.md); the separate [Desktop surface](desktop.md) exposes the same Ledger through scoped reads and audited controls. These adapters do not supply a scheduler or release integration.
 
 - [Reference](#reference)
 - [Why commitments and evidence are separate](#why-commitments-and-evidence-are-separate)
@@ -40,6 +40,7 @@ list_projects(limit=100, after=None)
 list_tasks(project_id, limit=100, after=None)
 list_deadlines(project_id, limit=100, after=None)
 history(entity_type, entity_id, limit=100, after=None)
+project_history(project_id, limit=100, after=None)
 progress(project_id)
 explain_deadline(deadline_id)
 ```
@@ -54,6 +55,7 @@ All reads use a consistent transaction and write nothing.
 - `list_tasks`: scoped task key dictionaries (`board_id`, `task_id`), ordered by that pair. The cursor is the last pair as a two-item list/tuple. Use `get_task` for details.
 - `list_deadlines`: scoped deadline records ordered by ID; the cursor is the last `deadline_id`. Both scoped lists require an existing project, accept limits 1–500, and have the same concurrent-enumeration limits as `list_projects`.
 - `history`: audit rows ordered by `sequence`, strictly after the optional integer cursor. Limit is 1–500. `entity_type` is `project`, `task`, `milestone` or `deadline`; task entity IDs are compact JSON arrays such as `["demo-board","demo-task"]`. Other entity IDs are their plain IDs. `before_json` and `after_json` are JSON strings. History includes successful commands only.
+- `project_history`: the same audit row shape and sequence cursor, combining project, task, milestone and deadline changes for one project. Membership comes from recorded before/after snapshots, not arbitrary caller IDs. Successful commands only; limit 1–500.
 - `progress`: `{project_id, baseline_weight, current_weight, verified_weight, percent, state, unscoped_task_count, last_verified_progress_at, revision}`. No baseline yields `baseline_weight=null`. No active criteria or any unscoped task yields `percent=null`, `state='insufficient_evidence'`; otherwise state is `determinate`. Progress is the weighted fraction of active criterion revisions with accepted, uninvalidated matching evidence. A missing required criterion prevents 100%, even if floating-point rounding would conceal its weight. `last_verified_progress_at` is historical: reopening invalidates credit without erasing the last accepted-evidence time.
 - `explain_deadline`: deadline columns plus `forecast`, `forecast_at`, nullable `actual_verified_at`, `baseline_variance_seconds`, `target_variance_seconds`, `input`, and `input_revisions`. Variance is actual verified completion minus the respective date when all scoped tasks have verified completion; otherwise it is projected completion minus that date. Positive means late. `forecast_at` is clock + summed stored work/buffers, not an empirical percentile. Work/buffers include every scoped task exactly once; callers update estimates explicitly. An empty scope has no actual completion. `input_revisions` records deadline/project revisions and `[board_id,task_id,revision]` tuples; `input` records aggregate seconds and evaluation time.
 

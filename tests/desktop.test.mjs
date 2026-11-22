@@ -435,6 +435,16 @@ test('milestone control creates and edits membership through named commands', as
     'milestone membership is checked against the project revision, not a milestone revision');
 });
 
+test('history renders the actual audit timestamp and action fields', async () => {
+  const {api} = await load({useState: initial => [initial === 'commitments' ? 'history' : initial, () => {}],
+    sdk: {useQuery: () => ({data: {items: [{sequence: 9, occurred_at: '2030-01-02T10:00:00Z',
+      action: 'revise_deadline', actor: 'operator', reason: 'Approved new target'}]}})}});
+  const project = {project_id: 'a', title: 'A', revision: 1, observed_at: '2030-01-01T00:00:00Z'};
+  const text = JSON.stringify(expand(api.ProjectDetail({ctx: {}, scope: {}, sender: {}, project})));
+  assert.match(text, /2030-01-02T10:00:00Z/);
+  assert.match(text, /revise_deadline/);
+});
+
 test('detail tabs expose every audited read surface with its own state', async () => {
   const {api} = await load();
   const tree = JSON.stringify(api.DetailTabs({tab: 'history', onTab() {},

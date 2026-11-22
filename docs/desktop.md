@@ -29,7 +29,7 @@ payload cannot choose a database or claim a permission. Responses are
 | `GET /projects/{project_id}/timeline` | `start`, `end` (UTC ISO 8601, span 0 to 366 days), `limit`, `after` | paged task rows with `started_at`, `dependencies` and `blocked_periods` explicitly `null`, plus `start`, `end`, `now`, `range_policy` |
 | `GET /projects/{project_id}/milestones` | `limit`, `after` | `items`, `has_more`, `next` |
 | `GET /projects/{project_id}/milestones/{milestone_id}` | — | scoped milestone title, member task IDs and owning `project_revision` |
-| `GET /projects/{project_id}/history` | `limit`, `after` (decimal sequence) | audited change records, `has_more`, `next` |
+| `GET /projects/{project_id}/history` | `limit`, `after` (decimal sequence) | project and member task/milestone/deadline audit records, `has_more`, `next` |
 | `GET /projects/{project_id}/source-tasks` | `limit`, `after` | canonical Sync rows plus `sync_health` and `sync_seconds` |
 | `GET /projects/{project_id}/interventions` | `limit`, `after` | receipts, `recovery_creation`, `next_action` |
 

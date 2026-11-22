@@ -423,7 +423,7 @@ export function ProjectDetail({ctx, scope, sender, project, disabled, onSaved}) 
         row: item => [item.board_id, item.task_id, item.status, item.assignee, item.goal]})]}),
     history: () => jsx(RecordList, {query: records, empty: 'No recorded changes.', onMore: setCursor,
       columns: ['Sequence', 'At', 'Actor', 'Operation', 'Reason'],
-      row: item => [item.sequence, item.at, item.actor, item.operation, item.reason]}),
+      row: item => [item.sequence, item.occurred_at, item.actor, item.action, item.reason]}),
     interventions: () => jsxs('section', {children: [
       jsx('p', {className: 'ue-note', children: records.data
         ? `Recovery creation: ${records.data.recovery_creation}. ${records.data.next_action}`

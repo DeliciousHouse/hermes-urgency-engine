@@ -311,6 +311,23 @@ class Ledger:
                 'SELECT * FROM audit WHERE entity_type=? AND entity_id=? AND sequence>? ORDER BY sequence LIMIT ?',
                 (entity_type, entity_id, after or 0, limit))]
 
+    def project_history(self, project_id, limit=100, after=None):
+        """Page recorded project, task, milestone and commitment changes together.
+
+        Resolve ownership from the audit snapshot rather than querying live
+        entity rows. Evidence results inherit ownership from their prior task.
+        """
+        _integer(limit, 'limit', 1, 500)
+        if after is not None:
+            _integer(after, 'after')
+        with self._transaction('project_history'):
+            self._project(project_id)
+            return [dict(row) for row in self.connection.execute(
+                "SELECT * FROM audit WHERE sequence>? AND ((entity_type='project' AND entity_id=?) "
+                "OR (entity_type IN ('task','milestone','deadline') AND "
+                "COALESCE(json_extract(after_json,'$.project_id'),json_extract(before_json,'$.project_id'))=?)) "
+                "ORDER BY sequence LIMIT ?", (after or 0, project_id, project_id, limit))]
+
     @_command
     def create_project(self, project_id, title, *, request_id, actor):
         _id(project_id, 'project_id')
