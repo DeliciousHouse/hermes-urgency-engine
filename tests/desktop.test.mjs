@@ -287,7 +287,7 @@ test('milestone control creates and edits membership through named commands', as
   assert.equal(sent[0][0], 'create_milestone');
   assert.deepEqual(JSON.parse(JSON.stringify(sent[0][1])), {milestone_id: 'm1', project_id: 'proj-alpha', title: 'Beta ready'});
   mount();
-  const memberProps = {sender, milestone: {milestone_id: 'm1', revision: 2}, onSaved() {}, disabled: false};
+  const memberProps = {sender, milestoneId: 'm1', projectRevision: 2, onSaved() {}, disabled: false};
   let members = api.MembershipForm(memberProps);
   const lines = ['b1/t1', 'b1/t2', ''].join(String.fromCharCode(10));
   labelled(members, 'Member tasks, one board/task per line').props.onChange({target: {value: lines}});
@@ -298,7 +298,8 @@ test('milestone control creates and edits membership through named commands', as
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(sent[1][0], 'set_milestone_tasks');
   assert.deepEqual(JSON.parse(JSON.stringify(sent[1][1].tasks)), [['b1', 't1'], ['b1', 't2']]);
-  assert.equal(sent[1][1].expected_revision, 2);
+  assert.equal(sent[1][1].expected_revision, 2,
+    'milestone membership is checked against the project revision, not a milestone revision');
 });
 
 test('detail tabs expose every audited read surface with its own state', async () => {
@@ -341,4 +342,40 @@ test('project detail mounts the timeline, every tab and every audited control', 
     assert.ok(tree.includes(label), `detail is missing ${label}`);
   }
   assert.match(tree, /verification time exceeds remaining slack/);
+});
+
+// protects=an actionable save failure; fails_when=a raw transport payload is dumped
+// into the page as ordinary text, or a conflict is not announced as an alert;
+// why_new=a vision pass on the installed page found the 409 shown as inline prose;
+// seam=SDK module boundary; no_claim=not a native rendering check.
+test('a save failure is summarised, announced and keeps its detail collapsed', async () => {
+  const {api} = await load();
+  const raw = "Error invoking remote method 'hermes:api': Error: 409: "
+    + JSON.stringify({ok: false, error: {code: 'REVISION_CONFLICT', operation: 'edit_project',
+      retryable: true, side_effects: 'none',
+      next_action: 'Reload current state and reconcile the intended change.'}});
+  const failure = api.commandFailure(new Error(raw));
+  assert.match(failure.headline, /REVISION_CONFLICT/);
+  assert.match(failure.headline, /Reload current state/);
+  assert.ok(!failure.headline.includes('{'), 'the summary must not contain the raw payload');
+  assert.ok(failure.detail.includes('hermes:api'), 'the raw text stays available as detail');
+  const plain = api.commandFailure(new Error('lost reply'));
+  assert.match(plain.headline, /lost reply/);
+  assert.equal(plain.detail, null);
+});
+
+test('the command form announces a failure as an alert and explains reconcile', async () => {
+  const {api, reset} = await load();
+  const props = {sender: {send: async () => {throw new Error('lost reply');}, pending: () => true},
+    projectId: 'proj-alpha', onSaved() {}, disabled: false};
+  let tree = api.DeadlineForm(props);
+  tree.props.onSubmit({preventDefault() {}});
+  await new Promise(resolve => setImmediate(resolve));
+  reset();
+  tree = api.DeadlineForm(props);
+  const text = JSON.stringify(tree);
+  assert.match(text, /"role":"alert"/);
+  assert.match(text, /lost reply/);
+  assert.match(text, /Reconcile same request/);
+  assert.match(text, /resends the identical request/i);
 });

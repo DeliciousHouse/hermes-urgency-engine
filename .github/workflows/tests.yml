@@ -37,6 +37,29 @@ jobs:
           result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.discover('tests'));
           raise SystemExit(not (result.wasSuccessful() and result.testsRun and not result.skipped))"
 
+  desktop-ui:
+    name: Desktop renderer (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Run renderer module-boundary tests
+        # The harness refuses any import other than the official SDK, react and
+        # react/jsx-runtime, so a forbidden dependency fails here.
+        run: >-
+          node --experimental-vm-modules --test-reporter=spec
+          --test tests/desktop.test.mjs
+
   native:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
@@ -79,6 +102,7 @@ jobs:
           .host/.venv/bin/python .host/hermes plugins doctor "$RUNNER_TEMP/plugin" --ci
           .host/.venv/bin/python .host/hermes plugins validate "$RUNNER_TEMP/plugin" --install-deps
           .host/.venv/bin/python "$RUNNER_TEMP/plugin/tests/host_runtime.py" --hermes-root "$GITHUB_WORKSPACE/.host"
+          .host/.venv/bin/python "$RUNNER_TEMP/plugin/tests/host_desktop.py"
       - name: Install exact public revision and exercise installed lifecycle and tutorial
         # Exercise capability-positive or explicit-unknown facts on each host.
         env:

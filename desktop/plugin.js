@@ -141,6 +141,29 @@ export function ProjectEditor({selected, project, ...props}) {
 // against the named zone. Never guess an offset here.
 const civil = value => /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value || '') ? `${value}:00` : value;
 
+// A transport failure can arrive as a long string with the backend envelope
+// embedded in it. Summarise the part an operator can act on and keep the raw
+// text available instead of dumping it into the page as prose.
+export function commandFailure(error) {
+  const message = String(error?.message || error || 'Command refused');
+  const start = message.indexOf('{');
+  if (start !== -1) {
+    try {
+      const envelope = JSON.parse(message.slice(start));
+      const detail = envelope?.error || envelope;
+      const code = detail?.code;
+      if (code) {
+        return {headline: [code, detail.operation && `during ${detail.operation}`,
+          detail.next_action].filter(Boolean).join(' · '), detail: message};
+      }
+    } catch {
+      // Not an envelope after all; fall through to the plain summary.
+    }
+    return {headline: message.slice(0, start).trim() || 'Command refused', detail: message};
+  }
+  return {headline: message, detail: null};
+}
+
 // One audited command path for every control: the submitted revision is the one
 // the draft began on, an unknown outcome is retained rather than resent, and no
 // form can name an actor or an authorization.
@@ -148,7 +171,8 @@ export function CommandForm({sender, title, submitLabel, fields, base, build, on
   const [pinned, setPinned] = useState(base);
   const [draft, setDraft] = useState(() => Object.fromEntries(fields.map(field =>
     [field.name, field.initial ? field.initial(base) : base?.[field.name] ?? (field.options ? field.options[0][0] : '')])));
-  const [message, setMessage] = useState('');
+  const [saved, setSaved] = useState('');
+  const [failure, setFailure] = useState(null);
   const [pending, setPending] = useState(false);
   const lock = useRef(false);
   const set = (name, value) => setDraft(current => ({...current, [name]: value}));
@@ -158,10 +182,12 @@ export function CommandForm({sender, title, submitLabel, fields, base, build, on
     try {
       const [operation, args] = build(draft, pinned);
       const result = reconcile ? await sender.reconcile() : await sender.send(operation, args);
-      if (base) setPinned(result);
-      setMessage('Saved. Reading current state…'); onSaved(result);
+      // Keep the pin when the result carries no revision of its own (milestone
+      // operations are checked against their project's revision).
+      if (base && result?.revision !== undefined) setPinned(result);
+      setFailure(null); setSaved('Saved. Reading current state…'); onSaved(result);
     } catch (error) {
-      setMessage(`Save not confirmed. ${error.message}. Read current state before reconciling the same request.`);
+      setSaved(''); setFailure(commandFailure(error));
     } finally {lock.current = false; setPending(false);}
   }
   const control = field => field.options
@@ -175,8 +201,15 @@ export function CommandForm({sender, title, submitLabel, fields, base, build, on
     jsx('h2', {children: title}), ...(preamble || []),
     ...fields.map(field => jsxs('label', {children: [field.label, control(field)]}, field.name)),
     jsx(Button, {type: 'submit', disabled: disabled || pending || !!sender.pending?.(), children: pending ? 'Saving…' : submitLabel}),
-    sender.pending?.() && jsx(Button, {type: 'button', disabled: disabled || pending, onClick: () => submit(true), children: 'Reconcile same request'}),
-    message && jsx('p', {role: 'status', children: message})]});
+    failure && jsxs('div', {role: 'alert', className: 'ue-alert', children: [
+      jsx('strong', {children: 'Save not confirmed.'}), ' ', failure.headline,
+      jsx('p', {children: 'Read the current state before deciding. Nothing is resent automatically.'}),
+      failure.detail && jsxs('details', {children: [jsx('summary', {children: 'Full response'}),
+        jsx('pre', {style: {whiteSpace: 'pre-wrap', overflowWrap: 'anywhere'}, children: failure.detail})]})]}),
+    sender.pending?.() && jsxs('div', {children: [
+      jsx('p', {children: 'This request was kept because its outcome is unknown. Reconciling resends the identical request, so the Ledger treats a duplicate as a no-op instead of a second change.'}),
+      jsx(Button, {type: 'button', disabled: disabled || pending, onClick: () => submit(true), children: 'Reconcile same request'})]}),
+    saved && jsx('p', {role: 'status', children: saved})]});
 }
 
 export function ProjectForm({sender, project, onSaved, disabled}) {
@@ -220,11 +253,15 @@ export function ReviseForm({sender, commitment, onSaved, disabled}) {
       timezone: draft.timezone, expected_revision: pinned.revision, reason: draft.reason}]});
 }
 
-export function MilestoneForm({sender, projectId, milestone, onSaved, disabled}) {
+// A milestone carries no revision of its own: the Ledger checks milestone edits
+// and membership against the owning project's revision, so that is what these
+// controls pin and submit.
+export function MilestoneForm({sender, projectId, projectRevision, milestone, onSaved, disabled}) {
   const fields = milestone
-    ? [{name: 'title', label: 'Milestone name', initial: base => base?.title || ''}, {name: 'reason', label: 'Reason for the change'}]
+    ? [{name: 'title', label: 'Milestone name', initial: () => milestone.title || ''}, {name: 'reason', label: 'Reason for the change'}]
     : [{name: 'milestone_id', label: 'Milestone ID', maxLength: 128}, {name: 'title', label: 'Milestone name'}];
-  return CommandForm({sender, onSaved, disabled, base: milestone, fields,
+  return CommandForm({sender, onSaved, disabled, fields,
+    base: milestone ? {milestone_id: milestone.milestone_id, revision: projectRevision} : null,
     title: milestone ? 'Edit milestone' : 'Add a milestone', submitLabel: 'Save milestone',
     build: (draft, pinned) => milestone
       ? ['edit_milestone', {milestone_id: pinned.milestone_id, title: draft.title,
@@ -232,9 +269,10 @@ export function MilestoneForm({sender, projectId, milestone, onSaved, disabled})
       : ['create_milestone', {milestone_id: draft.milestone_id, project_id: projectId, title: draft.title}]});
 }
 
-export function MembershipForm({sender, milestone, onSaved, disabled}) {
-  return CommandForm({sender, onSaved, disabled, base: milestone,
-    title: `Milestone membership ${milestone.milestone_id}`, submitLabel: 'Save membership',
+export function MembershipForm({sender, milestoneId, projectRevision, onSaved, disabled}) {
+  return CommandForm({sender, onSaved, disabled,
+    base: {milestone_id: milestoneId, revision: projectRevision},
+    title: `Milestone membership ${milestoneId}`, submitLabel: 'Save membership',
     fields: [{name: 'tasks', label: 'Member tasks, one board/task per line', multiline: true,
       maxLength: 65536, required: false, initial: () => ''},
       {name: 'reason', label: 'Reason for the change'}],
@@ -296,7 +334,7 @@ export function Timeline({commitments, start, end, now, onSelect}) {
 const styles = `.ue {font:inherit;color:var(--ui-text-primary);padding:20px;overflow:auto;height:100%;font-size:16px;line-height:1.5}
 .ue * {box-sizing:border-box}.ue h1{font-size:28px;margin:0 0 12px}.ue h2{font-size:22px;margin:24px 0 8px}
 .ue button,.ue input,.ue select{min-height:44px}.ue button:focus-visible,.ue input:focus-visible,.ue select:focus-visible{outline:2px solid var(--ui-accent);outline-offset:2px}
-.ue-scroll{overflow:auto}.ue table{width:100%;border-collapse:collapse;text-align:left}.ue th,.ue td{padding:12px 16px 12px 0;vertical-align:top;border-bottom:1px solid var(--ui-stroke-secondary)}
+.ue-alert{border:1px solid var(--ui-stroke-secondary);border-left-width:4px;padding:12px;margin:12px 0}.ue-alert pre{font:inherit;margin:8px 0 0}.ue-scroll{overflow:auto}.ue table{width:100%;border-collapse:collapse;text-align:left}.ue th,.ue td{padding:12px 16px 12px 0;vertical-align:top;border-bottom:1px solid var(--ui-stroke-secondary)}
 .ue caption{text-align:left;padding:12px 0}.ue-toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.ue-note{padding:12px 0}.ue dl{display:grid;grid-template-columns:minmax(120px,1fr) 3fr;gap:8px}.ue dd{margin:0;overflow-wrap:anywhere}
 .ue [role=progressbar]{min-width:120px}.ue form{max-width:640px}.ue label{display:grid;gap:4px;margin:12px 0}.ue input,.ue select{width:100%;color:inherit;background:var(--ui-bg);border:1px solid var(--ui-stroke-secondary);padding:8px;font:inherit}
 @media(max-width:640px){.ue{padding:12px}.ue th,.ue td{padding-right:12px}.ue dl{grid-template-columns:1fr}.ue dd{margin-bottom:8px}}`;
@@ -339,8 +377,8 @@ export function ProjectDetail({ctx, scope, sender, project, disabled, onSaved}) 
         columns: ['Requested', 'Observed', 'Attributed effect', 'At'],
         row: item => [item.requested ?? item.action, item.observed, item.attributed_effect ?? item.outcome, item.at]})]}),
     commitments: () => jsxs('section', {children: [
-      jsx('div', {className: 'ue-toolbar', children: RANGES.map(([value, label]) =>
-        jsx(Button, {'aria-pressed': hours === value, onClick: () => setHours(value), children: label}, value))}),
+      jsxs('fieldset', {children: [jsx('legend', {children: 'Timeline range'}), jsx('div', {className: 'ue-toolbar', children: RANGES.map(([value, label]) =>
+        jsx(Button, {'aria-pressed': hours === value, onClick: () => setHours(value), children: label}, value))})]}),
       jsx(Timeline, {commitments, now: project.observed_at,
         start: new Date(Date.parse(project.observed_at) - hours * 360000).toISOString(),
         end: new Date(Date.parse(project.observed_at) + hours * 3240000).toISOString(),
@@ -379,9 +417,10 @@ export function ProjectDetail({ctx, scope, sender, project, disabled, onSaved}) 
     jsxs('details', {children: [jsx('summary', {children: 'Edit milestone membership'}),
       jsxs('label', {children: ['Milestone ID to edit', jsx(Input, {value: milestone || '',
         onChange: event => setMilestone(event.target.value)})]}),
-      milestone ? jsx(MembershipForm, {sender, milestone: {milestone_id: milestone,
-        revision: records.data?.items?.find(item => item.milestone_id === milestone)?.revision},
-        disabled, onSaved}, milestone) : jsx('p', {children: 'Name a milestone from the Milestones tab to edit its membership.'})]})]});
+      milestone
+        ? jsx(MembershipForm, {sender, milestoneId: milestone, projectRevision: project.revision,
+          disabled, onSaved}, `${milestone}:${project.revision}`)
+        : jsx('p', {children: 'Name a milestone from the Milestones tab to edit its membership.'})]})]});
 }
 
 function Page({ctx}) {

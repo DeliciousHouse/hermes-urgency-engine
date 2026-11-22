@@ -9,4 +9,10 @@ include tests/host_interventions.py
 include docs/watchdog.md
 include docs/kanban.md
 include docs/interventions.md
+include docs/desktop.md
+include tests/host_desktop.py
+include tests/desktop.test.mjs
+include desktop/plugin.js
+include dashboard/manifest.json
+include dashboard/plugin_api.py
 recursive-include scripts *.py
