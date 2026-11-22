@@ -58,6 +58,12 @@ before an oversized chunk is retained. The allowlist is exactly:
 A milestone row carries no revision column of its own, so milestone title and
 membership edits submit the **project** revision. The page's controls do this for you.
 
+Deadline controls submit civil time (`YYYY-MM-DDTHH:MM:SS`) plus an IANA zone.
+The backend resolves it to an offset timestamp only when that civil time names one
+instant. Nonexistent spring-forward times and ambiguous fall-back times are refused;
+choose another time or use the CLI with an explicit offset. Existing offset-bearing
+API inputs still undergo the Ledger's offset/zone consistency checks.
+
 `revise_deadline` always runs with `intent: "operator"`, injected by the adapter. The
 renderer cannot send an intent, so the page can never present itself as an automatic
 reschedule. `verify_artifact`, `claim_complete`, `reopen_task`, `upsert_task` and

@@ -54,6 +54,31 @@ class ManagementTests(unittest.TestCase):
                 management_command(self.ledger, bad)
         self.assertEqual(len(self.ledger.history('project', 'p')), 2)
 
+    def test_datetime_control_payload_creates_and_revises_real_commitment(self):
+        """protects=working native datetime controls; fails_when=naive form times
+        never reach Ledger; seam=synthetic zone files; no_claim=installed UI.
+        """
+        from urgency_engine.desktop import management_command
+        from test_ledger import fixture_zones, TZPATH, reset_tzpath, ZoneInfo
+        fixture_zones(self.root)
+        self.addCleanup(lambda: (reset_tzpath(TZPATH), ZoneInfo.clear_cache()))
+        payload = dict(operation='set_deadline', request_id='civil', arguments=dict(
+            deadline_id='d', project_id='p', kind='soft', at='2030-01-02T09:30:00',
+            timezone='Synthetic', owner='operator', source='Plan'))
+        result = management_command(self.ledger, payload)
+        self.assertEqual(result['target_at'], '2030-01-02T14:30:00+00:00')
+        self.assertEqual(management_command(self.ledger, payload), result)
+        revised = management_command(self.ledger, dict(operation='revise_deadline', request_id='civil-revise',
+            arguments=dict(deadline_id='d', at='2030-07-02T09:30:00', timezone='Synthetic',
+                           expected_revision=1, reason='Move review')))
+        self.assertEqual(revised['target_at'], '2030-07-02T13:30:00+00:00')
+        self.assertEqual(revised['original_at'], result['original_at'])
+        for value in ('2030-03-10T02:30:00', '2030-11-03T01:30:00', '2030-02-30T09:30:00'):
+            with self.subTest(value=value), self.assertRaises(LedgerError):
+                management_command(self.ledger, dict(operation='revise_deadline', request_id='refused-' + value,
+                    arguments=dict(deadline_id='d', at=value, timezone='Synthetic', expected_revision=2, reason='Invalid')))
+        self.assertEqual(self.ledger.get_deadline('d'), revised)
+
     def test_milestone_edit_preserves_membership_and_uses_project_revision(self):
         self.ledger.upsert_task('b', 't', project_id='p', goal='Deliver', expected_revision=0,
                                 reason='Plan', request_id='task', actor='operator')

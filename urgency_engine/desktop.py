@@ -29,6 +29,32 @@ def command_arguments(payload):
     return operation, {**arguments, 'request_id': payload['request_id'], 'actor': 'desktop-operator'}
 
 
+def command_time(value, zone_name):
+    """Resolve a datetime-local control only when its named-zone instant is unique.
+
+    Explicit offsets still go through the Ledger's existing zone validation.
+    Never pick one side of a DST fold or normalize a nonexistent civil time.
+    """
+    if not isinstance(value, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}', value):
+        return value
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    try:
+        local = datetime.fromisoformat(value)
+        zone = ZoneInfo(zone_name)
+        candidates = {}
+        for fold in (0, 1):
+            aware = local.replace(tzinfo=zone, fold=fold)
+            utc = aware.astimezone(timezone.utc)
+            if utc.astimezone(zone).replace(tzinfo=None) == local:
+                candidates[utc] = aware
+        if len(candidates) == 1:
+            return next(iter(candidates.values())).isoformat()
+    except (ValueError, TypeError, OverflowError, ZoneInfoNotFoundError):
+        pass
+    raise LedgerError('INVALID_INPUT', 'desktop', 'at', next_action=
+                      'Choose an unambiguous date and time in a valid IANA zone; use the CLI with an explicit offset for a DST fold.')
+
+
 def management_command(ledger, payload):
     """Domain adapter only. The host must authorize before opening the writer."""
     operation, arguments = command_arguments(payload)
@@ -37,6 +63,8 @@ def management_command(ledger, payload):
               'set_milestone_tasks': ledger.set_milestone_tasks, 'set_deadline': ledger.set_deadline,
               'revise_deadline': ledger.revise_deadline, 'baseline_scope': ledger.baseline_scope,
               'set_criteria': ledger.set_criteria}
+    if operation in ('set_deadline', 'revise_deadline'):
+        arguments['at'] = command_time(arguments['at'], arguments['timezone'])
     if operation == 'revise_deadline':
         arguments['intent'] = 'operator'
     return routes[operation](**arguments)
