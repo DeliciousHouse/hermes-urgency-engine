@@ -49,6 +49,76 @@ class DesktopViewTests(unittest.TestCase):
         self.assertEqual(view.project('a')['evidence_kind'], 'artifact_byte_identity')
         self.assertEqual(page['coverage'], 'local_ledger_only')
 
+    def test_portfolio_summary_selects_next_by_time_and_keeps_execution_provenance(self):
+        """protects=scanable factual portfolio; fails_when=ID order picks next date;
+        why_new=portfolio summary; seam=real Ledger; no_claim=live worker liveness.
+        """
+        from urgency_engine.desktop import Views
+        from test_ledger import fixture_zones, TZPATH, reset_tzpath, ZoneInfo
+        fixture_zones(self.root)
+        self.addCleanup(lambda: (reset_tzpath(TZPATH), ZoneInfo.clear_cache()))
+        task = self.ledger.get_task('board', 'task')
+        self.ledger.upsert_task('board', 'task', project_id='a', goal='Deliver', status='running',
+            assignee='builder', remaining_seconds=3600, expected_revision=task['revision'],
+            reason='Start', request_id='start', actor='operator')
+        for name, at, kind in [('a-later', '2030-02-01T00:00:00Z', 'hard'),
+                               ('z-next', '2030-01-02T00:00:00Z', 'soft')]:
+            self.ledger.set_deadline(name, project_id='a', kind=kind, at=at, timezone='UTC',
+                owner='operator', source='Plan', request_id=name, actor='operator')
+        data = Views(self.ledger, clock=lambda:self.now).project('a')
+        self.assertEqual(data['summary']['next_commitment']['deadline_id'], 'z-next')
+        self.assertEqual(data['summary']['hard_deadline']['deadline_id'], 'a-later')
+        self.assertEqual(data['summary']['assigned_agents'], ['builder'])
+        self.assertEqual(data['summary']['recorded_running_agents'], ['builder'])
+        self.assertEqual(data['summary']['task_states'], {'running': 1})
+        self.assertEqual(data['summary']['boards'], ['board'])
+        self.assertEqual(data['summary']['schedule_status'], 'ahead')
+        self.assertEqual(data['summary']['forecast_at'], '2030-01-01T01:00:00+00:00')
+        empty = Views(self.ledger, clock=lambda:self.now).project('b')['summary']
+        self.assertIsNone(empty['forecast_at'])
+        self.assertEqual(empty['schedule_status'], 'unknown')
+
+    def test_portfolio_filters_keep_bounded_cursor_even_when_a_page_has_no_matches(self):
+        """protects=honest filter traversal; fails_when=empty filtered page ends inventory;
+        why_new=portfolio filters; seam=real Ledger; no_claim=canonical host permissions.
+        """
+        from urgency_engine.desktop import Views
+        from urgency_engine.ledger import LedgerError
+        view = Views(self.ledger, clock=lambda:self.now)
+        first = view.portfolio(limit=1, project='b')
+        self.assertEqual(first['items'], [])
+        self.assertEqual(first['next'], 'a')
+        self.assertTrue(first['has_more'])
+        self.assertEqual(view.portfolio(after=first['next'], project='b')['items'][0]['project_id'], 'b')
+        self.assertEqual([x['project_id'] for x in view.portfolio(board='board')['items']], ['a'])
+        self.assertEqual(view.portfolio(assignee='absent')['items'], [])
+        self.assertEqual(view.portfolio(urgency='0')['items'][0]['project_id'], 'a')
+        self.assertEqual(view.portfolio(deadline_type='hard')['items'], [])
+        for bad in ({'urgency': '7'}, {'deadline_type': 'automatic'}, {'board': []}):
+            with self.subTest(bad=bad), self.assertRaises(LedgerError):
+                view.portfolio(**bad)
+
+    def test_portfolio_identifies_shared_assignments_and_same_day_targets_without_claiming_overload(self):
+        """protects=visible contention; fails_when=shared agents disappear;
+        why_new=portfolio coordination; seam=real Ledger; no_claim=capacity violation.
+        """
+        from urgency_engine.desktop import Views
+        from test_ledger import fixture_zones, TZPATH, reset_tzpath, ZoneInfo
+        fixture_zones(self.root)
+        self.addCleanup(lambda: (reset_tzpath(TZPATH), ZoneInfo.clear_cache()))
+        for project in ('a', 'b'):
+            self.ledger.upsert_task('shared', project, project_id=project, goal='Deliver',
+                assignee='builder', expected_revision=0, reason='Plan', request_id='shared-' + project, actor='operator')
+            self.ledger.set_deadline('deadline-' + project, project_id=project, kind='hard',
+                at='2030-01-02T12:00:00Z', timezone='UTC', owner='operator', source='Plan',
+                request_id='deadline-' + project, actor='operator')
+        result = Views(self.ledger, clock=lambda:self.now).portfolio()
+        self.assertEqual(result['coordination']['shared_agents'], [{'agent': 'builder', 'projects': ['a', 'b']}])
+        self.assertEqual(result['coordination']['same_day_targets'][0]['projects'], ['a', 'b'])
+        self.assertEqual(result['coordination']['same_day_targets'][0]['utc_day'], '2030-01-02')
+        self.assertEqual(result['coordination']['capacity_assessment'], 'unknown')
+        self.assertEqual(Views(self.ledger, clock=lambda:self.now).portfolio(project='a')['coordination']['shared_agents'], [])
+
     def test_commitments_expose_independent_forecasts_and_preserved_targets(self):
         from urgency_engine.desktop import Views
         from test_ledger import fixture_zones, TZPATH, reset_tzpath, ZoneInfo

@@ -123,6 +123,37 @@ class Views:
     def __init__(self, ledger, *, clock):
         self.ledger, self.clock = ledger, clock
 
+    def summary(self, project_id, commitments, partial):
+        # Aggregate owned Ledger rows, never native board SQL or a subprocess per
+        # task. Names are bounded; counts still cover the complete recorded scope.
+        db = self.ledger.connection
+        states = dict(db.execute('SELECT status,count(*) FROM tasks WHERE project_id=? GROUP BY status', (project_id,)))
+        def names(column, condition=''):
+            return [row[0] for row in db.execute(
+                f'SELECT DISTINCT {column} FROM tasks WHERE project_id=? AND {column} IS NOT NULL {condition} ORDER BY {column} LIMIT 101',
+                (project_id,))]
+        boards = names('board_id')
+        assigned = names('assignee')
+        running = names('assignee', "AND status='running'")
+        active = sorted((d for d in commitments if not d['actual_verified_at']), key=lambda d: (d['target_at'], d['deadline_id']))
+        whole = [d for d in commitments if d['board_id'] is None and d['milestone_id'] is None]
+        forecast = whole[0]['forecast_at'] if whole and not partial else None
+        status = 'unknown'
+        if not partial and active:
+            if any(datetime.fromisoformat(d['target_at']) < self.clock() for d in active):
+                status = 'overdue'
+            elif any(d['forecast']['level'] >= 3 for d in active):
+                status = 'at risk'
+            elif all(d['forecast_at'] is not None for d in active):
+                status = 'ahead' if all(d['target_variance_seconds'] < 0 for d in active) else 'on track'
+        return dict(task_states=states, boards=boards[:100], assigned_agents=assigned[:100],
+                    recorded_running_agents=running[:100], names_partial=any(len(v) > 100 for v in (boards, assigned, running)),
+                    next_commitment=active[0] if active and not partial else None,
+                    hard_deadline=next((d for d in active if d['kind'] == 'hard'), None) if not partial else None,
+                    next_milestone=next((d for d in active if d['milestone_id']), None) if not partial else None,
+                    forecast_at=forecast, forecast_evidence=whole[0]['forecast']['evidence'] if whole and not partial else 'unknown',
+                    schedule_status=status, coverage='recorded_ledger_state_not_live_worker_liveness')
+
     def project(self, project_id):
         project = self.ledger.get_project(project_id)
         progress = self.ledger.progress(project_id)
@@ -135,11 +166,12 @@ class Views:
             # inspector pages tasks separately rather than duplicating it per marker.
             explanation.pop('input_revisions')
             commitments.append(explanation)
+        summary = self.summary(project_id, commitments, more)
         if self.ledger.get_project(project_id)['revision'] != project['revision']:
             raise LedgerError('REVISION_CONFLICT', 'desktop', next_action='Reload the changed project.')
         active = [d for d in commitments if d['actual_verified_at'] is None]
         urgent = max(active, key=lambda d: d['forecast']['level'], default=None)
-        return {**project, 'progress': progress, **EVIDENCE,
+        return {**project, 'progress': progress, 'summary': summary, **EVIDENCE,
                 'commitments': commitments, 'commitments_has_more': more,
                 'commitments_next': deadlines[-1]['deadline_id'] if more else None,
                 'urgency': urgent['forecast'] if urgent and not more else None,
@@ -185,9 +217,49 @@ class Views:
                 'coverage': 'local_ledger_only',
                 'range_policy': 'Undated tasks remain visible; range controls the time axis, not task membership.'}
 
-    def portfolio(self, *, limit=100, after=None):
+    def portfolio(self, *, limit=100, after=None, board=None, project=None, assignee=None,
+                  urgency=None, deadline_type=None):
+        from .ledger import _id
+        for name, value in (('board', board), ('project', project), ('assignee', assignee)):
+            if value is not None:
+                _id(value, name)
+        if urgency is not None and urgency not in tuple(str(n) for n in range(7)):
+            raise LedgerError('INVALID_INPUT', 'portfolio', 'urgency')
+        if deadline_type is not None and deadline_type not in ('hard', 'soft'):
+            raise LedgerError('INVALID_INPUT', 'portfolio', 'deadline_type')
         rows = self.ledger.list_projects(limit, after)
         more = bool(rows and self.ledger.list_projects(1, rows[-1]['project_id']))
-        return {'items': [self.project(row['project_id']) for row in rows],
+        items = []
+        for row in rows:
+            project_id = row['project_id']
+            if project is not None and project_id != project:
+                continue
+            db = self.ledger.connection
+            if board is not None and not db.execute('SELECT 1 FROM tasks WHERE project_id=? AND board_id=? LIMIT 1', (project_id, board)).fetchone():
+                continue
+            if assignee is not None and not db.execute('SELECT 1 FROM tasks WHERE project_id=? AND assignee=? LIMIT 1', (project_id, assignee)).fetchone():
+                continue
+            if deadline_type is not None and not db.execute('SELECT 1 FROM deadlines WHERE project_id=? AND kind=? LIMIT 1', (project_id, deadline_type)).fetchone():
+                continue
+            item = self.project(project_id)
+            if item['revision'] != row['revision']:
+                raise LedgerError('REVISION_CONFLICT', 'portfolio', next_action='Reload the changed portfolio.')
+            if urgency is not None and str((item['urgency'] or {}).get('level', 0)) != urgency:
+                continue
+            items.append(item)
+        agents, days = {}, {}
+        for item in items:
+            for agent in item['summary']['assigned_agents']:
+                agents.setdefault(agent, set()).add(item['project_id'])
+            for deadline in item['commitments']:
+                if not deadline['actual_verified_at']:
+                    days.setdefault(deadline['target_at'][:10], set()).add(item['project_id'])
+        shared = [{'agent': agent, 'projects': sorted(projects)} for agent, projects in sorted(agents.items()) if len(projects) > 1]
+        collisions = [{'utc_day': day, 'projects': sorted(projects)} for day, projects in sorted(days.items()) if len(projects) > 1]
+        coordination = dict(shared_agents=shared[:100], same_day_targets=collisions[:100],
+                            truncated=len(shared) > 100 or len(collisions) > 100,
+                            coverage='loaded_project_and_commitment_pages', capacity_assessment='unknown')
+        return {'items': items, 'coordination': coordination,
                 'next': rows[-1]['project_id'] if more else None, 'has_more': more,
-                'observed_at': self.clock().isoformat(), 'coverage': 'local_ledger_only'}
+                'observed_at': self.clock().isoformat(), 'coverage': 'local_ledger_only',
+                'scanned': len(rows), 'filter_policy': 'Filters select recorded Ledger data within each bounded project page; an empty page may have a next cursor.'}

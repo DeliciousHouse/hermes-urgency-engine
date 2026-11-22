@@ -188,21 +188,72 @@ const bindings = {measured: 'Measured', not_configured: 'Not configured for urge
   measurement_not_loaded: 'Measurement not loaded on this page', canonical_unavailable: 'Canonical inventory unavailable',
   no_canonical_project: 'No canonical project in this scope'};
 
-export function Portfolio({rows, onSelect}) {
-  return jsx('div', {className: 'ue-scroll', children: jsxs('table', {children: [
-    jsx('caption', {children: 'Projects · verified progress and deadline risk'}),
-    jsx('thead', {children: jsx('tr', {children: ['Project', 'Measurement', 'Verified progress', 'Urgency', 'Next commitment'].map(label => jsx('th', {scope: 'col', children: label}, label))})}),
-    jsx('tbody', {children: rows.map(row => {
-      const item = row.measured;
+export function PortfolioFilters({onApply}) {
+  const empty = {board: '', project: '', assignee: '', urgency: '', deadline_type: ''};
+  const [draft, setDraft] = useState(empty);
+  const fields = [['board', 'Board ID'], ['project', 'Project ID'], ['assignee', 'Assigned agent'],
+    ['urgency', 'Urgency', [['', 'Any urgency'], ...levels.map((label, index) => [String(index), label])]],
+    ['deadline_type', 'Deadline type', [['', 'Any deadline'], ['hard', 'Hard'], ['soft', 'Soft']]]];
+  return jsxs('form', {className: 'ue-filters', onSubmit: event => {event.preventDefault(); onApply(draft);}, children: [
+    ...fields.map(([name, label, options]) => jsxs('label', {children: [label,
+      jsx(options ? 'select' : Input, {value: draft[name], maxLength: 128,
+        onChange: event => setDraft(current => ({...current, [name]: event.target.value})),
+        ...(options ? {children: options.map(([value, text]) => jsx('option', {value, children: text}, value))} : {})})]}, name)),
+    jsx(Button, {type: 'submit', children: 'Apply filters'}),
+    jsx(Button, {type: 'button', onClick: () => {setDraft(empty); onApply(empty);}, children: 'Clear filters'})]});
+}
+
+export function Portfolio({rows, onSelect, sort = 'risk'}) {
+  const sorted = [...rows].sort((a, b) => {
+    const name = row => row.canonical?.name || row.measured?.title || row.key;
+    const value = row => sort === 'risk' ? -(row.measured?.urgency?.level || 0)
+      : Date.parse(row.measured?.summary?.next_commitment?.target_at) || Infinity;
+    return (sort === 'name' ? 0 : value(a) - value(b)) || name(a).localeCompare(name(b));
+  });
+  const fact = (label, value) => jsxs('div', {children: [jsx('strong', {children: `${label}: `}), value]});
+  const commitment = item => item ? `${item.kind} · ${date(item.target_at)}` : 'None recorded / unknown';
+  return jsx('div', {className: 'ue-scroll', children: jsxs('table', {className: 'ue-portfolio', children: [
+    jsx('caption', {children: 'Projects · verified progress and deadline risk (sorted within this page)'}),
+    jsx('thead', {children: jsx('tr', {children: ['Project', 'Verified progress', 'Urgency', 'Next commitment'].map(label => jsx('th', {scope: 'col', children: label}, label))})}),
+    jsx('tbody', {children: sorted.map(row => {
+      const item = row.measured, summary = item?.summary;
       const title = row.canonical?.name || item?.title;
       return jsxs('tr', {children: [
-        cell(item ? jsx(Button, {onClick: () => onSelect(item.project_id), children: title}) : title),
-        cell(`${bindings[row.binding]}${row.canonical?.archived ? ' · archived canonical project' : ''}`),
-        cell(item ? jsx(Progress, {progress: item.progress}) : 'Not measured'),
-        cell(item ? risk(item) : 'Unmeasured'),
-        cell(item?.commitments?.length ? `${item.commitments[0].kind} · ${date(item.commitments[0].target_at)}` : 'No recorded commitment')
+        cell(jsxs('div', {children: [item ? jsx(Button, {onClick: () => onSelect(item.project_id), children: title}) : title,
+          fact('Measurement', `${bindings[row.binding]}${row.canonical?.archived ? ' · archived' : ''}`),
+          summary && jsxs('details', {children: [jsx('summary', {children: 'Execution and forecast'}),
+            fact('Recorded task states', Object.entries(summary.task_states || {}).map(([state, count]) => `${state}: ${count}`).join(' · ') || 'No tasks'),
+            fact('Assigned', summary.assigned_agents?.join(', ') || 'None recorded'),
+            fact('Recorded running', summary.recorded_running_agents?.join(', ') || 'None recorded'),
+            fact('Forecast', date(summary.forecast_at)), fact('Forecast evidence', summary.forecast_evidence),
+            fact('Hard deadline', commitment(summary.hard_deadline)), fact('Next milestone', commitment(summary.next_milestone)),
+            fact('Last verified progress', date(item.progress?.last_verified_progress_at)),
+            jsx('p', {children: 'Recorded Ledger state, not live worker liveness. Source tasks shows canonical run freshness.'}),
+            summary.names_partial && jsx('p', {children: 'Only the first 100 board/agent names are listed.'})]})]})),
+        cell(item ? jsxs('div', {children: [jsx(Progress, {progress: item.progress}),
+          jsx('p', {children: `${item.progress?.verified_weight ?? 'Unknown'} verified of ${item.progress?.current_weight ?? 'unknown'} current weight`})]}) : 'Not measured'),
+        cell(jsxs('div', {children: [item ? risk(item) : 'Unmeasured',
+          fact('Schedule', summary?.schedule_status || 'unknown')]})),
+        cell(commitment(summary?.next_commitment))
       ]}, row.key);
     })})]})});
+}
+
+export function PortfolioTimeline({projects, coordination, now, onSelect}) {
+  const [page, setPage] = useState(0);
+  const commitments = projects.flatMap(project => (project.commitments || [])
+    .filter(item => item.kind === 'hard' || item.milestone_id)
+    .map(item => ({...item, project_id: project.project_id, label: `${project.title} · ${item.deadline_id}`})));
+  const offset = Math.min(page, Math.max(0, Math.ceil(commitments.length / 100) - 1)) * 100;
+  return jsxs('section', {children: [
+    jsx('h2', {children: 'Portfolio commitments and shared resources'}),
+    jsx('p', {children: 'Loaded project and commitment pages only. Same UTC-day targets and shared assignments are potential contention, not proof of a capacity violation.'}),
+    ...(coordination?.shared_agents || []).map(item => jsx('p', {children: `Shared agent ${item.agent}: ${item.projects.join(', ')}`}, item.agent)),
+    ...(coordination?.same_day_targets || []).map(item => jsx('p', {children: `Deadline collision ${item.utc_day} (UTC): ${item.projects.join(', ')}`}, item.utc_day)),
+    coordination?.truncated && jsx('p', {role: 'status', children: 'Coordination list truncated at 100 groups.'}),
+    jsx(TimelineView, {commitments: commitments.slice(offset, offset + 100), now, onSelect: item => onSelect(item.project_id)}),
+    offset > 0 && jsx(Button, {onClick: () => setPage(0), children: 'First portfolio commitments'}),
+    offset + 100 < commitments.length && jsx(Button, {onClick: () => setPage(offset / 100 + 1), children: 'Next portfolio commitments'})]});
 }
 
 export function ProjectEditor({selected, project, ...props}) {
@@ -475,7 +526,7 @@ export function Timeline({commitments, start, end, now, onSelect}) {
         jsx('div', {style: {position: 'relative', height: 48, marginLeft: 180}, children: marker(now, 'Current time', '↓', () => {})}),
         ...commitments.map(item => jsxs('div', {style: {display: 'grid', gridTemplateColumns: '180px 1fr', minHeight: 176,
           borderBottom: '1px solid var(--ui-stroke-secondary)'}, children: [
-          jsx(Button, {onClick: () => onSelect(item), children: item.deadline_id}),
+          jsx(Button, {onClick: () => onSelect(item), children: item.label || item.deadline_id}),
           jsxs('div', {style: {position: 'relative'}, children: [
             marker(item.original_at, 'Original', '│', () => onSelect(item)),
             marker(item.target_at, item.kind === 'hard' ? 'Hard target' : 'Soft target', item.kind === 'hard' ? '◆' : '●', () => onSelect(item), 1),
@@ -700,6 +751,9 @@ function Page({ctx}) {
 function ScopedPage({ctx, scope, identity, sender, writer, requestWriter}) {
   const [selected, setSelected] = useState(null);
   const [after, setAfter] = useState(null);
+  const [filters, setFilters] = useState({});
+  const [sort, setSort] = useState('risk');
+  const [inventoryPage, setInventoryPage] = useState(0);
   const gateway = useValue(host.state.gateway);
   const client = useQueryClient();
   useEffect(() => {
@@ -712,12 +766,18 @@ function ScopedPage({ctx, scope, identity, sender, writer, requestWriter}) {
       client.invalidateQueries({queryKey: ['urgency', scope.connection, scope.profile, scope.epoch], refetchType: 'none'});
     });
   }, [ctx, client, scope.connection, scope.profile, scope.epoch]);
-  const path = selected ? `/projects/${encodeURIComponent(selected)}` : `/portfolio?limit=100${after ? '&after=' + encodeURIComponent(after) : ''}`;
+  const filterQuery = new URLSearchParams(Object.entries(filters).filter(([, value]) => value)).toString();
+  const path = selected ? `/projects/${encodeURIComponent(selected)}` : `/portfolio?limit=100${after ? '&after=' + encodeURIComponent(after) : ''}${filterQuery ? '&' + filterQuery : ''}`;
   const query = useRead(ctx, path, scope);
   const inventory = useQuery({queryKey: ['urgency', scope.connection, scope.profile, scope.epoch, 'canonical'],
     queryFn: () => canonicalProjects(scope), retry: false, staleTime: 5000, enabled: !selected && gateway === 'open',
     refetchInterval: state => state.state.error ? 60000 : 30000, refetchIntervalInBackground: false});
   const writable = writer && gateway === 'open' && !identity.isError && !!identity.data?.scope_id;
+  const rows = selected ? [] : mergeInventory(inventory.data, query.data?.items,
+    {measurementsComplete: !after && !query.data?.has_more && !filterQuery, canonicalAvailable: !inventory.isError && !inventory.isPending})
+    .filter(row => row.measured || (!filters.assignee && !filters.urgency && !filters.deadline_type
+      && (!filters.board || row.canonical?.board_slug === filters.board)
+      && (!filters.project || row.key === filters.project)));
   return jsxs('main', {className: 'ue', 'aria-label': 'Urgency Engine', children: [
     jsx('style', {children: styles}), jsx('h1', {children: 'Urgency Engine'}),
     jsx('p', {children: `${connectionLabel(scope.connection, gateway)} / ${scope.profile} · ${gateway}`}),
@@ -737,11 +797,18 @@ function ScopedPage({ctx, scope, identity, sender, writer, requestWriter}) {
       selected ? jsx(ProjectDetail, {ctx, scope, sender, project: query.data,
         disabled: !writable || query.isError || query.isPending, onSaved: () => query.refetch()}, selected) : jsxs('section', {children: [
           inventoryNotice(inventory) && jsx('p', {className: 'ue-note', role: 'status', children: inventoryNotice(inventory)}),
-          jsx(Portfolio, {rows: mergeInventory(inventory.data, query.data.items,
-            {measurementsComplete: !after && !query.data.has_more, canonicalAvailable: !inventory.isError && !inventory.isPending}), onSelect: setSelected}),
-          !query.data.items.length && !inventory.data?.length && jsx('p', {children: 'No configured projects in this scope. Create a project to begin measuring verified work.'}),
-          after && jsx(Button, {onClick: () => setAfter(null), children: 'First page'}),
-          query.data.has_more && jsx(Button, {onClick: () => setAfter(query.data.next), children: 'Next projects'})]})]})]});
+          jsx(PortfolioFilters, {onApply: value => {setFilters(value); setAfter(null); setInventoryPage(0);}}),
+          jsx('p', {children: 'Filters use recorded measurements; unmeasured projects cannot match agent, urgency or deadline filters. Empty pages can have more matches. Clear filters to see the full canonical inventory.'}),
+          jsxs('label', {children: ['Sort loaded page', jsx('select', {value: sort, onChange: event => setSort(event.target.value),
+            children: [['risk', 'Urgency first'], ['name', 'Project name'], ['target', 'Earliest commitment']].map(([value, label]) => jsx('option', {value, children: label}, value))})]}),
+          jsx(Portfolio, {rows: rows.slice(inventoryPage * 100, (inventoryPage + 1) * 100), sort, onSelect: setSelected}),
+          inventoryPage > 0 && jsx(Button, {onClick: () => setInventoryPage(value => value - 1), children: 'Previous inventory rows'}),
+          (inventoryPage + 1) * 100 < rows.length && jsx(Button, {onClick: () => setInventoryPage(value => value + 1), children: 'More inventory rows'}),
+          jsx(PortfolioTimeline, {projects: query.data.items, coordination: query.data.coordination,
+            now: query.data.observed_at, onSelect: setSelected}, path),
+          !filterQuery && !query.data.has_more && !query.data.items.length && !inventory.data?.length && jsx('p', {children: 'No configured projects in this scope. Create a project to begin measuring verified work.'}),
+          after && jsx(Button, {onClick: () => {setAfter(null); setInventoryPage(0);}, children: 'First page'}),
+          query.data.has_more && jsx(Button, {onClick: () => {setAfter(query.data.next); setInventoryPage(0);}, children: 'Next projects'})]})]})]});
 }
 
 export default {

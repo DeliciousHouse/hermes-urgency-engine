@@ -25,8 +25,8 @@ payload cannot choose a database or claim a permission. Responses are
 | Route | Query | Returns |
 |---|---|---|
 | `GET /identity` | — | `scope_id`: opaque 32-character namespace, or `null` before explicit initialization; never creates storage |
-| `GET /portfolio` | `limit` (1-500, default 100), `after` | `items` (one project summary each), `next`, `has_more`, `observed_at`, `coverage` |
-| `GET /projects/{project_id}` | — | project, `progress`, `commitments`, `commitments_has_more`, `urgency`, `risk_coverage`, `observed_at`, `coverage` |
+| `GET /portfolio` | `limit` (1-500, default 100), `after`, `board`, `project`, `assignee`, `urgency` (0-6), `deadline_type` (`hard`/`soft`) | `items`, `next`, `has_more`, `scanned`, `coordination`, `observed_at`, `coverage` |
+| `GET /projects/{project_id}` | — | project, `progress`, `summary`, `commitments`, `commitments_has_more`, `urgency`, `risk_coverage`, `observed_at`, `coverage` |
 | `GET /projects/{project_id}/commitments` | `limit`, `after` (deadline ID) | paged deadline explanations, `has_more`, `next`, `project_revision`, `observed_at` |
 | `GET /projects/{project_id}/timeline` | `start`, `end` (UTC ISO 8601, span 0 to 366 days), `limit`, `after` | paged task rows with `started_at`, `dependencies` and `blocked_periods` explicitly `null`, plus `start`, `end`, `now`, `range_policy` |
 | `GET /projects/{project_id}/milestones` | `limit`, `after` | `items`, `has_more`, `next` |
@@ -83,9 +83,32 @@ reschedule. `verify_artifact`, `claim_complete`, `reopen_task`, `upsert_task` an
 
 ### Controls on the page
 
-Portfolio: a project table (project, measurement binding, verified progress, urgency,
-next commitment), a canonical-inventory notice, project paging, and a create-project
-form. Detail: progress, risk and its reasons, weighted scope against the baseline, the
+Portfolio: a project table with measurement binding, weighted verified progress,
+engine urgency, schedule status and next outstanding commitment. Expand **Execution
+and forecast** for recorded task-state counts, assigned/running agent names, a
+project-scoped forecast and its evidence class, hard deadline, next milestone and
+last verified progress. Running Ledger state is not live worker liveness. Board and
+agent name lists cap at 100 with a partial indicator; counts cover all recorded tasks.
+The next commitment is chosen by target time, not ID order. A summary with more than
+100 commitments has unknown aggregate risk, next dates and forecast. A project
+forecast requires a project-scoped commitment, not a guess from one milestone.
+
+Use Board ID, Project ID, Assigned agent, Urgency and Deadline type filters, then
+**Apply filters**. Filters are exact matches on recorded Ledger data. Urgency 0 means
+unmeasured, including partial risk. Each request scans at most `limit` project rows;
+an empty filtered page can still have a next cursor. Use **Next projects** to keep
+looking. **Clear filters** restores canonical unmeasured rows. Unmeasured projects
+cannot match agent, urgency or deadline filters. The canonical inventory has its own
+100-row display pages. Sort by urgency, name or next commitment within the loaded
+display page; sorting never changes backend state.
+
+The portfolio timeline shows hard deadlines and milestone targets from loaded
+project/commitment pages, 100 at a time. Selecting a marker opens its project. The
+backend highlights shared assigned agents and targets on the same UTC day among
+the loaded projects, capped at 100 groups. These are potential contention, not a
+capacity-violation claim; no capacity budget is inferred. Off-page commitments and
+assignments can reveal additional contention. Detail: progress, risk and its reasons,
+weighted scope against the baseline, the
 commitment timeline with `6h / 24h / 7d / 30d / 90d` presets, zoom, Earlier/Later and
 Fit controls, and tabs for Commitments, Milestones, Verified work, Source tasks,
 History and Interventions. Commitment pages have First/Next controls; Fit covers
@@ -469,14 +492,12 @@ recovery controls or completion of the sixteen-scenario acceptance matrix.
 
 ### Known gaps in this release
 
-- **Current recovery controls still need native captures and acceptance.** The
-  scoped screenshots above do not establish those newer interactions.
-- **Portfolio-level timeline and deadline-collision view are not implemented.** The
-  portfolio shows each project's next commitment; it does not yet draw a cross-project
-  timeline or highlight contention for shared agents. Project timelines currently
-  show paged commitment markers, not the complete execution/dependency graph.
-- **Filtering is limited to paging.** Board, assignee, urgency and deadline-type
-  filters named in the amendment are not implemented in this slice.
+- **Current portfolio controls still need native captures and acceptance.** The
+  scoped screenshots above do not establish these newer interactions. Recovery and
+  single-writer handoff have scoped native operator evidence, not full release QA.
+- **Portfolio coordination covers loaded pages only.** Shared assignments and
+  same-day targets do not establish actual resource overload. The full dependency
+  graph and capacity-aware planning overlay are still unfinished.
 - **Task intervals, dependencies, blocked periods and critical path are reported as
   `null`,** not computed. The timeline is commitment-based; the task read model
   deliberately returns explicit nulls rather than invented execution periods.

@@ -85,6 +85,12 @@ def child():
     assert missing.status_code == 404 and missing.json()['error']['code'] == 'NOT_FOUND'
     invalid = client.get(url + '/portfolio?limit=501', headers=headers)
     assert invalid.status_code == 400 and invalid.json()['error']['code'] == 'INVALID_INPUT'
+    filtered = client.get(url + '/portfolio?project=synthetic&board=board&urgency=0', headers=headers)
+    assert filtered.status_code == 200, (filtered.status_code, filtered.text)
+    assert [row['project_id'] for row in filtered.json()['data']['items']] == ['synthetic']
+    assert client.get(url + '/portfolio?assignee=absent', headers=headers).json()['data']['items'] == []
+    assert client.get(url + '/portfolio?deadline_type=automatic', headers=headers).status_code == 400
+    assert client.get(url + '/portfolio?project=synthetic&project=other', headers=headers).status_code == 400
     denied_command = client.post(url + '/commands', json={'request_id': 'rename', 'operation': 'edit_project',
         'arguments': {'project_id': 'synthetic', 'title': 'Changed', 'expected_revision': 1, 'reason': 'Edit'}}, headers=headers)
     assert denied_command.status_code == 403, (denied_command.status_code, denied_command.text)

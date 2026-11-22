@@ -138,6 +138,64 @@ test('deadline and membership editors keep their identity across background revi
   assert.deepEqual(keys(1), keys(2), 'server revisions must not unmount unsaved drafts');
 });
 
+// protects=usable filtered portfolio; fails_when=controls do not reach scoped reads;
+// why_new=portfolio management; seam=React tree; no_claim=native input or styling.
+test('portfolio filters apply exact values and the summary exposes recorded facts', async () => {
+  const {api, reset} = await load(); const applied = [];
+  let tree = api.PortfolioFilters({onApply: value => applied.push(value)});
+  for (const [label, value] of [['Board ID', 'b'], ['Project ID', 'p'], ['Assigned agent', 'builder'],
+    ['Urgency', '4'], ['Deadline type', 'hard']]) labelled(tree, label).props.onChange({target: {value}});
+  reset(); tree = api.PortfolioFilters({onApply: value => applied.push(value)});
+  tree.props.onSubmit({preventDefault() {}});
+  assert.deepEqual(JSON.parse(JSON.stringify(applied[0])), {board: 'b', project: 'p', assignee: 'builder', urgency: '4', deadline_type: 'hard'});
+  const rows = api.mergeInventory([], [{project_id: 'p', title: 'Launch', progress: {percent: 25, verified_weight: 1, current_weight: 4},
+    urgency: {level: 4}, summary: {task_states: {running: 1}, assigned_agents: ['builder'], recorded_running_agents: ['builder'],
+      schedule_status: 'at risk', forecast_at: '2030-01-02T00:00:00Z', forecast_evidence: 'insufficient_data',
+      next_commitment: {kind: 'hard', target_at: '2030-01-01T00:00:00Z'}}}]);
+  reset(); const text = JSON.stringify(expand(api.Portfolio({rows, onSelect() {}})));
+  for (const value of ['builder', 'at risk', 'insufficient_data', '1 verified of 4', 'Recorded running']) assert.ok(text.includes(value), value);
+});
+
+test('applied portfolio filters enter the scoped REST key and preserve canonical inventory', async () => {
+  const queries = [], contributions = [];
+  const {api, reset, mount} = await load({sdk: {useQuery: options => {
+    queries.push(options.queryKey.at(-1)); return {data: options.queryKey.at(-1) === 'canonical' ? [] : {items: [], coverage: 'local_ledger_only'}};
+  }}});
+  api.default.register({register: c => contributions.push(c)});
+  const page = contributions.find(c => c.area === 'routes').render();
+  const scoped = page.type(page.props);
+  mount();
+  let tree = scoped.type(scoped.props);
+  let filter;
+  (function walk(node) {
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (!node || typeof node !== 'object') return;
+    if (node.type?.name === 'PortfolioFilters') filter = node;
+    walk(node.props?.children);
+  })(tree);
+  assert.ok(filter, 'filters must be reachable from the portfolio');
+  filter.props.onApply({board: 'board-a', assignee: 'builder', urgency: '4', project: '', deadline_type: 'hard'});
+  reset(); scoped.type(scoped.props);
+  assert.ok(queries.some(path => path.includes('board=board-a') && path.includes('assignee=builder') && path.includes('urgency=4') && path.includes('deadline_type=hard')));
+});
+
+test('portfolio timeline pages major commitments and opens their owning project', async () => {
+  const {api, reset} = await load(), opened = [];
+  const projects = [{project_id: 'a', title: 'Alpha', commitments: Array.from({length: 101}, (_, index) =>
+    ({deadline_id: `d${index}`, kind: 'hard', target_at: '2030-02-01T00:00:00Z'}))}];
+  const props = {projects, now: '2030-01-01T00:00:00Z', onSelect: id => opened.push(id),
+    coordination: {shared_agents: [{agent: 'builder', projects: ['a', 'b']}], same_day_targets: [{utc_day: '2030-02-01', projects: ['a', 'b']}]}};
+  let tree = api.PortfolioTimeline(props);
+  const timeline = node => node.props.children.find(n => n?.type?.name === 'TimelineView');
+  assert.equal(timeline(tree).props.commitments.length, 100);
+  timeline(tree).props.onSelect(timeline(tree).props.commitments[0]);
+  assert.deepEqual(opened, ['a']);
+  assert.match(JSON.stringify(tree), /builder/);
+  const next = tree.props.children.find(n => n?.props?.children === 'Next portfolio commitments');
+  next.props.onClick(); reset(); tree = api.PortfolioTimeline(props);
+  assert.equal(timeline(tree).props.commitments.length, 1);
+});
+
 test('portfolio renders authoritative project names and risk without status-derived progress', async () => {
   const {api} = await load();
   const rows = api.mergeInventory([], [{project_id: 'a', title: 'Synthetic alpha',

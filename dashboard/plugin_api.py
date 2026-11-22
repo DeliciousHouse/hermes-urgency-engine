@@ -99,7 +99,9 @@ def initialize_identity():
 @router.get('/portfolio')
 def portfolio(request: Request):
     def read():
-        arguments = page_arguments(request)
+        filters = ('board', 'project', 'assignee', 'urgency', 'deadline_type')
+        arguments = page_arguments(request, filters)
+        arguments.update({key: request.query_params[key] for key in filters if key in request.query_params})
         return read_view(lambda view: view.portfolio(**arguments))
     return respond(read)
 
