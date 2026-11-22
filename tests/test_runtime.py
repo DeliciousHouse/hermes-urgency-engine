@@ -62,6 +62,101 @@ class RuntimeTests(unittest.TestCase):
     def project(self, name='p'):
         return self.request('create_project', project_id=name, title='Objective SYNTHETIC_SECRET', request_id=name)
 
+    def test_outcomes_cli_exports_verified_scoped_pages_without_writes(self):
+        import hashlib
+        (self.root / 'artifact').write_bytes(b'proof')
+        with self.runtime.open(self.runtime.settings()) as ledger:
+            for project in ('p', 'q'):
+                ledger.create_project(project, project, request_id=project, actor='operator')
+                ledger.upsert_task('b', project, project_id=project, goal='work', expected_revision=0,
+                                   request_id='task-' + project, actor='operator', reason='plan')
+                ledger.set_criteria('b', project, [dict(criterion_id='c', description='check', weight=1,
+                    required=True, expected_sha256=hashlib.sha256(b'proof').hexdigest())],
+                    expected_revision=1, reason='scope', request_id='scope-' + project, actor='operator')
+                ledger.verify_artifact('b', project, 'c', 'artifact', expected_revision=2,
+                    reason='check', request_id='verify-' + project, actor='verifier')
+            ledger.reopen_task('b', 'p', expected_revision=3, reason='again', request_id='reopen', actor='operator')
+            ledger.verify_artifact('b', 'p', 'c', 'artifact', expected_revision=4,
+                reason='check', request_id='SYNTHETIC_SECRET', actor='verifier')
+            expected = ledger.export_outcomes('p')
+        before = {p.relative_to(self.root): p.read_bytes() if p.is_file() else None for p in self.root.rglob('*')}
+        parser = setup_parser(Parser())
+        def command(*args):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = self.runtime.cli(parser.parse_args(args))
+            self.assertEqual(code, 0, err.getvalue())
+            self.assertEqual(err.getvalue(), '')
+            self.assertNotIn('SYNTHETIC_SECRET', out.getvalue())
+            return json.loads(out.getvalue())['data']
+        first = command('outcomes', '--project', 'p', '--limit', '1')
+        self.assertEqual(first, dict(items=expected[:1], has_more=True, next=expected[0]['sequence']))
+        second = command('outcomes', '--project', 'p', '--limit', '1', '--after', str(first['next']))
+        self.assertEqual(second['items'][0]['evidence_id'], '[REDACTED]')
+        self.assertEqual(second['items'][0]['sequence'], expected[1]['sequence'])
+        self.assertFalse(second['has_more'])
+        self.assertIsNone(second['next'])
+        self.assertEqual(command('outcomes', '--project', 'q')['items'][0]['project_id'], 'q')
+        self.assertEqual(command('outcomes', '--project', 'p', '--limit', '500', '--after',
+                                 str(second['items'][0]['sequence'])), dict(items=[], has_more=False, next=None))
+        self.ctx.redact_text = lambda *args, **kwargs: None
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = self.runtime.cli(parser.parse_args(['outcomes', '--project', 'p']))
+        self.assertEqual(code, 1)
+        self.assertEqual(out.getvalue(), '')
+        self.assertEqual(json.loads(err.getvalue())['error']['code'], 'REDACTION_FAILED')
+        self.assertEqual(before, {p.relative_to(self.root): p.read_bytes() if p.is_file() else None
+                                  for p in self.root.rglob('*')})
+
+    def test_outcomes_cli_validates_bounds_and_refuses_other_surfaces(self):
+        from urgency_engine.runtime import TOOL_SCHEMA
+        parser = setup_parser(Parser())
+        self.assertIn('outcomes', parser.format_help())
+        self.assertNotIn('outcomes', TOOL_SCHEMA['parameters']['properties']['operation']['enum'])
+        for surface in ('cli', 'tool', 'slash', 'hook'):
+            result = self.runtime.run_request('outcomes', {'project_id': 'p'}, surface=surface)
+            self.assertEqual(result['error']['code'], 'UNKNOWN_OPERATION')
+        self.assertFalse(json.loads(self.runtime.tool({'operation': 'outcomes', 'arguments': {'project_id': 'p'}}))['ok'])
+        self.assertFalse(json.loads(self.runtime.slash('outcomes --project p'))['ok'])
+        for option, value, field in (('--limit', '0', 'limit'), ('--limit', '501', 'limit'),
+                                     ('--after', '-1', 'after'), ('--after', str(2**63), 'after')):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = self.runtime.cli(parser.parse_args(['outcomes', '--project', 'p', option, value]))
+            self.assertEqual(code, 1)
+            self.assertEqual(out.getvalue(), '')
+            self.assertEqual(json.loads(err.getvalue())['error']['field'], field)
+        for args in (['outcomes'], ['outcomes', '--project', 'p', '--limit', 'SYNTHETIC_SECRET'],
+                     ['outcomes', '--project', 'p', '--after', 'SYNTHETIC_SECRET']):
+            err = io.StringIO()
+            with redirect_stderr(err), self.assertRaises(SystemExit) as raised:
+                parser.parse_args(args)
+            self.assertEqual(raised.exception.code, 2)
+            self.assertNotIn('SYNTHETIC_SECRET', err.getvalue())
+            self.assertEqual(json.loads(err.getvalue())['error']['code'], 'INVALID_INPUT')
+        self.assertFalse((self.root / 'data.db').exists())
+
+    def test_outcomes_cli_missing_store_and_redaction_fail_closed(self):
+        parser = setup_parser(Parser())
+        args = parser.parse_args(['outcomes', '--project', 'p'])
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = self.runtime.cli(args)
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(err.getvalue())['error']['code'], 'NOT_FOUND')
+        self.assertFalse((self.root / 'data.db').exists())
+        self.project()
+        before = (self.root / 'data.db').read_bytes()
+        self.ctx.redact_text = lambda *args, **kwargs: None
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = self.runtime.cli(parser.parse_args(['outcomes', '--project', 'missing']))
+        self.assertEqual(code, 1)
+        self.assertEqual(out.getvalue(), '')
+        self.assertEqual(json.loads(err.getvalue())['error']['code'], 'REDACTION_FAILED')
+        self.assertEqual((self.root / 'data.db').read_bytes(), before)
+
     def test_snapshot_is_scoped_minimal_and_does_not_open_stores(self):
         """protects=public source read; fails_when=private data leaks or read writes;
         why_new=bounded detail bridge; seam=real CLI/mock public tool; no_claim=native fences.
@@ -475,7 +570,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(health['last_success'])
 
     def test_diagnose_reports_actual_schema_after_unknown_work_write(self):
-        """protects=upgrade diagnostics; fails_when=schema1 reported for schema2;
+        """protects=upgrade diagnostics; fails_when=outdated schema reported;
         why_new=migration; seam=real Runtime; no_claim=installed upgrade.
         """
         self.project()
@@ -483,7 +578,7 @@ class RuntimeTests(unittest.TestCase):
                               remaining_seconds=None, expected_revision=0, reason='Fixture', request_id='t')
         self.assertTrue(result['ok'], result)
         self.assertIsNone(result['data']['remaining_seconds'])
-        self.assertEqual(self.request('diagnose')['data']['schema'], 2)
+        self.assertEqual(self.request('diagnose')['data']['schema'], 3)
 
     def test_kanban_cached_reads_do_not_initialize_or_collect(self):
         """protects=opt-in read boundary; fails_when=reads collect/create storage;
