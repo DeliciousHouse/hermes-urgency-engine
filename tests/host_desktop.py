@@ -2,8 +2,9 @@
 
 protects=authenticated scoped read and safe errors; fails_when=auth leaks or mount fails;
 why_new=new Desktop HTTP boundary; seam=ASGI transport only;
-no_claim=actual Electron interaction, remote routing or public installation.
+no_claim=actual Electron interaction or remote routing.
 """
+import argparse
 import json
 import os
 from pathlib import Path
@@ -19,20 +20,32 @@ PLUGIN_CONFIG = {'enabled': [PLUGIN], 'isolation': 'in_process'}
 
 def child():
     from datetime import datetime, timezone
+    from inspect import getfile
     import sqlite3
     from fastapi.testclient import TestClient
     from hermes_constants import get_hermes_home
-    sys.path.insert(0, str(ROOT))
+    home = get_hermes_home().resolve()
+    assert home == Path(os.environ['HERMES_HOME']).resolve()
+    package = home / 'plugins' / PLUGIN
+    sys.path.insert(0, str(package))
     from urgency_engine.ledger import Ledger
-    root = get_hermes_home() / 'plugin-data' / PLUGIN
+    root = home / 'plugin-data' / PLUGIN
     root.mkdir(parents=True)
     with Ledger(sqlite3.connect(root / 'data.db'), clock=lambda:datetime(2030, 1, 1, tzinfo=timezone.utc), artifact_root=root) as ledger:
         ledger.create_project('synthetic', 'Synthetic project', request_id='create', actor='operator')
     from hermes_cli import web_server as server
     from hermes_cli.web_server_dashboard import _mount_plugin_api_routes
     _mount_plugin_api_routes()
-    client = TestClient(server.app)
     url = '/api/plugins/' + PLUGIN
+    mounted_source = None
+
+    async def app(scope, receive, send):
+        nonlocal mounted_source
+        await server.app(scope, receive, send)
+        if scope['path'] == url + '/portfolio' and 'endpoint' in scope:
+            mounted_source = Path(getfile(scope['endpoint'])).resolve()
+
+    client = TestClient(app)
     assert client.get(url + '/portfolio').status_code == 401
     headers = {'X-Hermes-Session-Token': server._SESSION_TOKEN}
     assert client.get(url + '/identity').status_code == 401
@@ -49,6 +62,8 @@ def child():
     assert client.get(url + '/identity', headers=headers).json()['data']['scope_id'] == expected_identity
     response = client.get(url + '/portfolio', headers=headers)
     assert response.status_code == 200, (response.status_code, response.text)
+    expected_source = (package / 'dashboard' / 'plugin_api.py').resolve()
+    assert mounted_source == expected_source, mounted_source
     data = response.json()['data']
     assert data['items'][0]['title'] == 'Synthetic project'
     assert data['items'][0]['progress']['percent'] is None
@@ -152,29 +167,43 @@ def child():
     assert not (root / 'data.db').exists(), 'first read must not create durable state'
     (root / 'saved.db').rename(root / 'data.db')
     print(json.dumps({'native_rest': 'passed', 'unauthenticated': 401, 'read': 200,
-                      'missing': 404, 'invalid_limit': 400, 'data': 'synthetic only'}))
+                      'missing': 404, 'invalid_limit': 400, 'data': 'synthetic only',
+                      'mounted_from': expected_source.relative_to(package).as_posix()}))
 
 
 if __name__ == '__main__':
-    if '--child' in sys.argv:
+    parser = argparse.ArgumentParser()
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--child', action='store_true', help=argparse.SUPPRESS)
+    mode.add_argument('--installed', action='store_true',
+                      help='run from the enabled package in a fresh disposable HERMES_HOME')
+    args = parser.parse_args()
+    if args.child:
         child()
     else:
         with tempfile.TemporaryDirectory(prefix='urgency-rest-') as directory:
-            home = Path(directory)
+            if args.installed and not os.environ.get('HERMES_HOME'):
+                parser.error('--installed requires a fresh disposable HERMES_HOME')
+            home = Path(os.environ['HERMES_HOME'] if args.installed else directory).resolve()
             target = home / 'plugins' / PLUGIN
-            target.mkdir(parents=True)
-            for name in ('__init__.py', 'plugin.yaml'):
-                shutil.copy2(ROOT / name, target / name)
-            for name in ('urgency_engine', 'dashboard'):
-                if (ROOT / name).exists():
-                    shutil.copytree(ROOT / name, target / name, ignore=shutil.ignore_patterns('__pycache__'))
-            (home / 'config.yaml').write_text(json.dumps({'plugins': PLUGIN_CONFIG}), encoding='utf-8')
-            env = dict(os.environ)
+            if args.installed:
+                if (ROOT != target or not (target / '.git').is_dir()
+                        or (home / 'plugin-data' / PLUGIN).exists()):
+                    parser.error('--installed requires this script in a fresh installed Git checkout')
+            else:
+                target.mkdir(parents=True)
+                for name in ('__init__.py', 'plugin.yaml'):
+                    shutil.copy2(ROOT / name, target / name)
+                for name in ('urgency_engine', 'dashboard'):
+                    if (ROOT / name).exists():
+                        shutil.copytree(ROOT / name, target / name, ignore=shutil.ignore_patterns('__pycache__'))
+                (home / 'config.yaml').write_text(json.dumps({'plugins': PLUGIN_CONFIG}), encoding='utf-8')
+            env = {k: v for k, v in os.environ.items() if not k.startswith('HERMES_')}
             # Preserve worker fences; this test does not gain operator privileges.
             env.update(HERMES_HOME=str(home), HERMES_KANBAN_HOME=str(home / 'boards'), HERMES_DISABLE_LAZY_INSTALLS='1',
-                       HERMES_KANBAN_TASK='synthetic-worker')
+                       HERMES_RUNTIME_DIR=str(home / 'runtime'), HERMES_KANBAN_TASK='synthetic-worker')
             result = subprocess.run([sys.executable, str(Path(__file__).resolve()), '--child'], env=env,
-                                    capture_output=True, text=True, timeout=90)
+                                    cwd=home, capture_output=True, text=True, timeout=90)
             print(result.stdout)
             if result.returncode:
                 print(result.stderr)

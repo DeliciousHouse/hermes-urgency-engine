@@ -122,7 +122,7 @@ jobs:
           .host/.venv/bin/python .host/hermes plugins validate "$RUNNER_TEMP/plugin" --install-deps
           .host/.venv/bin/python "$RUNNER_TEMP/plugin/tests/host_runtime.py" --hermes-root "$GITHUB_WORKSPACE/.host"
           .host/.venv/bin/python "$RUNNER_TEMP/plugin/tests/host_desktop.py"
-      - name: Install exact public revision and exercise installed lifecycle and tutorial
+      - name: Install exact public revision and exercise lifecycle, tutorial and Desktop REST
         # Exercise capability-positive or explicit-unknown facts on each host.
         env:
           PLUGIN_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -162,3 +162,18 @@ jobs:
           cp "$scratch/home/config.yaml" "$interventions_home/config.yaml"
           "${clean[@]}" timeout 8m "$python" "$RUNNER_TEMP/plugin/tests/host_interventions.py" \
             --hermes-root "$host" --installed-home "$interventions_home"
+          # Start with no Ledger state and keep the installer-produced enablement
+          # for the first mount. No source archive or copied install is used here.
+          desktop_home="$scratch/desktop-home"
+          mkdir "$desktop_home"
+          "${clean[@]}" HERMES_HOME="$desktop_home" timeout 6m "$python" "$host/hermes" plugins install \
+            DeliciousHouse/hermes-urgency-engine --ref "$PLUGIN_SHA" --yes-deps --enable </dev/null
+          desktop_installed="$desktop_home/plugins/hermes-urgency-engine"
+          test "$("${clean[@]}" git -C "$desktop_installed" rev-parse HEAD)" = "$PLUGIN_SHA"
+          desktop_status=$("${clean[@]}" git -C "$desktop_installed" status --porcelain)
+          test -z "$desktop_status"
+          "${clean[@]}" HERMES_HOME="$desktop_home" timeout 2m "$python" \
+            "$desktop_installed/tests/host_desktop.py" --installed
+          desktop_status=$("${clean[@]}" git -C "$desktop_installed" status --porcelain)
+          test -z "$desktop_status"
+          printf 'Public install Desktop REST passed at %s\n' "$PLUGIN_SHA"

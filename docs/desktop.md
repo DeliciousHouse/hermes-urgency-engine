@@ -215,6 +215,9 @@ estimates. Independent branches can overlap in this calculation. They may not ov
 in a real schedule if they share an agent, so the number is **not** a finish date,
 capacity estimate, or replacement for the commitment forecast. It does not add
 verification, deployment, waiting time, or inferred future blocker durations.
+Changing a dependency edge can move this bound past a target without changing
+the Ledger's authoritative forecast, urgency, or committed dates. Changing
+milestone membership is different: it changes which work the milestone forecast counts.
 
 The read requires fresh, complete retained source coverage for the current binding,
 exact canonical and Ledger task membership, known durations, and an acyclic graph
@@ -519,14 +522,14 @@ and is not satisfied by this table.**
 | 6 | Hard deadlines never move automatically | `test_desktop_acceptance.py::test_case_6_hard_deadline_never_moves_automatically` | Automated |
 | 7 | Soft deadlines retain original baselines | `test_desktop_views.py::test_commitments_expose_independent_forecasts_and_preserved_targets`; a prior native fixture revised a soft target and read back the unchanged original | Automated plus scoped native observation |
 | 8 | Forecasts update without changing commitments | same test (`forecast_at` moves, `target_at` does not, no snapshot is written) | Automated |
-| 9 | Membership changes recalculate schedule risk | `test_desktop_acceptance.py::test_case_9_milestone_membership_change_recalculates_risk` | Automated |
+| 9 | A canonical dependency edit changes schedule risk | `test_desktop_acceptance.py::test_case_9_canonical_edge_changes_bound_not_authoritative_forecast`: one parent edge through Sync raises the dependency-only bound from 3,600 s to 5,400 s against a 4,500 s target. Task estimates, urgency (level 4), forecast and target stay fixed. | Desktop lower bound verified in a synthetic fixture; **authoritative risk change NOT MET**, pending dependency- and resource-aware forecasting |
 | 10 | Escalation changes the displayed urgency level | `test_desktop_acceptance.py::test_case_10_escalation_changes_the_displayed_urgency_level` | Automated |
 | 11 | Long-running work represented accurately | `test_desktop_acceptance.py::test_case_11_long_running_and_unestimated_work_is_not_invented`; prior native runs ended bars at the retained end or heartbeat, with no invented bar for an untimed task | Automated plus scoped native observation |
 | 12 | Live updates recover after disconnection | `desktop.test.mjs` rejects results from a changed activation epoch; prior native run showed the disconnected status | **Live reconnect with populated readback still pending** |
 | 13 | Multiple profiles and remote connections isolated | queries keyed by connection, epoch and profile; prior native fixture switched live gateways without exposing or replaying the other scope's pending command | Scoped two-gateway observation; **same-gateway profile switch still pending** |
 | 14 | Large task boards remain responsive | `test_desktop_acceptance.py::test_case_14_large_board_detail_stays_bounded_and_paged` (10,000 tasks, bounded pages, printed timing) | Automated; one machine, not a latency guarantee |
 | 15 | Dark/light themes, resizing, keyboard navigation | prior native fixtures checked 390–1280 px, both themes, keyboard filter controls, and task selection after timeline scrolling | Scoped native observations; **complete exact-candidate accessibility still pending** |
-| 16 | Clean installation exposes the page without source edits | CI checks the installed public revision and clean tree; prior exact-public native installs enabled the whole package and opened the page in Electron | Automated install and scoped native observations at earlier revisions; current candidate still requires native readback |
+| 16 | Clean installation exposes the page without source edits | Both pinned Hermes CI jobs install the exact public revision into a fresh home, verify its Git revision and clean tree, and exercise authenticated Desktop REST through Hermes' ASGI app. `host_desktop.py --installed` checks that the responding endpoint comes from the installed package. The separate source-copy validation does not count as install evidence. | Automated install and backend REST; **independent Electron page acceptance still required** |
 
 Author testing is not independent QA. Previous native observations establish only
 the named journeys on their tested revisions. In particular, the disconnect status

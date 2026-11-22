@@ -20,6 +20,7 @@ import time
 import unittest
 
 from urgency_engine.desktop import Views
+from urgency_engine.kanban import Sync, settings
 from urgency_engine.ledger import Ledger, LedgerError
 
 
@@ -75,7 +76,7 @@ class DesktopAcceptanceTests(unittest.TestCase):
         self.assertEqual([record['reason'] for record in self.ledger.history('deadline', 'hard')][-1],
                          'Client agreed a new date')
 
-    def test_case_9_milestone_membership_change_recalculates_risk(self):
+    def test_milestone_membership_change_recalculates_risk(self):
         self.ledger.create_milestone('m', project_id='a', title='Beta ready', request_id='m',
                                      actor='operator')
         self.task('slow', remaining=30 * 86400)
@@ -93,6 +94,58 @@ class DesktopAcceptanceTests(unittest.TestCase):
                            'adding a task that cannot finish in time must raise measured risk')
         self.assertEqual(bound['target_at'], '2030-01-10T00:00:00+00:00',
                          'recalculated risk must not move the committed target')
+
+    def test_case_9_canonical_edge_changes_bound_not_authoritative_forecast(self):
+        """Change only a parent edge at a fixed clock, through real Sync and Ledger stores."""
+        parent_ids = []
+
+        class Source:
+            def inventory(self, binding):
+                return [dict(id=key, tenant=binding['tenant']) for key in ('prepare', 'task')]
+
+            def detail(self, binding, task_id):
+                return dict(task=dict(id=task_id, tenant=binding['tenant'], title=task_id, status='todo'),
+                            parents=list(parent_ids) if task_id == 'task' else [])
+
+        cfg = settings(dict(kanban_sync_enabled=True, kanban_bindings=[
+            dict(board='board', tenant='synthetic', project_id='a')]))
+        with Sync(sqlite3.connect(self.root / 'kanban.db'), clock=lambda: self.now, redact=str) as sync:
+            source = Source()
+
+            def scan(request_id):
+                result = sync.scan(cfg, self.ledger, None, self.root / 'data.db', source,
+                                   request_id=request_id, reason='Synthetic canonical graph')
+                self.assertEqual(result['state'], 'complete')
+
+            def schedule():
+                page = sync.page('a', limit=2, cfg=cfg, with_graph=True)
+                view = self.view()
+                bound = view.dependency_bound('a', page['graph'], page['items'])
+                return bound, page['items'], view.project('a')
+
+            scan('without-edge')
+            for task_id, duration in (('prepare', 1800), ('task', 3600)):
+                self.ledger.upsert_task('board', task_id, project_id='a', goal=task_id,
+                                        expected_revision=self.ledger.get_task('board', task_id)['revision'],
+                                        reason='Estimate', request_id='estimate-' + task_id,
+                                        actor='operator', remaining_seconds=duration)
+            self.deadline('soft', kind='soft', at='2030-01-01T01:15:00Z')
+            before, before_rows, before_project = schedule()
+            parent_ids.append('prepare')
+            scan('with-edge')
+            after, after_rows, after_project = schedule()
+
+        self.assertEqual(before, dict(reason=None, lower_bound_seconds=3600, path_tasks=1))
+        self.assertEqual(after, dict(reason=None, lower_bound_seconds=5400, path_tasks=2))
+        self.assertEqual([(r['task_id'], r['remaining_seconds'], r['parents'], r['critical_path_step'])
+                          for r in before_rows], [('prepare', 1800, [], None), ('task', 3600, [], 1)])
+        self.assertEqual([(r['task_id'], r['remaining_seconds'], r['parents'], r['critical_path_step'])
+                          for r in after_rows], [('prepare', 1800, [], 1), ('task', 3600, ['prepare'], 2)])
+        commitment, = before_project['commitments']
+        self.assertEqual((before_project['urgency']['level'], commitment['forecast_at'], commitment['target_at']),
+                         (4, '2030-01-01T01:30:00+00:00', '2030-01-01T01:15:00+00:00'))
+        self.assertEqual(after_project['urgency'], before_project['urgency'])
+        self.assertEqual(after_project['commitments'], before_project['commitments'])
 
     def test_case_10_escalation_changes_the_displayed_urgency_level(self):
         self.task('work', remaining=5 * 86400)
