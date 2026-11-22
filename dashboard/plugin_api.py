@@ -88,6 +88,11 @@ def project(project_id: str):
     return respond(lambda: read_view(lambda view: view.project(project_id)))
 
 
+@router.get('/projects/{project_id}/commitments')
+def commitments(project_id: str, request: Request):
+    return respond(lambda: read_view(lambda view: view.commitments(project_id, **page_arguments(request))))
+
+
 @router.get('/projects/{project_id}/timeline')
 def timeline(project_id: str, request: Request):
     def read():

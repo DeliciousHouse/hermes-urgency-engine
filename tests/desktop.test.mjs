@@ -117,7 +117,8 @@ test('stale detail measurements disable every management control', async () => {
 });
 
 test('deadline and membership editors keep their identity across background revisions', async () => {
-  const {api} = await load({useState: initial => [initial === null ? 'd' : initial, () => {}]});
+  const {api} = await load({useState: initial => [initial === null ? 'd' : initial, () => {}],
+    sdk: {useQuery: () => ({data: {items: [{deadline_id: 'd', kind: 'soft'}]}})}});
   function keys(revision) {
     const project = {project_id: 'a', revision, title: 'A', observed_at: '2030-01-01T00:00:00Z',
       commitments: [{deadline_id: 'd', revision, kind: 'soft'}]};
@@ -211,6 +212,52 @@ test('timeline exposes distinct target forecast actual and original labels', asy
     start: '2030-01-01T00:00:00Z', end: '2030-01-04T00:00:00Z', now: '2030-01-02T00:00:00Z', onSelect() {}}));
   for (const label of ['Original', 'Hard target', 'Forecast', 'Current time']) assert.match(tree, new RegExp(label));
   assert.doesNotMatch(tree, /Actual completion/);
+});
+
+// protects=coincident commitments remain keyboard/pointer reachable;
+// fails_when=44px markers overlay each other; seam=render tree; no_claim=pixel QA.
+test('coincident timeline markers occupy separate tracks', async () => {
+  const {api} = await load();
+  const at = '2030-01-01T00:00:00Z';
+  const tree = expand(api.Timeline({commitments: [{deadline_id: 'd', kind: 'hard',
+    original_at: at, target_at: at, forecast_at: at, actual_verified_at: at}],
+    start: at, end: '2030-01-02T00:00:00Z', now: at, onSelect() {}}));
+  const markers = [];
+  (function walk(node) {
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (!node || typeof node !== 'object') return;
+    if (/^(Original|Hard target|Forecast|Actual completion):/.test(node.props?.['aria-label'] || '')) markers.push(node);
+    walk(node.props?.children);
+  })(tree);
+  assert.equal(markers.length, 4);
+  const tops = markers.map(node => node.props.style.top).sort((a,b) => a-b);
+  for (let i = 1; i < tops.length; i++) assert.ok(tops[i] - tops[i-1] >= 44);
+});
+
+// protects=hours-to-months keyboard navigation; fails_when=zoom/pan/Fit are inert;
+// why_new=interactive timeline controls; seam=React hooks; no_claim=native pixels.
+test('timeline zoom, pan and Fit change the axis without changing targets', async () => {
+  const {api, reset} = await load();
+  const props = {now: '2030-01-01T00:00:00Z', commitments: [{deadline_id: 'd',
+    original_at: '2030-02-01T00:00:00Z', target_at: '2030-03-01T00:00:00Z'}], onSelect() {}};
+  const original = JSON.stringify(props.commitments);
+  const find = (node, label) => {
+    if (Array.isArray(node)) return node.map(n => find(n, label)).find(Boolean);
+    if (!node || typeof node !== 'object') return null;
+    return node.props?.children === label ? node : find(node.props?.children, label);
+  };
+  let tree = api.TimelineView(props);
+  const axis = node => node.props.children.find(n => n?.type?.name === 'Timeline').props;
+  const initial = axis(tree);
+  find(tree, 'Zoom in').props.onClick(); reset(); tree = api.TimelineView(props);
+  assert.ok(Date.parse(axis(tree).end) - Date.parse(axis(tree).start) < Date.parse(initial.end) - Date.parse(initial.start));
+  const beforePan = axis(tree).start;
+  find(tree, 'Later').props.onClick(); reset(); tree = api.TimelineView(props);
+  assert.ok(Date.parse(axis(tree).start) > Date.parse(beforePan));
+  find(tree, 'Fit commitments').props.onClick(); reset(); tree = api.TimelineView(props);
+  assert.ok(Date.parse(axis(tree).start) <= Date.parse(props.commitments[0].original_at));
+  assert.ok(Date.parse(axis(tree).end) >= Date.parse(props.commitments[0].target_at));
+  assert.equal(JSON.stringify(props.commitments), original);
 });
 
 test('registered page mounts creation controls and native reads', async () => {
@@ -312,6 +359,14 @@ test('an identically named canonical project in another scope is never joined', 
     [{project_id: 'proj-alpha', title: 'Shared name', progress: {percent: 50}}]);
   assert.equal(rows.find(row => row.key === 'other-scope-id').measured, null);
   assert.equal(rows.find(row => row.key === 'proj-alpha').canonical, null);
+});
+
+test('partial inventory never labels an off-page measurement unconfigured or missing', async () => {
+  const {api} = await load();
+  const row = api.mergeInventory([{id: 'later', name: 'Later'}], [], {measurementsComplete: false})[0];
+  assert.equal(row.binding, 'measurement_not_loaded');
+  const unavailable = api.mergeInventory([], [{project_id: 'a'}], {canonicalAvailable: false})[0];
+  assert.equal(unavailable.binding, 'canonical_unavailable');
 });
 
 test('unavailable canonical inventory is not reported as an empty inventory', async () => {
@@ -435,21 +490,128 @@ test('milestone control creates and edits membership through named commands', as
     'milestone membership is checked against the project revision, not a milestone revision');
 });
 
+// protects=real intervention outcomes; fails_when=guessed fields hide receipts;
+// why_new=first intervention table; seam=SDK read; no_claim=native authorization.
+test('interventions render requested and observed effects without implying attribution', async () => {
+  const {api} = await load({useState: initial => [initial === 'commitments' ? 'interventions' : initial, () => {}],
+    sdk: {useQuery: () => ({data: {items: [{action_id: 'action-a', kind: 'priority', state: 'observed',
+      requested_effect: {priority: 8}, observed_effect: {priority: 8}, attribution: 'not_attributed',
+      next_action: 'Inspect concurrent change'}]}})}});
+  const text = JSON.stringify(expand(api.ProjectDetail({ctx: {}, scope: {}, sender: {},
+    project: {project_id: 'a', title: 'A', observed_at: '2030-01-01T00:00:00Z'}})));
+  for (const value of ['action-a', 'priority', 'not_attributed', 'Inspect concurrent change']) assert.ok(text.includes(value), value);
+  assert.ok(text.includes('priority\\\":8'), 'structured effects remain inspectable');
+});
+
+test('source task rows show canonical title, run times, dependencies and stale coverage', async () => {
+  const {api} = await load({useState: initial => [initial === 'commitments' ? 'source-tasks' : initial, () => {}],
+    sdk: {useQuery: () => ({data: {items: [{board_id: 'b', task_id: 't', title: 'Canonical deliverable',
+      status: 'running', assignee: 'builder', parents: ['parent-task'], stale: true, coverage: 'unknown',
+      observed_at: '2030-01-01T12:00:00Z', worker: {run_id: 9, state: 'running',
+        started_at: '2030-01-01T10:00:00Z', heartbeat_at: '2030-01-01T11:59:00Z', ended_at: null}}]}})}});
+  const text = JSON.stringify(expand(api.ProjectDetail({ctx: {}, scope: {}, sender: {},
+    project: {project_id: 'a', title: 'A', observed_at: '2030-01-01T12:00:00Z'}})));
+  for (const value of ['Canonical deliverable', 'parent-task', '2030-01-01T10:00:00Z', 'stale', 'unknown']) assert.ok(text.includes(value), value);
+});
+
 test('history renders the actual audit timestamp and action fields', async () => {
   const {api} = await load({useState: initial => [initial === 'commitments' ? 'history' : initial, () => {}],
     sdk: {useQuery: () => ({data: {items: [{sequence: 9, occurred_at: '2030-01-02T10:00:00Z',
-      action: 'revise_deadline', actor: 'operator', reason: 'Approved new target'}]}})}});
+      action: 'revise_deadline', actor: 'operator', reason: 'Approved new target',
+      before_json: '{"target_at":"2030-01-03"}', after_json: '{"target_at":"2030-01-04"}'}]}})}});
   const project = {project_id: 'a', title: 'A', revision: 1, observed_at: '2030-01-01T00:00:00Z'};
   const text = JSON.stringify(expand(api.ProjectDetail({ctx: {}, scope: {}, sender: {}, project})));
   assert.match(text, /2030-01-02T10:00:00Z/);
   assert.match(text, /revise_deadline/);
+  assert.match(text, /2030-01-03/);
+  assert.match(text, /2030-01-04/);
+  assert.match(text, /Inspect recorded change/);
+});
+
+// protects=commitments beyond the summary cap; fails_when=detail never reads next page;
+// why_new=paged commitment UI; seam=SDK query; no_claim=installed input/navigation.
+test('commitment page navigation reads the next page and renders its targets', async () => {
+  const queries = [];
+  const {api, reset} = await load({sdk: {useQuery: options => {
+    queries.push(options);
+    return {data: {items: [{deadline_id: 'later', kind: 'soft', target_at: '2030-01-02T00:00:00Z'}],
+      has_more: true, next: 'later'}};
+  }}});
+  const props = {ctx: {}, scope: {}, sender: {}, project: {project_id: 'a', title: 'A',
+    observed_at: '2030-01-01T00:00:00Z', commitments: [], commitments_has_more: true}};
+  let tree = expand(api.ProjectDetail(props));
+  assert.ok(queries.some(q => q.queryKey.at(-1) === '/projects/a/commitments?limit=100'));
+  assert.match(JSON.stringify(tree), /later/);
+  let next;
+  (function walk(node) {
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (!node || typeof node !== 'object') return;
+    if (node.props?.children === 'Next commitments') next = node;
+    walk(node.props?.children);
+  })(tree);
+  assert.ok(next);
+  next.props.onClick();
+  reset();
+  api.ProjectDetail(props);
+  assert.ok(queries.some(q => q.queryKey.at(-1) === '/projects/a/commitments?limit=100&after=later'));
+});
+
+// protects=audited scope editing; fails_when=hidden controls or discarded criteria;
+// why_new=scope controls; seam=command sender boundary; no_claim=native validation.
+test('criteria and baseline controls submit pinned revisions and preserve loaded scope', async () => {
+  const {api, reset, mount} = await load();
+  const sent = [];
+  const sender = {send: async (op, args) => {sent.push([op, args]); return {};}};
+  const task = {board_id: 'b', task_id: 't', revision: 4, criteria: [{criterion_id: 'test',
+    description: 'Tests pass', weight: 3, required: 1, expected_sha256: null, active: 1, criterion_revision: 2}]};
+  const props = {task, sender, onSaved() {}};
+  let tree = api.CriteriaForm(props);
+  assert.match(JSON.stringify(tree), /invalidates existing verification/);
+  labelled(tree, 'Reason for scope change').props.onChange({target: {value: 'Clarify scope'}});
+  reset(); tree = api.CriteriaForm(props);
+  tree.props.onSubmit({preventDefault() {}});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(sent[0][0], 'set_criteria');
+  assert.equal(sent[0][1].expected_revision, 4);
+  assert.deepEqual(JSON.parse(JSON.stringify(sent[0][1].criteria)), [{criterion_id: 'test',
+    description: 'Tests pass', weight: 3, required: true, expected_sha256: null}]);
+  mount();
+  tree = api.BaselineForm({project: {project_id: 'p', revision: 7}, sender, onSaved() {}});
+  tree.props.onSubmit({preventDefault() {}});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(sent[1][0], 'baseline_scope');
+  assert.equal(sent[1][1].expected_revision, 7);
+});
+
+test('verified work inspector exposes loaded criteria and scope controls on the detail page', async () => {
+  const task = {board_id: 'b', task_id: 't', goal: 'Ship artifact', revision: 4, criteria: [],
+    actual_seconds: 3600, remaining_seconds: null, status: 'running'};
+  const {api, reset} = await load({sdk: {useQuery: () => ({data: {items: [task], has_more: false}})}});
+  const props = {ctx: {}, scope: {}, sender: {}, project: {project_id: 'a', revision: 1,
+    observed_at: '2030-01-01T00:00:00Z'}, onSaved() {}};
+  let tree = api.TaskScope(props);
+  let select;
+  (function walk(node) {
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (!node || typeof node !== 'object') return;
+    if (node.props?.children === 'b/t · Ship artifact') select = node;
+    walk(node.props?.children);
+  })(tree);
+  assert.ok(select);
+  select.props.onClick(); reset();
+  tree = expand(api.TaskScope(props));
+  const text = JSON.stringify(tree);
+  assert.match(text, /Acceptance criteria \(JSON\)/);
+  assert.match(text, /Measured execution/);
+  assert.match(text, /Unknown/);
+  assert.match(text, /Record immutable baseline/);
 });
 
 test('detail tabs expose every audited read surface with its own state', async () => {
   const {api} = await load();
   const tree = JSON.stringify(api.DetailTabs({tab: 'history', onTab() {},
     query: {isPending: true}, children: null}));
-  for (const label of ['Commitments', 'Milestones', 'Source tasks', 'History', 'Interventions']) {
+  for (const label of ['Commitments', 'Milestones', 'Verified work', 'Source tasks', 'History', 'Interventions']) {
     assert.match(tree, new RegExp(label));
   }
   assert.match(tree, /aria-selected/);

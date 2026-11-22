@@ -26,6 +26,7 @@ payload cannot choose a database or claim a permission. Responses are
 |---|---|---|
 | `GET /portfolio` | `limit` (1-500, default 100), `after` | `items` (one project summary each), `next`, `has_more`, `observed_at`, `coverage` |
 | `GET /projects/{project_id}` | — | project, `progress`, `commitments`, `commitments_has_more`, `urgency`, `risk_coverage`, `observed_at`, `coverage` |
+| `GET /projects/{project_id}/commitments` | `limit`, `after` (deadline ID) | paged deadline explanations, `has_more`, `next`, `project_revision`, `observed_at` |
 | `GET /projects/{project_id}/timeline` | `start`, `end` (UTC ISO 8601, span 0 to 366 days), `limit`, `after` | paged task rows with `started_at`, `dependencies` and `blocked_periods` explicitly `null`, plus `start`, `end`, `now`, `range_policy` |
 | `GET /projects/{project_id}/milestones` | `limit`, `after` | `items`, `has_more`, `next` |
 | `GET /projects/{project_id}/milestones/{milestone_id}` | — | scoped milestone title, member task IDs and owning `project_revision` |
@@ -75,16 +76,29 @@ reschedule. `verify_artifact`, `claim_complete`, `reopen_task`, `upsert_task` an
 Portfolio: a project table (project, measurement binding, verified progress, urgency,
 next commitment), a canonical-inventory notice, project paging, and a create-project
 form. Detail: progress, risk and its reasons, weighted scope against the baseline, the
-commitment timeline with `6h / 24h / 7d / 30d / 90d` presets, and tabs for
-Commitments, Milestones, Source tasks, History and Interventions. Forms: create and
+commitment timeline with `6h / 24h / 7d / 30d / 90d` presets, zoom, Earlier/Later and
+Fit controls, and tabs for Commitments, Milestones, Verified work, Source tasks,
+History and Interventions. Commitment pages have First/Next controls; Fit covers
+the loaded page, with a maximum 366-day axis. Forms: create and
 edit project, add a deadline, reschedule a deadline, add a milestone, and edit
 milestone title and membership. Both editors first load the existing record, so
 opening membership never starts with an empty replacement for existing members.
 
+Verified work pages measured tasks and opens their goal, agent, recorded execution
+duration, remaining estimate, completion timestamp and criteria. The criteria editor
+uses a labelled JSON array, preloaded with the complete current criteria. Replacing
+criteria invalidates previous verification; it cannot mark work complete. Record
+original scope creates the immutable weighted baseline once, with a required reason.
+Source tasks separately shows canonical dependencies and the latest recorded run's
+start/end/heartbeat with source freshness. A missing end does not establish completion.
+Interventions uses the actual requested/observed effect and attribution fields;
+matching requested and observed values alone never implies an attributed effect.
+
 Hard and soft deadlines are labelled in text (`Hard (external commitment)`,
 `Soft (internal target)`), never by colour alone. Timeline markers are `│` original,
 `◆` hard target, `●` soft target, `◇` forecast, `■` actual completion, `↓` current
-time, each with an accessible label and a 44px target. Dragging never reschedules
+time, each with an accessible label and a 44px target on a separate vertical track.
+Coincident dates remain separately selectable. Dragging never reschedules
 anything; rescheduling is an explicit form with a required reason.
 
 ### Settings and cadence
@@ -148,13 +162,17 @@ different projects. The consequences are shown honestly:
 
 - `Measured` — bound, with real numbers.
 - `Not configured for urgency measurement` — a canonical project with no Ledger
-  project of that id. Create one with the matching id to start measuring it.
+  project of that id in a complete measurement inventory. Create one with the matching
+  id to start measuring it. With paged measurements the label is instead
+  `Measurement not loaded on this page`; absence from one page proves nothing.
 - `No canonical project in this scope` — a Ledger project with no canonical peer
   here. Usually a different profile, a renamed project, or a local-only id.
 
 If the inventory RPC fails, the page says the inventory is **unavailable** and lists
 only measured projects. That is deliberately distinguished from an empty inventory: an
 empty success and a failed read must never look alike.
+Rows without a canonical match during a failed inventory read say
+`Canonical inventory unavailable`, not that the canonical project is absent.
 
 `coverage` is reported as `local_ledger_only` on every read, and project risk is
 `partial` once more than 100 commitments exist, because the summary then reflects only
@@ -200,7 +218,7 @@ coverage line shows an `observed_at` timestamp that advances as you watch.
 1. In the Commitments tab, select **Reschedule this deadline** on the commitment.
 2. The form shows the original and current target before any field you can edit.
 3. Enter the new date, the time zone, and a reason. The reason is required.
-4. Save. `│` stays at the original instant, `◆` moves, and the History tab gains a
+4. Save. `│` stays at the original instant, `●` moves, and the History tab gains a
    record naming the actor, the reason and both revisions.
 
 Accumulated slippage is readable at any time as **Variance against original** on each
@@ -217,6 +235,23 @@ commitment.
    and return to Commitments. A milestone-scoped deadline now measures exactly
    those tasks, so binding work that cannot finish in time raises the urgency level
    while leaving the committed target untouched.
+
+### How to inspect and change weighted scope
+
+1. Open **Verified work**, page to a measured task, and select its board/task button.
+2. Review its recorded state and estimates. Edit the preloaded acceptance-criteria
+   JSON array, preserving each criterion you intend to keep. Use `null` for an unknown
+   expected digest; never invent an expected hash to obtain credit.
+3. Enter a reason and choose **Replace criteria and invalidate verification**.
+   Reloaded progress must lose any evidence invalidated by this change. Use the
+   supported CLI to verify an actual artifact; this page cannot assert verification.
+4. To capture the original project denominator, enter a baseline reason and choose
+   **Record immutable baseline**. This succeeds once. A later attempt with a new
+   request is refused rather than replacing history.
+
+A stale task revision refuses the write. Read the current values before using the
+explicit current-revision control. Invalid JSON is refused inline; invalid criterion
+fields are refused by the Ledger without changing scope.
 
 ### Recover from a save whose result you never saw
 
@@ -393,8 +428,8 @@ live remote gateways, assistive technology and window geometries.
   Publishable captures from a clean synthetic home are a downstream QA deliverable.
 - **Portfolio-level timeline and deadline-collision view are not implemented.** The
   portfolio shows each project's next commitment; it does not yet draw a cross-project
-  timeline or highlight contention for shared agents. Project-level timelines are
-  complete.
+  timeline or highlight contention for shared agents. Project timelines currently
+  show paged commitment markers, not the complete execution/dependency graph.
 - **Filtering is limited to paging.** Board, assignee, urgency and deadline-type
   filters named in the amendment are not implemented in this slice.
 - **Task intervals, dependencies, blocked periods and critical path are reported as
@@ -402,7 +437,3 @@ live remote gateways, assistive technology and window geometries.
   deliberately returns explicit nulls rather than invented execution periods.
 - **Recovery-card creation remains unavailable** (`CAPABILITY_UNAVAILABLE`) because
   the installed host exposes no supported route for it.
-- **Timeline markers on the same instant can overlap.** Each marker keeps its own
-  44px hit target and accessible label, and the per-commitment list below the timeline
-  always gives the exact dates, but two markers at an identical date sit on top of one
-  another rather than on separate tracks.

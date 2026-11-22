@@ -83,6 +83,30 @@ class DesktopViewTests(unittest.TestCase):
         self.assertIsNone(data['urgency'])
         self.assertEqual(data['risk_coverage'], 'partial')
 
+    def test_commitment_pages_preserve_each_explanation_and_refuse_foreign_project(self):
+        """protects=all commitments accessible; fails_when=only first100 reachable;
+        seam=real Ledger; no_claim=native navigation or complete aggregate risk.
+        """
+        from urgency_engine.desktop import Views
+        from urgency_engine.ledger import LedgerError
+        from test_ledger import fixture_zones, TZPATH, reset_tzpath, ZoneInfo
+        fixture_zones(self.root)
+        self.addCleanup(lambda: (reset_tzpath(TZPATH), ZoneInfo.clear_cache()))
+        for name in ('a-first', 'b-second'):
+            self.ledger.set_deadline(name, project_id='a', kind='hard', at='2030-01-02T00:00:00Z',
+                timezone='UTC', owner='operator', source='Plan', request_id=name, actor='operator')
+        view = Views(self.ledger, clock=lambda:self.now)
+        first = view.commitments('a', limit=1)
+        self.assertTrue(first['has_more'])
+        second = view.commitments('a', limit=1, after=first['next'])
+        self.assertEqual(second['items'][0]['deadline_id'], 'b-second')
+        self.assertEqual(second['items'][0]['original_at'], '2030-01-02T00:00:00+00:00')
+        self.assertNotIn('input_revisions', second['items'][0])
+        self.assertFalse(second['has_more'])
+        self.assertEqual(view.commitments('b')['items'], [])
+        with self.assertRaises(LedgerError):
+            view.commitments('missing')
+
     def test_project_refuses_a_mixed_revision_measurement(self):
         from urgency_engine.desktop import Views
         from urgency_engine.ledger import LedgerError

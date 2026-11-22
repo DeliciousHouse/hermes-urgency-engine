@@ -97,16 +97,17 @@ function useRead(ctx, path, scope, enabled = true) {
 // Canonical identity only. Two projects sharing a name, slug, board or path are
 // different projects; a measurement is shown against a canonical row solely when
 // the Ledger project id IS that canonical project id, read in the same scope.
-export function mergeInventory(canonical, measured) {
+export function mergeInventory(canonical, measured, {measurementsComplete = true, canonicalAvailable = true} = {}) {
   const byId = new Map((measured || []).map(item => [item.project_id, item]));
   const rows = (canonical || []).map(project => {
     const match = byId.get(project.id) || null;
     byId.delete(project.id);
     return {key: project.id, canonical: project, measured: match,
-      binding: match ? 'measured' : 'not_configured'};
+      binding: match ? 'measured' : measurementsComplete ? 'not_configured' : 'measurement_not_loaded'};
   });
   for (const item of byId.values()) {
-    rows.push({key: item.project_id, canonical: null, measured: item, binding: 'no_canonical_project'});
+    rows.push({key: item.project_id, canonical: null, measured: item,
+      binding: canonicalAvailable ? 'no_canonical_project' : 'canonical_unavailable'});
   }
   return rows;
 }
@@ -119,6 +120,7 @@ export function inventoryNotice(query) {
 }
 
 const bindings = {measured: 'Measured', not_configured: 'Not configured for urgency measurement',
+  measurement_not_loaded: 'Measurement not loaded on this page', canonical_unavailable: 'Canonical inventory unavailable',
   no_canonical_project: 'No canonical project in this scope'};
 
 export function Portfolio({rows, onSelect}) {
@@ -247,6 +249,32 @@ export function ProjectForm({sender, project, onSaved, disabled}) {
       : ['create_project', {project_id: draft.project_id, title: draft.title}]});
 }
 
+export function BaselineForm({project, sender, onSaved, disabled}) {
+  return CommandForm({sender, onSaved, disabled, base: project, title: 'Record original scope',
+    submitLabel: 'Record immutable baseline', fields: [{name: 'reason', label: 'Reason for baseline'}],
+    preamble: [jsx('p', {children: 'This records the current weighted scope once. An existing baseline cannot be replaced.'})],
+    build: (draft, pinned) => ['baseline_scope', {project_id: pinned.project_id,
+      expected_revision: pinned.revision, reason: draft.reason}]});
+}
+
+export function CriteriaForm({task, sender, onSaved, disabled}) {
+  return CommandForm({sender, onSaved, disabled, base: task, title: 'Edit acceptance criteria',
+    submitLabel: 'Replace criteria and invalidate verification',
+    preamble: [jsx('p', {children: 'Replacing criteria invalidates existing verification. This is not a completion control. Review the full replacement before saving.'}),
+      jsx('p', {children: 'JSON array: each criterion needs criterion_id, description, positive weight, required (true/false), and expected_sha256 (a lowercase SHA-256 or null). Maximum 100 criteria; [] removes all criteria.'})],
+    fields: [{name: 'criteria', label: 'Acceptance criteria (JSON)', multiline: true, maxLength: 65536,
+      initial: base => JSON.stringify(base.criteria.map(item => ({criterion_id: item.criterion_id,
+        description: item.description, weight: item.weight, required: !!item.required,
+        expected_sha256: item.expected_sha256})), null, 2)},
+      {name: 'reason', label: 'Reason for scope change'}],
+    validate: draft => {
+      try {if (Array.isArray(JSON.parse(draft.criteria))) return null;} catch { /* Show an inline input error. */ }
+      return 'Acceptance criteria must be a JSON array. Nothing was sent.';
+    },
+    build: (draft, pinned) => ['set_criteria', {board_id: pinned.board_id, task_id: pinned.task_id,
+      criteria: JSON.parse(draft.criteria), expected_revision: pinned.revision, reason: draft.reason}]});
+}
+
 export function DeadlineForm({sender, projectId, onSaved, disabled}) {
   return CommandForm({sender, onSaved, disabled, base: null, title: 'Add a deadline',
     submitLabel: 'Create deadline',
@@ -337,7 +365,7 @@ export function MilestoneEditor({query, sender, disabled, onSaved}) {
 }
 
 const TABS = [['commitments', 'Commitments'], ['milestones', 'Milestones'],
-  ['source-tasks', 'Source tasks'], ['history', 'History'], ['interventions', 'Interventions']];
+  ['scope', 'Verified work'], ['source-tasks', 'Source tasks'], ['history', 'History'], ['interventions', 'Interventions']];
 
 export function DetailTabs({tab, onTab, query, children}) {
   return jsxs('section', {children: [
@@ -356,7 +384,7 @@ export function RecordList({query, empty, columns, row, onMore}) {
   return jsxs('div', {className: 'ue-scroll', children: [jsxs('table', {children: [
     jsx('thead', {children: jsx('tr', {children: columns.map(label => jsx('th', {scope: 'col', children: label}, label))})}),
     jsx('tbody', {children: items.map((item, index) => jsx('tr', {children: row(item).map((value, column) =>
-      jsx('td', {children: value === null || value === undefined ? 'Unknown' : String(value)}, columns[column]))}, index))})]}),
+      jsx('td', {children: value === null || value === undefined ? 'Unknown' : value?.type ? value : String(value)}, columns[column]))}, index))})]}),
     query.data.has_more ? jsx(Button, {onClick: () => onMore?.(query.data.next),
       children: 'Next records'}) : jsx('p', {className: 'ue-note', children: 'End of recorded page.'})]});
 }
@@ -364,9 +392,9 @@ export function RecordList({query, empty, columns, row, onMore}) {
 export function Timeline({commitments, start, end, now, onSelect}) {
   const left = Date.parse(start), width = Date.parse(end) - left;
   const position = value => Math.max(0, Math.min(100, 100 * (Date.parse(value) - left) / width));
-  const marker = (value, label, symbol, onClick) => value && jsx('button', {type: 'button', onClick,
+  const marker = (value, label, symbol, onClick, track = 0) => value && jsx('button', {type: 'button', onClick,
     title: `${label}: ${date(value)}`, 'aria-label': `${label}: ${date(value)}`,
-    style: {position: 'absolute', left: `${position(value)}%`, transform: 'translateX(-50%)', top: 0,
+    style: {position: 'absolute', left: `${position(value)}%`, transform: 'translateX(-50%)', top: track * 44,
       minWidth: 44, minHeight: 44, color: 'var(--ui-text-primary)'}, children: symbol});
   return jsxs('section', {'aria-label': 'Commitment timeline', children: [
     jsx('p', {children: '◆ Hard target · ● Soft target · ◇ Forecast · ■ Actual · │ Original. Dates outside the range appear at its edge; inspect for the exact date.'}),
@@ -374,14 +402,14 @@ export function Timeline({commitments, start, end, now, onSelect}) {
       style: {minWidth: 720, padding: '0 24px'}, children: [
         jsxs('div', {className: 'ue-toolbar', style: {justifyContent: 'space-between'}, children: [date(start), date(end)]}),
         jsx('div', {style: {position: 'relative', height: 48, marginLeft: 180}, children: marker(now, 'Current time', '↓', () => {})}),
-        ...commitments.map(item => jsxs('div', {style: {display: 'grid', gridTemplateColumns: '180px 1fr', minHeight: 52,
+        ...commitments.map(item => jsxs('div', {style: {display: 'grid', gridTemplateColumns: '180px 1fr', minHeight: 176,
           borderBottom: '1px solid var(--ui-stroke-secondary)'}, children: [
           jsx(Button, {onClick: () => onSelect(item), children: item.deadline_id}),
           jsxs('div', {style: {position: 'relative'}, children: [
             marker(item.original_at, 'Original', '│', () => onSelect(item)),
-            marker(item.target_at, item.kind === 'hard' ? 'Hard target' : 'Soft target', item.kind === 'hard' ? '◆' : '●', () => onSelect(item)),
-            marker(item.forecast_at, 'Forecast', '◇', () => onSelect(item)),
-            marker(item.actual_verified_at, 'Actual completion', '■', () => onSelect(item))]})]}, item.deadline_id))]})}),
+            marker(item.target_at, item.kind === 'hard' ? 'Hard target' : 'Soft target', item.kind === 'hard' ? '◆' : '●', () => onSelect(item), 1),
+            marker(item.forecast_at, 'Forecast', '◇', () => onSelect(item), 2),
+            marker(item.actual_verified_at, 'Actual completion', '■', () => onSelect(item), 3)]})]}, item.deadline_id))]})}),
     !commitments.length && jsx('p', {children: 'No commitments recorded. Add a hard deadline or soft target to begin scheduling.'})]});
 }
 
@@ -394,24 +422,81 @@ const styles = `.ue {font:inherit;color:var(--ui-text-primary);padding:20px;over
 @media(max-width:640px){.ue{padding:12px}.ue th,.ue td{padding-right:12px}.ue dl{grid-template-columns:1fr}.ue dd{margin-bottom:8px}}`;
 
 const RANGES = [[6, '6 hours'], [24, '24 hours'], [168, '7 days'], [720, '30 days'], [2160, '90 days']];
+export function TimelineView({commitments, now, onSelect}) {
+  const [hours, setHours] = useState(168);
+  const [center, setCenter] = useState(null);
+  const anchor = center ?? Date.parse(now);
+  const span = hours * 3600000;
+  const zoom = factor => setHours(value => Math.max(1, Math.min(8784, value * factor)));
+  function fit() {
+    const times = commitments.flatMap(item => [item.original_at, item.target_at,
+      item.forecast_at, item.actual_verified_at]).map(Date.parse).filter(Number.isFinite);
+    if (!times.length) {setCenter(null); setHours(168); return;}
+    const first = Math.min(...times), last = Math.max(...times);
+    setCenter((first + last) / 2);
+    setHours(Math.max(1, Math.min(8784, (last - first) / 3600000 * 1.1)));
+  }
+  return jsxs('section', {children: [
+    jsxs('fieldset', {children: [jsx('legend', {children: 'Timeline range'}),
+      jsx('div', {className: 'ue-toolbar', children: [
+        ...RANGES.map(([value, label]) => jsx(Button, {'aria-pressed': hours === value,
+          onClick: () => {setHours(value); setCenter(null);}, children: label}, value)),
+        jsx(Button, {onClick: () => zoom(.5), children: 'Zoom in'}),
+        jsx(Button, {onClick: () => zoom(2), children: 'Zoom out'}),
+        jsx(Button, {onClick: () => setCenter(anchor - span / 2), children: 'Earlier'}),
+        jsx(Button, {onClick: () => setCenter(anchor + span / 2), children: 'Later'}),
+        jsx(Button, {onClick: fit, children: 'Fit commitments'})]})]}),
+    jsx(Timeline, {commitments, now, onSelect, start: new Date(anchor - span / 2).toISOString(),
+      end: new Date(anchor + span / 2).toISOString()})]});
+}
 const seconds = value => value === null || value === undefined ? 'Unknown'
   : `${(value / 3600).toFixed(1)} h`;
 
+export function TaskScope({ctx, scope, sender, project, disabled, onSaved}) {
+  const [after, setAfter] = useState(null);
+  const [selected, setSelected] = useState(null);
+  // Stable range key during polling. Undated task membership is not range-filtered.
+  const [start] = useState(() => project.observed_at);
+  const end = new Date(Date.parse(start) + 86400000).toISOString();
+  const path = `/projects/${encodeURIComponent(project.project_id)}/timeline?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&limit=100${after ? '&after=' + encodeURIComponent(after) : ''}`;
+  const query = useRead(ctx, path, scope);
+  const task = query.data?.items.find(item => JSON.stringify([item.board_id, item.task_id]) === selected);
+  const saved = () => {onSaved(); query.refetch();};
+  return jsxs('section', {children: [
+    jsx('h2', {children: 'Verified work and scope'}),
+    query.isPending && jsx('p', {role: 'status', children: 'Loading task scope…'}),
+    query.isError && jsx('p', {role: 'alert', children: 'Task scope unavailable or stale. Editing disabled.'}),
+    ...(query.data?.items || []).map(item => jsx(Button, {
+      onClick: () => setSelected(JSON.stringify([item.board_id, item.task_id])),
+      children: `${item.board_id}/${item.task_id} · ${item.goal}`}, JSON.stringify([item.board_id, item.task_id]))),
+    query.data?.items.length === 0 && jsx('p', {children: 'No measured tasks. Bind canonical work with the supported Kanban sync configuration.'}),
+    after && jsx(Button, {onClick: () => {setAfter(null); setSelected(null);}, children: 'First tasks'}),
+    query.data?.has_more && jsx(Button, {onClick: () => {setAfter(query.data.next); setSelected(null);}, children: 'Next tasks'}),
+    task && jsxs('section', {children: [jsx('h3', {children: task.goal}),
+      jsxs('dl', {children: [jsx('dt', {children: 'Recorded status'}), jsx('dd', {children: task.status}),
+        jsx('dt', {children: 'Assigned agent'}), jsx('dd', {children: task.assignee || 'Unassigned'}),
+        jsx('dt', {children: 'Measured execution'}), jsx('dd', {children: seconds(task.actual_seconds)}),
+        jsx('dt', {children: 'Estimated remaining'}), jsx('dd', {children: seconds(task.remaining_seconds)}),
+        jsx('dt', {children: 'Verified completion'}), jsx('dd', {children: date(task.actual_verified_at)})]}),
+      jsx(CriteriaForm, {task, sender, disabled: disabled || query.isError || query.isPending, onSaved: saved}, selected)]}),
+    jsx(BaselineForm, {project, sender, disabled, onSaved})]});
+}
+
 export function ProjectDetail({ctx, scope, sender, project, disabled, onSaved}) {
   const [tab, setTab] = useState('commitments');
-  const [hours, setHours] = useState(168);
   const [inspected, setInspected] = useState(null);
   const [cursor, setCursor] = useState(null);
   const [milestone, setMilestone] = useState(null);
   const base = `/projects/${encodeURIComponent(project.project_id)}`;
   // One hook, one scoped key per tab: switching tabs reads the selected surface
   // and never renders another tab's rows.
-  const records = useRead(ctx, tab === 'commitments' ? base
-    : `${base}/${tab}?limit=100${cursor ? '&after=' + encodeURIComponent(cursor) : ''}`, scope);
+  const records = useRead(ctx, `${base}/${tab}?limit=100${cursor ? '&after=' + encodeURIComponent(cursor) : ''}`, scope, tab !== 'scope');
   const milestoneRead = useRead(ctx, `${base}/milestones/${encodeURIComponent(milestone || '')}`, scope, !!milestone);
-  const commitments = project.commitments || [];
+  const commitments = tab === 'commitments' && records.data?.items
+    ? records.data.items : cursor ? [] : project.commitments || [];
   const chosen = commitments.find(item => item.deadline_id === inspected) || null;
   const tabs = {
+    scope: () => jsx(TaskScope, {ctx, scope, sender, project, disabled, onSaved}, project.project_id),
     milestones: () => jsx(RecordList, {query: records, empty: 'No milestones recorded.', onMore: setCursor,
       columns: ['Milestone', 'Name', 'Revision'], row: item => [item.milestone_id, item.title, item.revision]}),
     'source-tasks': () => jsxs('section', {children: [
@@ -419,27 +504,32 @@ export function ProjectDetail({ctx, scope, sender, project, disabled, onSaved}) 
         ? `Canonical sync cadence ${records.data.sync_seconds}s, distinct from this page's 10s read. Sync health: ${JSON.stringify(records.data.sync_health)}`
         : 'Reading canonical source coverage…'}),
       jsx(RecordList, {query: records, empty: 'No canonical source tasks bound to this project.', onMore: setCursor,
-        columns: ['Board', 'Task', 'Status', 'Assignee', 'Goal'],
-        row: item => [item.board_id, item.task_id, item.status, item.assignee, item.goal]})]}),
+        columns: ['Board', 'Task', 'Status', 'Assignee', 'Goal', 'Dependencies (same board)', 'Current run', 'Run start', 'Run end', 'Heartbeat', 'Source coverage'],
+        row: item => [item.board_id, item.task_id, item.status, item.assignee, item.title,
+          item.parents?.join(', ') || 'None recorded', item.worker?.run_id, item.worker?.started_at,
+          item.worker?.ended_at, item.worker?.heartbeat_at,
+          `${item.coverage} · ${item.stale ? 'stale' : 'observed'} ${item.observed_at}`]})]}),
     history: () => jsx(RecordList, {query: records, empty: 'No recorded changes.', onMore: setCursor,
-      columns: ['Sequence', 'At', 'Actor', 'Operation', 'Reason'],
-      row: item => [item.sequence, item.occurred_at, item.actor, item.action, item.reason]}),
+      columns: ['Sequence', 'At', 'Actor', 'Operation', 'Reason', 'Change'],
+      row: item => [item.sequence, item.occurred_at, item.actor, item.action, item.reason,
+        jsxs('details', {children: [jsx('summary', {children: 'Inspect recorded change'}),
+          jsx('pre', {style: {whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxWidth: 480},
+            children: `Before: ${item.before_json ?? 'none'}\nAfter: ${item.after_json ?? 'none'}`})]})]}),
     interventions: () => jsxs('section', {children: [
       jsx('p', {className: 'ue-note', children: records.data
         ? `Recovery creation: ${records.data.recovery_creation}. ${records.data.next_action}`
         : 'Reading intervention receipts…'}),
       jsx(RecordList, {query: records, empty: 'No recorded interventions', onMore: setCursor,
-        columns: ['Requested', 'Observed', 'Attributed effect', 'At'],
-        row: item => [item.requested ?? item.action, item.observed, item.attributed_effect ?? item.outcome, item.at]})]}),
+        columns: ['Action', 'Kind', 'State', 'Requested', 'Observed', 'Attribution', 'Next action'],
+        row: item => [item.action_id, item.kind, item.state, JSON.stringify(item.requested_effect),
+          JSON.stringify(item.observed_effect), item.attribution, item.next_action]})]}),
     commitments: () => jsxs('section', {children: [
-      jsxs('fieldset', {children: [jsx('legend', {children: 'Timeline range'}), jsx('div', {className: 'ue-toolbar', children: RANGES.map(([value, label]) =>
-        jsx(Button, {'aria-pressed': hours === value, onClick: () => setHours(value), children: label}, value))})]}),
-      jsx(Timeline, {commitments, now: project.observed_at,
-        start: new Date(Date.parse(project.observed_at) - hours * 360000).toISOString(),
-        end: new Date(Date.parse(project.observed_at) + hours * 3240000).toISOString(),
+      jsx(TimelineView, {commitments, now: project.observed_at,
         onSelect: item => setInspected(item.deadline_id)}),
+      cursor && jsx(Button, {onClick: () => {setCursor(null); setInspected(null);}, children: 'First commitments'}),
+      records.data?.has_more && jsx(Button, {onClick: () => {setCursor(records.data.next); setInspected(null);}, children: 'Next commitments'}),
       project.commitments_has_more && jsx('p', {role: 'status', children:
-        `More commitments exist beyond the first ${commitments.length}; project risk is reported as ${project.risk_coverage}. Use the supported CLI to page the remainder.`}),
+        'Project risk covers only the summary page. Commitment pages do not establish a complete aggregate risk.'}),
       ...commitments.map(commitment => jsxs('dl', {children: [
         jsx('dt', {children: `${commitment.kind} deadline`}), jsx('dd', {children: commitment.deadline_id}),
         jsx('dt', {children: 'Owner and source'}), jsx('dd', {children: `${commitment.owner} · ${commitment.source}`}),
@@ -462,9 +552,10 @@ export function ProjectDetail({ctx, scope, sender, project, disabled, onSaved}) 
     jsx('dl', {children: [jsx('dt', {children: 'Weighted scope'}),
       jsx('dd', {children: `${project.progress?.verified_weight ?? 'unknown'} verified of ${project.progress?.current_weight ?? 'unknown'} current (baseline ${project.progress?.baseline_weight ?? 'none recorded'})`}),
       jsx('dt', {children: 'Last verified progress'}), jsx('dd', {children: date(project.progress?.last_verified_progress_at)})]}),
-    jsx(DetailTabs, {tab, query: tab === 'commitments' ? null : records,
+    jsx(DetailTabs, {tab, query: tab === 'scope' ? null : records,
       onTab: value => {setCursor(null); setTab(value);}, children: tabs[tab]()}),
-    chosen && jsx(ReviseForm, {sender, commitment: chosen, disabled, onSaved}, chosen.deadline_id),
+    chosen && jsx(ReviseForm, {sender, commitment: chosen, disabled: disabled || records.isError,
+      onSaved: () => {onSaved(); records.refetch();}}, chosen.deadline_id),
     jsxs('details', {children: [jsx('summary', {children: 'Add a deadline'}),
       jsx(DeadlineForm, {sender, projectId: project.project_id, disabled, onSaved})]}),
     jsxs('details', {children: [jsx('summary', {children: 'Add a milestone'}),
@@ -520,7 +611,8 @@ function ScopedPage({ctx, scope, sender}) {
       selected ? jsx(ProjectDetail, {ctx, scope, sender, project: query.data,
         disabled: gateway !== 'open' || query.isError || query.isPending, onSaved: () => query.refetch()}, selected) : jsxs('section', {children: [
           inventoryNotice(inventory) && jsx('p', {className: 'ue-note', role: 'status', children: inventoryNotice(inventory)}),
-          jsx(Portfolio, {rows: mergeInventory(inventory.data, query.data.items), onSelect: setSelected}),
+          jsx(Portfolio, {rows: mergeInventory(inventory.data, query.data.items,
+            {measurementsComplete: !after && !query.data.has_more, canonicalAvailable: !inventory.isError && !inventory.isPending}), onSelect: setSelected}),
           !query.data.items.length && !inventory.data?.length && jsx('p', {children: 'No configured projects in this scope. Create a project to begin measuring verified work.'}),
           after && jsx(Button, {onClick: () => setAfter(null), children: 'First page'}),
           query.data.has_more && jsx(Button, {onClick: () => setAfter(query.data.next), children: 'Next projects'})]})]})]});

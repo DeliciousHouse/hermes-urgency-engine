@@ -107,6 +107,20 @@ class Views:
                 'risk_coverage': 'partial' if more else 'recorded_commitments',
                 'observed_at': self.clock().isoformat(), 'coverage': 'local_ledger_only'}
 
+    def commitments(self, project_id, *, limit=100, after=None):
+        project = self.ledger.get_project(project_id)
+        rows = self.ledger.list_deadlines(project_id, limit, after)
+        more = bool(rows and self.ledger.list_deadlines(project_id, 1, rows[-1]['deadline_id']))
+        items = []
+        for row in rows:
+            item = self.ledger.explain_deadline(row['deadline_id'])
+            item.pop('input_revisions')
+            items.append(item)
+        if self.ledger.get_project(project_id)['revision'] != project['revision']:
+            raise LedgerError('REVISION_CONFLICT', 'desktop', next_action='Reload the changed project.')
+        return {'items': items, 'has_more': more, 'next': rows[-1]['deadline_id'] if more else None,
+                'project_revision': project['revision'], 'observed_at': self.clock().isoformat()}
+
     def timeline(self, project_id, *, start, end, limit=100, after=None):
         left, right = range_time(start), range_time(end)
         if not 0 < (right - left).total_seconds() <= 366 * 86400:

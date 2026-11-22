@@ -47,7 +47,7 @@ def child():
     history = client.get(url + '/projects/synthetic/history', headers=headers)
     assert history.status_code == 200, (history.status_code, history.text)
     assert history.json()['data']['items'][0]['action'] == 'create_project'
-    for suffix in ('milestones', 'source-tasks', 'interventions'):
+    for suffix in ('commitments', 'milestones', 'source-tasks', 'interventions'):
         response = client.get(url + '/projects/synthetic/' + suffix, headers=headers)
         assert response.status_code == 200, (suffix, response.status_code, response.text)
         assert response.json()['data']['items'] == []

@@ -54,6 +54,27 @@ class ManagementTests(unittest.TestCase):
                 management_command(self.ledger, bad)
         self.assertEqual(len(self.ledger.history('project', 'p')), 2)
 
+    def test_scope_control_payloads_use_real_ledger_replay_and_baseline(self):
+        """protects=renderer scope payload compatibility; seam=real adapter/store;
+        no_claim=installed form input; supplements the renderer's exact field test.
+        """
+        from urgency_engine.desktop import management_command
+        self.ledger.upsert_task('b', 't', project_id='p', goal='Deliver', expected_revision=0,
+                               reason='Plan', request_id='task', actor='operator')
+        payload = dict(operation='set_criteria', request_id='criteria', arguments=dict(
+            board_id='b', task_id='t', expected_revision=1, reason='Clarify scope',
+            criteria=[dict(criterion_id='test', description='Tests pass', weight=3,
+                           required=True, expected_sha256=None)]))
+        result = management_command(self.ledger, payload)
+        self.assertEqual(result['criteria'][0]['weight'], 3)
+        self.assertEqual(management_command(self.ledger, payload), result)
+        baseline = dict(operation='baseline_scope', request_id='baseline', arguments=dict(
+            project_id='p', expected_revision=self.ledger.get_project('p')['revision'], reason='Freeze original'))
+        first = management_command(self.ledger, baseline)
+        self.assertEqual(management_command(self.ledger, baseline), first)
+        self.assertEqual(self.ledger.progress('p')['baseline_weight'], 3)
+        self.assertEqual(self.ledger.progress('p')['percent'], 0)
+
     def test_datetime_control_payload_creates_and_revises_real_commitment(self):
         """protects=working native datetime controls; fails_when=naive form times
         never reach Ledger; seam=synthetic zone files; no_claim=installed UI.
