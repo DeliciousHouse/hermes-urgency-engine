@@ -52,6 +52,20 @@ def child():
         assert response.status_code == 200, (suffix, response.status_code, response.text)
         assert response.json()['data']['items'] == []
         assert client.get(url + '/projects/foreign/' + suffix, headers=headers).status_code == 404
+    # Read an existing milestone and its membership at the owning revision;
+    # a milestone ID from another project must never populate this editor.
+    with Ledger(sqlite3.connect(root / 'data.db'), clock=lambda:datetime(2030, 1, 1, tzinfo=timezone.utc), artifact_root=root) as ledger:
+        ledger.upsert_task('board', 'task', project_id='synthetic', goal='Deliver', expected_revision=0,
+                          reason='Plan', request_id='task', actor='operator')
+        ledger.create_milestone('m', project_id='synthetic', title='Review', request_id='m', actor='operator')
+        ledger.set_milestone_tasks('m', [['board', 'task']], expected_revision=3, reason='Scope', request_id='members', actor='operator')
+        ledger.create_project('other', 'Other', request_id='other', actor='operator')
+    milestone = client.get(url + '/projects/synthetic/milestones/m', headers=headers)
+    assert milestone.status_code == 200, (milestone.status_code, milestone.text)
+    assert milestone.json()['data']['tasks'] == [['board', 'task']]
+    assert milestone.json()['data']['project_revision'] == 4
+    assert client.get(url + '/projects/other/milestones/m', headers=headers).status_code == 404
+    assert client.get(url + '/projects/synthetic/milestones/m').status_code == 401
     missing = client.get(url + '/projects/foreign', headers=headers)
     assert missing.status_code == 404 and missing.json()['error']['code'] == 'NOT_FOUND'
     invalid = client.get(url + '/portfolio?limit=501', headers=headers)

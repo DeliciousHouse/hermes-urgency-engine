@@ -87,10 +87,10 @@ function useScope() {
   const epoch = useGatewayActivationEpoch();
   return {connection, profile, epoch};
 }
-function useRead(ctx, path, scope) {
+function useRead(ctx, path, scope, enabled = true) {
   const gateway = useValue(host.state.gateway);
   return useQuery({queryKey: ['urgency', scope.connection, scope.profile, scope.epoch, path],
-    queryFn: () => scopedRead(ctx, path, scope), retry: false, staleTime: 5000, enabled: gateway === 'open',
+    queryFn: () => scopedRead(ctx, path, scope), retry: false, staleTime: 5000, enabled: enabled && gateway === 'open',
     refetchInterval: query => query.state.error ? 60000 : 10000, refetchIntervalInBackground: false});
 }
 
@@ -306,12 +306,12 @@ export function memberTasks(text) {
   return {tasks, rejected};
 }
 
-export function MembershipForm({sender, milestoneId, projectRevision, onSaved, disabled}) {
+export function MembershipForm({sender, milestoneId, projectRevision, tasks = [], onSaved, disabled}) {
   return CommandForm({sender, onSaved, disabled,
-    base: {milestone_id: milestoneId, revision: projectRevision},
+    base: {milestone_id: milestoneId, revision: projectRevision, tasks},
     title: `Milestone membership ${milestoneId}`, submitLabel: 'Save membership',
     fields: [{name: 'tasks', label: 'Member tasks, one board/task per line', multiline: true,
-      maxLength: 65536, required: false, initial: () => ''},
+      maxLength: 65536, required: false, initial: base => base.tasks.map(pair => pair.join('/')).join('\n')},
       {name: 'reason', label: 'Reason for the change'}],
     validate: draft => {
       const {rejected} = memberTasks(draft.tasks);
@@ -322,6 +322,18 @@ export function MembershipForm({sender, milestoneId, projectRevision, onSaved, d
     build: (draft, pinned) => ['set_milestone_tasks', {milestone_id: pinned.milestone_id,
       tasks: memberTasks(draft.tasks).tasks,
       expected_revision: pinned.revision, reason: draft.reason}]});
+}
+
+export function MilestoneEditor({query, sender, disabled, onSaved}) {
+  const milestone = query.data;
+  if (!milestone) return jsx('p', {role: query.isError ? 'alert' : 'status',
+    children: query.isError ? 'Milestone unavailable. Check the ID and retry.' : 'Loading milestone…'});
+  const props = {sender, disabled: disabled || query.isError, onSaved,
+    projectRevision: milestone.project_revision};
+  return jsxs('section', {children: [
+    query.isError && jsx('p', {role: 'alert', children: 'Milestone data is stale; editing is disabled.'}),
+    jsx(MilestoneForm, {...props, milestone}, `title:${milestone.milestone_id}`),
+    jsx(MembershipForm, {...props, milestoneId: milestone.milestone_id, tasks: milestone.tasks}, `members:${milestone.milestone_id}`)]});
 }
 
 const TABS = [['commitments', 'Commitments'], ['milestones', 'Milestones'],
@@ -396,6 +408,7 @@ export function ProjectDetail({ctx, scope, sender, project, disabled, onSaved}) 
   // and never renders another tab's rows.
   const records = useRead(ctx, tab === 'commitments' ? base
     : `${base}/${tab}?limit=100${cursor ? '&after=' + encodeURIComponent(cursor) : ''}`, scope);
+  const milestoneRead = useRead(ctx, `${base}/milestones/${encodeURIComponent(milestone || '')}`, scope, !!milestone);
   const commitments = project.commitments || [];
   const chosen = commitments.find(item => item.deadline_id === inspected) || null;
   const tabs = {
@@ -460,8 +473,8 @@ export function ProjectDetail({ctx, scope, sender, project, disabled, onSaved}) 
       jsxs('label', {children: ['Milestone ID to edit', jsx(Input, {value: milestone || '',
         onChange: event => setMilestone(event.target.value)})]}),
       milestone
-        ? jsx(MembershipForm, {sender, milestoneId: milestone, projectRevision: project.revision,
-          disabled, onSaved}, milestone)
+        ? jsx(MilestoneEditor, {sender, query: milestoneRead, disabled,
+          onSaved: () => {onSaved(); milestoneRead.refetch(); records.refetch();}}, milestone)
         : jsx('p', {children: 'Name a milestone from the Milestones tab to edit its membership.'})]})]});
 }
 

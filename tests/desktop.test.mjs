@@ -126,7 +126,7 @@ test('deadline and membership editors keep their identity across background revi
     (function walk(node) {
       if (Array.isArray(node)) return node.forEach(walk);
       if (!node || typeof node !== 'object') return;
-      if (['ReviseForm', 'MembershipForm'].includes(node.type?.name)) editors.push(node.key);
+      if (['ReviseForm', 'MilestoneEditor'].includes(node.type?.name)) editors.push(node.key);
       walk(node.props?.children);
     })(tree);
     return editors;
@@ -389,6 +389,17 @@ test('rescheduling shows the original target and requires an explicit reason', a
   assert.equal(sent[0][1].expected_revision, 3);
   assert.equal(sent[0][1].reason, 'client moved the review');
   assert.equal(sent[0][1].intent, undefined);
+});
+
+test('milestone editor waits for membership and mounts both editing controls', async () => {
+  const {api} = await load();
+  const props = {sender: {}, onSaved() {}, disabled: false};
+  const pending = api.MilestoneEditor({...props, query: {isPending: true}});
+  assert.match(JSON.stringify(pending), /Loading milestone/);
+  const tree = expand(api.MilestoneEditor({...props, query: {data: {milestone_id: 'm',
+    title: 'Loaded milestone', project_revision: 7, tasks: [['b', 't']]}}}));
+  assert.equal(labelled(tree, 'Milestone name').props.value, 'Loaded milestone');
+  assert.equal(labelled(tree, 'Member tasks, one board/task per line').props.value, 'b/t');
 });
 
 test('milestone control creates and edits membership through named commands', async () => {

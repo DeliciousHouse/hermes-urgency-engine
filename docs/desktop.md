@@ -28,6 +28,7 @@ payload cannot choose a database or claim a permission. Responses are
 | `GET /projects/{project_id}` | — | project, `progress`, `commitments`, `commitments_has_more`, `urgency`, `risk_coverage`, `observed_at`, `coverage` |
 | `GET /projects/{project_id}/timeline` | `start`, `end` (UTC ISO 8601, span 0 to 366 days), `limit`, `after` | paged task rows with `started_at`, `dependencies` and `blocked_periods` explicitly `null`, plus `start`, `end`, `now`, `range_policy` |
 | `GET /projects/{project_id}/milestones` | `limit`, `after` | `items`, `has_more`, `next` |
+| `GET /projects/{project_id}/milestones/{milestone_id}` | — | scoped milestone title, member task IDs and owning `project_revision` |
 | `GET /projects/{project_id}/history` | `limit`, `after` (decimal sequence) | audited change records, `has_more`, `next` |
 | `GET /projects/{project_id}/source-tasks` | `limit`, `after` | canonical Sync rows plus `sync_health` and `sync_seconds` |
 | `GET /projects/{project_id}/interventions` | `limit`, `after` | receipts, `recovery_creation`, `next_action` |
@@ -77,7 +78,8 @@ form. Detail: progress, risk and its reasons, weighted scope against the baselin
 commitment timeline with `6h / 24h / 7d / 30d / 90d` presets, and tabs for
 Commitments, Milestones, Source tasks, History and Interventions. Forms: create and
 edit project, add a deadline, reschedule a deadline, add a milestone, and edit
-milestone membership.
+milestone title and membership. Both editors first load the existing record, so
+opening membership never starts with an empty replacement for existing members.
 
 Hard and soft deadlines are labelled in text (`Hard (external commitment)`,
 `Soft (internal target)`), never by colour alone. Timeline markers are `│` original,
@@ -211,7 +213,8 @@ commitment.
    a reason. Only the first `/` splits a line, so a task id may contain one. A line
    that does not name both halves is refused by name before anything is sent, rather
    than guessed at.
-3. Save, then return to Commitments. A milestone-scoped deadline now measures exactly
+3. Wait for the existing name and membership to load. Edit either form, then save
+   and return to Commitments. A milestone-scoped deadline now measures exactly
    those tasks, so binding work that cannot finish in time raises the urgency level
    while leaving the committed target untouched.
 

@@ -133,6 +133,19 @@ def milestones(project_id: str, request: Request):
     return respond(read)
 
 
+@router.get('/projects/{project_id}/milestones/{milestone_id}')
+def milestone(project_id: str, milestone_id: str):
+    def read(view):
+        project = view.ledger.get_project(project_id)
+        record = view.ledger.get_milestone(milestone_id)
+        if record['project_id'] != project_id:
+            raise _ledger.LedgerError('NOT_FOUND', 'desktop', 'milestone_id')
+        if view.ledger.get_project(project_id)['revision'] != project['revision']:
+            raise _ledger.LedgerError('REVISION_CONFLICT', 'desktop')
+        return {**record, 'project_revision': project['revision']}
+    return respond(lambda: read_view(read))
+
+
 @router.get('/projects/{project_id}/source-tasks')
 def source_tasks(project_id: str, request: Request):
     def read():
