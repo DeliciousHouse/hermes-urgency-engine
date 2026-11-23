@@ -70,6 +70,12 @@ subcommand prints help and exits 2. Slash and tool return a JSON string. String
 values are redacted through Hermes before export; redaction can therefore alter
 an identifier containing a credential-like value. Do not put secrets in IDs.
 
+The local CLI additionally offers `outcomes --project ID --limit N --after SEQUENCE`.
+Only `--project` is required; limit defaults to 100 (1–500). This read-only export
+returns `items`, `has_more`, and `next` in the active profile with normal redaction.
+It is not a slash/tool/hook/HTTP operation. See the [outcome reference](ledger.md#verified-forecast-outcomes)
+for provenance, retention and null reasons.
+
 ### Operator writes
 
 `hermes urgency apply OPERATION --json-file PATH` accepts one UTF-8 JSON object,
@@ -121,8 +127,8 @@ Operator writes create the default artifact directory under
 artifact directories are never created automatically. Artifact paths in requests
 are relative; the ledger rejects escapes and symlinks. SQLite `data.db`, focus
 `state.json`, and diagnostic logs are plugin-owned persistent data, not files in
-the plugin install directory. Ledger writes atomically upgrade validated schema 1
-to schema 2 for unknown remaining work; reads support both without migration.
+the plugin install directory. Write-capable Ledger opens atomically upgrade validated
+schemas 1/2 to schema 3 for verified outcomes; reads support all three without migration.
 See [schema compatibility](ledger.md#schema-versions-1-and-2). Audit retention is
 not bounded by diagnostic-log rotation.
 
@@ -185,9 +191,9 @@ surface that supplies a session ID, or configure a deliberate profile default.
 3. Install a reviewed revision, then run `hermes plugins enable hermes-urgency-engine`
    and `hermes urgency diagnose`. Read status/history to reconcile uncertain writes.
 
-After the first write upgrades the ledger, schema-1-only code cannot read it.
-Keep schema-2-compatible code or restore a consistent pre-upgrade backup while
-writes are stopped; never lower user_version or discard the unknown flag. Do not
+After a write-capable open upgrades the ledger, older code without schema 3 support cannot read it.
+Keep compatible code or restore a consistent pre-upgrade backup while writers are stopped,
+preserving post-upgrade data separately; never lower user_version or discard tables/flags. Do not
 remove plugin-data to fix a load error. For a source checkout, validate only the
 plugin source directory, not a parent containing dependency caches or host copies:
 
