@@ -32,7 +32,7 @@ The [forecast core](forecast.md) takes an explicit evaluation time and does not 
 | [Intervention journal](interventions.md) | `interventions.db`: requests, effects and reconciliation receipts | The intent is retained before the effect; there is no transaction spanning the journal, Ledger, and native Kanban. |
 | [Desktop](desktop.md) | `desktop.db`: opaque profile identity; renderer retains pending command intent for recovery | Identity protects routing, not authorization. Do not switch profiles to retry a pending save. |
 
-SQLite stores follow the active Hermes home through plugin storage. SQLite can maintain WAL coordination files even when existing state is read. The Ledger validates schema 1 and upgrades it atomically on write to schema 2; read-only access does not migrate. A schema-1-only build cannot read upgraded state. Use [consistent backups and the removal procedure](troubleshooting.md#how-to-disable-upgrade-or-remove).
+SQLite stores follow the active Hermes home through plugin storage. SQLite can maintain WAL coordination files even when existing state is read. The Ledger validates schemas 1 and 2 and upgrades them atomically on write-capable open to schema 3; read-only access does not migrate. Builds without schema 3 support cannot read upgraded state. Use [consistent backups and the removal procedure](troubleshooting.md#how-to-disable-upgrade-or-remove).
 
 ## Process and network boundaries
 

@@ -61,6 +61,15 @@ def _json(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False)
 
 
+def _at_or_before(value, boundary):
+    try:
+        a = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        b = datetime.fromisoformat(boundary.replace('Z', '+00:00'))
+        return int(a.utcoffset() is not None and b.utcoffset() is not None and a <= b)
+    except (ValueError, TypeError, AttributeError, OverflowError):
+        return 0
+
+
 def _command(method, *, prepare=False) -> Any:
     signature = inspect.signature(method)
 
@@ -147,6 +156,13 @@ _SCHEMA = (
 
 _REMAINING_COLUMN = 'remaining_known INTEGER NOT NULL DEFAULT 1 CHECK(remaining_known IN (0,1))'
 _SCHEMA_V2 = tuple(sql.replace('PRIMARY KEY(board_id,task_id)', _REMAINING_COLUMN + ', PRIMARY KEY(board_id,task_id)') if sql.startswith('CREATE TABLE tasks(') else sql for sql in _SCHEMA)
+_OUTCOME_SCHEMA = (
+    "CREATE TABLE outcomes(sequence INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL REFERENCES projects, board_id TEXT NOT NULL, task_id TEXT NOT NULL, evidence_id TEXT NOT NULL REFERENCES evidence, verified_at TEXT NOT NULL, snapshot_id INTEGER REFERENCES snapshots, evaluated_at TEXT, recorded_at TEXT, input_revisions TEXT, target_at TEXT, forecast_at TEXT, completion_error_seconds REAL, on_time INTEGER, forecast_reason TEXT, duration_seconds REAL, duration_reason TEXT NOT NULL)",
+    'CREATE INDEX outcomes_project ON outcomes(project_id,sequence)',
+    'CREATE UNIQUE INDEX outcome_identity ON outcomes(project_id,board_id,task_id,evidence_id)',
+    "CREATE INDEX snapshot_task_forecast ON snapshots(project_id,json_extract(payload_json,'$.board_id'),json_extract(payload_json,'$.task_id'),snapshot_id) WHERE kind='forecast'",
+)
+_SCHEMA_V3 = _SCHEMA_V2 + _OUTCOME_SCHEMA
 
 
 _HAS_EVIDENCE = '''EXISTS(SELECT 1 FROM evidence e WHERE e.board_id=c.board_id AND e.task_id=c.task_id AND e.criterion_id=c.criterion_id AND e.criterion_revision=c.criterion_revision AND e.invalidated_at IS NULL AND e.observed_sha256=c.expected_sha256)'''
@@ -156,8 +172,9 @@ class Ledger:
     """Own a dedicated connection until context exit; do not share it across threads."""
 
     def __init__(self, connection, *, clock, artifact_root, busy_timeout_ms=5000, read_only=False,
-                 check_integrity=False):
+                 check_integrity=False, outcome_retention=1000):
         _integer(busy_timeout_ms, 'busy_timeout_ms', 0, 5000)
+        self.outcome_retention = _integer(outcome_retention, 'outcome_retention', 1, 10000)
         self.busy_timeout_ms = busy_timeout_ms
         self.connection, self.clock = connection, clock
         self.forecast_evidence: Any = None
@@ -182,6 +199,7 @@ class Ledger:
     def _initialize(self, read_only, check_integrity):
         connection = self.connection
         connection.row_factory = sqlite3.Row
+        connection.create_function('outcome_at_or_before', 2, _at_or_before, deterministic=True)
         connection.execute(f'PRAGMA busy_timeout={self.busy_timeout_ms}')
         connection.execute('PRAGMA foreign_keys=ON')
         with self._transaction('initialize', write=not read_only):
@@ -190,13 +208,13 @@ class Ledger:
             if version == 0 and not objects:
                 if read_only:
                     raise LedgerError('NOT_FOUND', 'initialize', next_action='Initialize the ledger with hermes urgency apply.')
-                for statement in _SCHEMA_V2:
+                for statement in _SCHEMA_V3:
                     connection.execute(statement)
-                connection.execute('PRAGMA user_version=2')
-                version = 2
-            elif version not in (1, 2):
+                connection.execute('PRAGMA user_version=3')
+                version = 3
+            elif version not in (1, 2, 3):
                 raise LedgerError('UNSUPPORTED_SCHEMA', 'initialize')
-            elif sorted(row[0] for row in objects) != sorted(_SCHEMA if version == 1 else _SCHEMA_V2):
+            elif sorted(row[0] for row in objects) != sorted((_SCHEMA, _SCHEMA_V2, _SCHEMA_V3)[version - 1]):
                 raise LedgerError('CORRUPT_STATE', 'initialize')
             if (not read_only or check_integrity) and (connection.execute('PRAGMA quick_check').fetchone()[0] != 'ok' or connection.execute('PRAGMA foreign_key_check').fetchone()):
                 raise LedgerError('CORRUPT_STATE', 'initialize')
@@ -204,6 +222,11 @@ class Ledger:
                 connection.execute('ALTER TABLE tasks ADD COLUMN ' + _REMAINING_COLUMN)
                 connection.execute('PRAGMA user_version=2')
                 version = 2
+            if version == 2 and not read_only:
+                for statement in _OUTCOME_SCHEMA:
+                    connection.execute(statement)
+                connection.execute('PRAGMA user_version=3')
+                version = 3
             self.schema_version = version
 
     def __enter__(self):
@@ -312,6 +335,25 @@ class Ledger:
             return [dict(row) for row in self.connection.execute(
                 'SELECT * FROM audit WHERE entity_type=? AND entity_id=? AND sequence>? ORDER BY sequence LIMIT ?',
                 (entity_type, entity_id, after or 0, limit))]
+
+    def export_outcomes(self, project_id, limit=100, after=None):
+        _id(project_id, 'project_id')
+        _integer(limit, 'limit', 1, 500)
+        if after is not None:
+            _integer(after, 'after')
+        with self._transaction('export_outcomes'):
+            self._project(project_id)
+            if self.schema_version < 3:
+                return []
+            rows = [dict(row) for row in self.connection.execute(
+                'SELECT * FROM outcomes WHERE project_id=? AND sequence>? ORDER BY sequence LIMIT ?',
+                (project_id, after or 0, limit))]
+            for row in rows:
+                if row['input_revisions'] is not None:
+                    row['input_revisions'] = json.loads(row['input_revisions'])
+                if row['on_time'] is not None:
+                    row['on_time'] = bool(row['on_time'])
+            return rows
 
     def project_history(self, project_id, limit=100, after=None):
         """Page recorded project, task, milestone and commitment changes together.
@@ -485,6 +527,37 @@ class Ledger:
         self._snapshot(before['project_id'], 'current', {'action': 'reopen_task', 'board_id': board_id, 'task_id': task_id, 'revision': expected_revision + 1})
         return self._task(board_id, task_id), 'task', _json([board_id, task_id]), before
 
+    def _record_outcome(self, before, evidence_id, checked_at):
+        board, task, project = before['board_id'], before['task_id'], before['project_id']
+        floor = self.connection.execute(
+            "SELECT coalesce(max(json_extract(after_json,'$.revision')),0) FROM audit WHERE entity_type='task' AND entity_id=? AND action NOT IN ('claim_complete','verify_artifact')",
+            (_json([board, task]),)).fetchone()[0]
+        scope = "project_id=? AND kind='forecast' AND json_extract(payload_json,'$.board_id')=? AND json_extract(payload_json,'$.task_id')=? AND json_extract(payload_json,'$.milestone_id') IS NULL"
+        revision = "json_array_length(payload_json,'$.input_revisions.tasks')=1 AND json_extract(payload_json,'$.input_revisions.tasks[0][0]')=? AND json_extract(payload_json,'$.input_revisions.tasks[0][1]')=? AND json_extract(payload_json,'$.input_revisions.tasks[0][2]') BETWEEN ? AND ? AND json_extract(payload_json,'$.actual_verified_at') IS NULL"
+        prior = "outcome_at_or_before(recorded_at,?) AND outcome_at_or_before(json_extract(payload_json,'$.input.now'),?)"
+        params = (project, board, task, board, task, floor, before['revision'], checked_at, checked_at)
+        row = self.connection.execute(f'SELECT snapshot_id,recorded_at,payload_json FROM snapshots WHERE {scope} AND {revision} AND {prior} ORDER BY snapshot_id DESC LIMIT 1', params).fetchone()
+        data = json.loads(row['payload_json']) if row else None
+        reason = None
+        if row is None:
+            prior_row = self.connection.execute(f'SELECT 1 FROM snapshots WHERE {scope} AND {prior} LIMIT 1', (project, board, task, checked_at, checked_at)).fetchone()
+            any_row = self.connection.execute(f'SELECT 1 FROM snapshots WHERE {scope} LIMIT 1', (project, board, task)).fetchone()
+            reason = 'stale' if prior_row else ('incomparable' if any_row else 'missing')
+        elif data is not None and (not data.get('forecast_at') or not _at_or_before(data['input']['now'], data['forecast_at'])):
+            reason = 'incomparable'
+        error = on_time = None
+        if data is not None:
+            on_time = int(datetime.fromisoformat(checked_at) <= datetime.fromisoformat(data['target_at']))
+        if reason is None and data is not None:
+            error = (datetime.fromisoformat(checked_at) - datetime.fromisoformat(data['forecast_at'])).total_seconds()
+        self.connection.execute('INSERT INTO outcomes(project_id,board_id,task_id,evidence_id,verified_at,snapshot_id,evaluated_at,recorded_at,input_revisions,target_at,forecast_at,completion_error_seconds,on_time,forecast_reason,duration_seconds,duration_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            (project, board, task, evidence_id, checked_at, row['snapshot_id'] if row else None,
+             data['input']['now'] if data else None, row['recorded_at'] if row else None,
+             _json(data['input_revisions']) if data else None, data['target_at'] if data else None,
+             data['forecast_at'] if data else None, error, on_time, reason, None, 'duration_unobserved'))
+        self.connection.execute('DELETE FROM outcomes WHERE project_id=? AND sequence <= coalesce((SELECT sequence FROM outcomes WHERE project_id=? ORDER BY sequence DESC LIMIT 1 OFFSET ?),0)',
+                                (project, project, self.outcome_retention))
+
     @partial(_command, prepare=True)
     def verify_artifact(self, board_id, task_id, criterion_id, artifact_relative_path, *,
                         expected_revision, reason, request_id, actor):
@@ -517,6 +590,8 @@ class Ledger:
             missing = self.connection.execute('SELECT count(*) FROM criteria c WHERE board_id=? AND task_id=? AND active=1 AND NOT ' + _HAS_EVIDENCE, (board_id, task_id)).fetchone()[0]
             self.connection.execute('UPDATE tasks SET status=?,actual_verified_at=?,last_verified_progress_at=?,revision=revision+1 WHERE board_id=? AND task_id=?',
                                     ('verified' if not missing else before['status'], checked_at if not missing else None, checked_at, board_id, task_id))
+            if not missing and before['status'] != 'verified':
+                self._record_outcome(before, request_id, checked_at)
             self._bump(before['project_id'])
             return dict(self.connection.execute('SELECT * FROM evidence WHERE evidence_id=?', (request_id,)).fetchone()), 'task', _json([board_id, task_id]), before
         return accept

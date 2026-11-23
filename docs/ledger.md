@@ -6,8 +6,10 @@ Keep original commitments, revised targets and verified progress in one local SQ
 - [Why commitments and evidence are separate](#why-commitments-and-evidence-are-separate)
 - [How to revise a deadline safely](#how-to-revise-a-deadline-safely)
 - [How to reconcile a failed command](#how-to-reconcile-a-failed-command)
+- [How to export verified outcomes](#how-to-export-verified-outcomes)
 - [How to back up and restore](#how-to-back-up-and-restore)
 - [Build a temporary evidence ledger](#build-a-temporary-evidence-ledger)
+- [Explore a synthetic forecast outcome](#explore-a-synthetic-forecast-outcome)
 - [How to run the checks](#how-to-run-the-checks)
 
 ## Reference
@@ -17,7 +19,7 @@ Import `Ledger`, `LedgerError` and `open_hermes_ledger` from `urgency_engine`. P
 ### Connections and ownership
 
 ```text
-Ledger(connection, *, clock, artifact_root, busy_timeout_ms=5000)
+Ledger(connection, *, clock, artifact_root, busy_timeout_ms=5000, outcome_retention=1000)
 open_hermes_ledger(*, clock, artifact_root, busy_timeout_ms=5000)
 ```
 
@@ -28,6 +30,8 @@ Both return a context manager. `connection` is a dedicated `sqlite3.Connection`,
 `open_hermes_ledger` lazily calls the documented `plugins.plugin_storage.plugin_db('hermes-urgency-engine')` on **every open**, following the active Hermes profile without caching a connection. Mutations use this opener. Native read-only queries and the pre-turn hook use `open_readonly_ledger` to read an existing database without initializing one. Offline callers inject their own temporary connection. No Hermes modules are needed merely to import the library. See the [Hermes plugin documentation](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/).
 
 `busy_timeout_ms` is an integer from 0 to 5000 (not bool). The default retains the library wait budget; the native hook uses 100 ms to fail open promptly under a held write lock.
+
+`outcome_retention` is a per-project count from 1 to 10,000 (integer, not bool), default 1,000. Each newly recorded outcome prunes older outcomes for that project to this count; it does not prune audit or evidence. The host opener uses the default.
 
 ### Reads
 
@@ -41,6 +45,7 @@ list_tasks(project_id, limit=100, after=None)
 list_deadlines(project_id, limit=100, after=None)
 history(entity_type, entity_id, limit=100, after=None)
 project_history(project_id, limit=100, after=None)
+export_outcomes(project_id, limit=100, after=None)
 progress(project_id)
 explain_deadline(deadline_id)
 ```
@@ -56,10 +61,21 @@ All reads use a consistent transaction and write nothing.
 - `list_deadlines`: scoped deadline records ordered by ID; the cursor is the last `deadline_id`. Both scoped lists require an existing project, accept limits 1–500, and have the same concurrent-enumeration limits as `list_projects`.
 - `history`: audit rows ordered by `sequence`, strictly after the optional integer cursor. Limit is 1–500. `entity_type` is `project`, `task`, `milestone` or `deadline`; task entity IDs are compact JSON arrays such as `["demo-board","demo-task"]`. Other entity IDs are their plain IDs. `before_json` and `after_json` are JSON strings. History includes successful commands only.
 - `project_history`: the same audit row shape and sequence cursor, combining project, task, milestone and deadline changes for one project. Membership comes from recorded before/after snapshots, not arbitrary caller IDs. Successful commands only; limit 1–500.
+- `export_outcomes`: a project's outcome records in ascending `sequence`, strictly after the nonnegative integer `after` cursor (maximum 2^63−1); `limit` is an integer 1–500, default 100. The project must exist. Continue with the last sequence until an empty page; retention or concurrent writes may remove rows between pages. Schema 1/2 read-only opens return `[]` without migration.
 - `progress`: `{project_id, baseline_weight, current_weight, verified_weight, percent, state, unscoped_task_count, last_verified_progress_at, revision}`. No baseline yields `baseline_weight=null`. No active criteria or any unscoped task yields `percent=null`, `state='insufficient_evidence'`; otherwise state is `determinate`. Progress is the weighted fraction of active criterion revisions with accepted, uninvalidated matching evidence. A missing required criterion prevents 100%, even if floating-point rounding would conceal its weight. `last_verified_progress_at` is historical: reopening invalidates credit without erasing the last accepted-evidence time.
 - `explain_deadline`: deadline columns plus `forecast`, `forecast_at`, nullable `actual_verified_at`, `baseline_variance_seconds`, `target_variance_seconds`, `input`, and `input_revisions`. Variance uses verified completion if known, otherwise the forecast. Positive means late. `forecast_at` is clock + forecast work + verification and deployment buffers, not an empirical percentile. `input_revisions` records deadline/project revisions and `[board_id,task_id,revision]` tuples for known contributors; `input` records seconds and evaluation time.
 
 Forecasts reuse the unchanged [forecast policy](forecast.md#forecast-api), with the stored target and default policy. The latest explicitly stored forecast supplies cooldown state; read-only explanations do not advance it. No completion samples are invented: P50/P90 and on-time probability remain null. Unrepresentable projected dates return a named `INVALID_INPUT` rather than overflowing or inventing a date.
+
+### Verified forecast outcomes
+
+The first accepted evidence that completes all active criteria creates one outcome in the same transaction as evidence, task state, audit and replay receipt. Claims, partial or failed verification and exact replays do not add an outcome. Reopening or replacing scope allows a later completion to produce another. Byte verification is not semantic acceptance.
+
+Each record contains `sequence`, `project_id`, `board_id`, `task_id`, `evidence_id`, and `verified_at`; nullable `snapshot_id`, `evaluated_at`, `recorded_at`, `input_revisions`, `target_at`, `forecast_at`, `completion_error_seconds`, `on_time`, and `forecast_reason`; plus `duration_seconds` and `duration_reason`. `input_revisions` is a decoded object and `on_time` is boolean or null. Timestamps are UTC ISO strings. `completion_error_seconds` is verified time minus saved forecast time: positive is later than predicted. `on_time` compares verified time to the **saved** target, inclusively.
+
+The selected snapshot is the latest eligible saved forecast by snapshot ID for the exact project, board and task, not a project or milestone forecast. Its evaluation and recording times must both be no later than verification; its single task revision must be at or after the last task scope, metadata or reopen change and no later than the pre-verification revision. Claim and verification revisions do not invalidate it. Already-verified snapshots are excluded. A later deadline revision does not invalidate the snapshot or change its saved target; original commitments are never rewritten. There is no age-based expiry.
+
+`forecast_reason` is null for a comparable forecast, `missing` when no task-scoped snapshot exists, `stale` when a prior task-scoped snapshot exists but none is eligible, or `incomparable` when no prior snapshot exists but another task-scoped snapshot does, or the selected forecast time is unknown/invalid. With an eligible snapshot but unknown forecast time, error is null while `on_time` can still be computed from its saved target. Without an eligible snapshot, snapshot fields, error and `on_time` are null. `duration_seconds` is always null with `duration_reason='duration_unobserved'`, even when `actual_seconds` is nonzero: that field lacks observed-duration provenance. No historical backfill or learned calibration occurs. See [export](#how-to-export-verified-outcomes) and the [synthetic tutorial](#explore-a-synthetic-forecast-outcome).
 
 ### Synced commitment schedule reference
 
@@ -190,11 +206,7 @@ Schema 2 adds `tasks.remaining_known INTEGER NOT NULL DEFAULT 1` constrained to
 0 or 1. Existing schema-1 durations retain their known meaning. Unknown work is
 stored as numeric zero plus flag 0, but public reads, new audit payloads and new
 forecasts project it as null. Never read the numeric compatibility column alone.
-Read-only opens accept schema 1 without migration. A write-open validates the
-schema and integrity before atomically adding the column and advancing the
-version; failure rolls back both. Historical audit and replay responses are not
-rewritten. Schema-1-only code refuses schema 2: rollback needs compatible code
-or a consistent pre-upgrade backup, not a forced version-number downgrade.
+Schema 3 adds outcomes and indexes. Read-only opens accept schemas 1 and 2 without migration; outcome exports are empty. A write-capable open validates schema and integrity and atomically migrates either version to 3, even before a command is issued. Failure rolls back the migration. Historical audit and replay responses are not rewritten, and old completions are not backfilled. Older code that does not support schema 3 cannot open the upgraded database; see [backup and rollback](#how-to-back-up-and-restore).
 
 
 ```text
@@ -217,11 +229,12 @@ Every successful mutation --> audit + operations (same transaction)
 | `milestones` | `milestone_id` PK; project_id FK, title |
 | `milestone_tasks` | `(milestone_id,board_id,task_id)` PK; milestone and task FKs |
 | `evidence` | `evidence_id` PK (first acceptance request ID); criterion-revision FK, artifact_relative_path, observed_sha256, checked_at, invalidated_at |
+| `outcomes` | `sequence` PK; project and evidence FKs, task identity, verification, saved snapshot and comparison fields as described above |
 | `snapshots` | `snapshot_id` PK; project_id FK, kind, recorded_at, payload_json |
 | `operations` | `request_id` PK; payload_sha256, response_json |
 | `audit` | `sequence` PK; request_id, entity_type, entity_id, action, actor, reason, occurred_at, before_json, after_json |
 
-New storage uses `PRAGMA user_version=2`, foreign keys and atomic `BEGIN IMMEDIATE`; mutation also uses `BEGIN IMMEDIATE` with a configurable busy timeout (5000 ms by default) and rollback on failure. Reads use `BEGIN`. A nonempty unknown database, future version, incomplete layout or failed integrity check is refused without repair/deletion. One active criterion per ID, one accepted evidence record per criterion revision, and one baseline per project are enforced by unique indexes. Internal bounded snapshots contain summaries, up to 100 criteria for scope changes, or at most 10,000 task revision tuples for forecasts. Retained audit JSON records and historical criteria allow reconstruction; do not delete history independently.
+New storage uses `PRAGMA user_version=3`, foreign keys and atomic `BEGIN IMMEDIATE`; mutation also uses `BEGIN IMMEDIATE` with a configurable busy timeout (5000 ms by default) and rollback on failure. Reads use `BEGIN`. A nonempty unknown database, future version, incomplete layout or failed integrity check is refused without repair/deletion. One active criterion per ID, one accepted evidence record per criterion revision, and one baseline per project are enforced by unique indexes. Internal bounded snapshots contain summaries, up to 100 criteria for scope changes, or at most 10,000 task revision tuples for forecasts. Retained audit JSON records and historical criteria allow reconstruction; do not delete history independently.
 
 ### Errors
 
@@ -249,6 +262,8 @@ Likewise, a task status is a claim, not proof. Weighted criteria define the deno
 
 SQLite trades concurrent writer throughput for atomic local changes. Each command commits entity changes, audit and replay response together. Hashing happens outside transactions, followed by a revision comparison inside the acceptance transaction. This permits another writer to replan during a slow hash without accepting obsolete proof. Whole-project JSON rewrites would not provide this protection. This library deliberately does not add a server, scheduler or learned calibration; those require separate integration and evidence.
 
+An outcome preserves the forecast that was actually available before verification, rather than reconstructing one afterward. The trade-off is that a missing or incompatible snapshot produces null comparisons, and retention removes old outcome rows; neither limitation justifies inventing measurements. See [outcome reference](#verified-forecast-outcomes).
+
 ## How to revise a deadline safely
 
 1. Read `explain_deadline(deadline_id)` and retain its `revision`.
@@ -266,9 +281,15 @@ For `REVISION_CONFLICT`, reload and reconcile. For a timezone error, install IAN
 
 Verify there is one audit row for the successful request. An exact replay returns historical response data, not necessarily today's state; call a getter for current state. See [errors](#errors).
 
+## How to export verified outcomes
+
+Prerequisites: an existing project in an initialized ledger, and for the native CLI an installed in-process plugin. Before final verification, save a task-scoped `snapshot_forecast`; then verify all active criteria. For a Python caller, read `ledger.export_outcomes(project_id, limit=100, after=None)` and pass the last row's `sequence` to the next call. Use a stable backup for a stable export; save pages externally before retention removes them.
+
+The native operator command is `hermes urgency outcomes --project PROJECT_ID --limit 100`, optionally with `--after SEQUENCE`. It reads the active profile only, returns redacted JSON `{ok, data: {items, has_more, next}}`, and does not initialize missing storage. Continue with `next` while `has_more` is true. String redaction can alter identifiers; failure to redact returns `REDACTION_FAILED`. This command is not exposed through slash, tool or HTTP. Missing store/project returns `NOT_FOUND`; invalid limits or cursors return `INVALID_INPUT`. For a runnable isolated exercise, use the [synthetic tutorial](#explore-a-synthetic-forecast-outcome).
+
 ## How to back up and restore
 
-Stop callers before source rollback or restoration. Preserve the original database and any WAL files; do not downgrade `user_version`, drop tables, delete state or copy only a live WAL database's main file. Use SQLite's backup API to create a consistent backup. Revert source through your normal review process, and open only a schema supported by that source.
+Before a schema 3 write-capable open, stop writers and use SQLite's backup API to make and verify a consistent pre-upgrade backup. Stop callers before source rollback or restoration; preserve the original database and WAL files and make a separate post-upgrade backup, including new outcomes and other writes. Older code must use the pre-upgrade backup or a schema-3-compatible version; restoring the old backup excludes later writes, which remain in the preserved post-upgrade copy. Do not downgrade `user_version`, drop tables, delete state or copy only a live WAL database's main file. Revert source through your normal review process, and open only a schema supported by that source.
 
 This complete demonstration touches only temporary fixtures:
 
@@ -299,7 +320,7 @@ with tempfile.TemporaryDirectory() as directory:
     print('backup and restore verified')
 ```
 
-If integrity checks fail, keep the original and backup for investigation. Do not repair by recreating an empty ledger. Disk growth, export and automatic retention are not managed by this version.
+If integrity checks fail, keep the original and backup for investigation. Do not repair by recreating an empty ledger. Outcome retention is bounded as above; audit and overall disk growth are not automatically bounded.
 
 ## Build a temporary evidence ledger
 
@@ -364,6 +385,16 @@ Expected output: `claim: 0%; verified bytes: 100%`. A missing file, digest misma
 ### What you built
 
 A durable local ledger where a claim earns no progress and matching bytes earn criterion credit. It does not establish semantic correctness of the result. Continue with the [API reference](#reference) or [backup how-to](#how-to-back-up-and-restore).
+
+## Explore a synthetic forecast outcome
+
+From the checkout root with Python 3.11–3.14, run this self-contained unittest. It creates and removes a temporary SQLite database, artifact and synthetic timezone data; it does not touch a Hermes profile or depend on host timezone data.
+
+```sh
+python -m unittest discover -s tests -p test_outcomes.py -k test_final_verification_captures_saved_forecast -v
+```
+
+The test creates a task and task-scoped deadline, saves a forecast, advances its fixture clock 60 seconds and verifies the artifact. A successful run reports one test `OK`; assertions check the saved snapshot, target, input revisions, verified time, 60-second completion error, on-time result and unobserved duration. If import fails, run from the repository root using a supported Python interpreter. **What you built:** a disposable comparison of a saved prediction against byte-verified completion, not a calibrated forecast. Continue with the [reference](#verified-forecast-outcomes) or [export how-to](#how-to-export-verified-outcomes).
 
 ## How to run the checks
 

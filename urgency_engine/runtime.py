@@ -167,6 +167,10 @@ def setup_parser(parser, *, conversational=False):
         focus = commands.add_parser('focus', help='Select a project for this session, or clear')
         focus.add_argument('project_id')
     else:
+        outcomes = commands.add_parser('outcomes', help='Export verified local forecast outcomes')
+        outcomes.add_argument('--project', required=True)
+        outcomes.add_argument('--limit', type=int, default=100)
+        outcomes.add_argument('--after', type=int)
         actions = commands.add_parser('interventions', help='Inspect or run supervised local interventions')
         intervention = actions.add_subparsers(dest='intervention_operation', required=True)
         intervention.add_parser('apply').add_argument('--json-file', required=True)
@@ -387,7 +391,19 @@ class Runtime:
             setup_parser(Parser(prog='hermes urgency')).print_help()
             return 2
         try:
-            if operation == 'interventions' and args.intervention_operation in ('show', 'reconcile'):
+            if operation == 'outcomes':
+                from .ledger import _id, _integer
+                _id(args.project, 'project_id')
+                _integer(args.limit, 'limit', 1, 500)
+                if args.after is not None:
+                    _integer(args.after, 'after')
+                with open_readonly_ledger(self.data_dir() / 'data.db', clock=self.clock, busy_timeout_ms=5000,
+                                          check_integrity=True) as ledger:
+                    items = ledger.export_outcomes(args.project, args.limit, args.after)
+                    has_more = bool(items and ledger.export_outcomes(args.project, 1, items[-1]['sequence']))
+                result = {'ok': True, 'data': dict(items=items, has_more=has_more,
+                          next=items[-1]['sequence'] if has_more else None)}
+            elif operation == 'interventions' and args.intervention_operation in ('show', 'reconcile'):
                 operation = 'interventions_' + args.intervention_operation
                 path = self.data_dir() / 'interventions.db'
                 store = interventions.Actions.read(path, self.clock)

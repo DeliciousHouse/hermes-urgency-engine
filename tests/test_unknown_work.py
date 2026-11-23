@@ -82,10 +82,10 @@ class UnknownLedgerTests(unittest.TestCase):
                 self.assertEqual(ledger.get_task('b', 't')['remaining_seconds'], 0)
             self.assertEqual(path.read_bytes(), before)
             with Ledger(sqlite3.connect(path), clock=lambda: now, artifact_root=root) as ledger:
-                self.assertEqual(ledger.schema_version, 2)
+                self.assertEqual(ledger.schema_version, 3)
                 self.assertEqual(ledger.get_task('b', 't')['remaining_seconds'], 0)
             with open_readonly_ledger(path, clock=lambda: now) as ledger:
-                self.assertEqual(ledger.schema_version, 2)
+                self.assertEqual(ledger.schema_version, 3)
 
 
     def test_explicit_null_survives_storage_forecast_and_progress(self):
@@ -123,7 +123,7 @@ class UnknownLedgerTests(unittest.TestCase):
                                          expected_revision=1, request_id='known'))
                 self.assertIs(known['remaining_known'], True)
                 self.assertEqual(ledger.explain_deadline('d')['forecast_at'], now.isoformat())
-                self.assertEqual(ledger.connection.execute('PRAGMA user_version').fetchone()[0], 2)
+                self.assertEqual(ledger.connection.execute('PRAGMA user_version').fetchone()[0], 3)
 
 
 if __name__ == '__main__':
