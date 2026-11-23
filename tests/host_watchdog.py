@@ -8,9 +8,72 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import secrets
+import socket
 import subprocess
 import sys
+import tempfile
 import time
+
+
+def external_liveness(host, installed, scratch):
+    probe = installed / 'scripts' / 'gateway_liveness.py'
+    home = scratch / 'home'
+    home.mkdir()
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0))
+        port = str(listener.getsockname()[1])
+    (home / 'config.yaml').write_text(json.dumps({
+        'kanban': {'dispatch_in_gateway': False},
+        'gateway': {'multiplex_profiles': False},
+    }), encoding='utf-8')
+    (home / '.env').write_text(
+        'API_SERVER_ENABLED=true\nAPI_SERVER_HOST=127.0.0.1\n'
+        f'API_SERVER_PORT={port}\nAPI_SERVER_KEY={secrets.token_hex(32)}\n', encoding='utf-8')
+    env = {k: os.environ[k] for k in ('PATH', 'LANG', 'SYSTEMROOT', 'WINDIR') if k in os.environ}
+    env.update(HOME=str(scratch), USERPROFILE=str(scratch), XDG_CONFIG_HOME=str(scratch / 'xdg'),
+               HERMES_HOME=str(home), HERMES_RUNTIME_DIR=str(scratch / 'runtime'),
+               HERMES_DISABLE_LAZY_INSTALLS='1', PYTHONUTF8='1')
+
+    def sample():
+        started = time.monotonic()
+        result = subprocess.run([sys.executable, '-I', str(probe), port], env=env, cwd=scratch,
+                                capture_output=True, text=True, timeout=5)
+        elapsed = time.monotonic() - started
+        assert result.returncode in (0, 1), result.returncode
+        assert result.stdout == '' and result.stderr == (
+            '' if result.returncode == 0 else 'Gateway health check failed.\n')
+        return {'exit': result.returncode, 'seconds': round(elapsed, 3)}
+
+    def while_running(label):
+        with (scratch / f'{label}.log').open('wb') as log:
+            process = subprocess.Popen([sys.executable, '-m', 'hermes_cli.main', 'gateway', 'run'],
+                                       cwd=host, env=env, stdin=subprocess.DEVNULL,
+                                       stdout=log, stderr=subprocess.STDOUT)
+            try:
+                deadline = time.monotonic() + 45
+                while process.poll() is None and time.monotonic() < deadline:
+                    receipt = sample()
+                    if receipt['exit'] == 0:
+                        return receipt
+                    time.sleep(0.25)
+                raise AssertionError(f'Gateway did not become healthy: {label}, exit={process.poll()}')
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=12)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                        raise
+
+    up = while_running('up')
+    stopped = sample()
+    assert stopped['exit'] == 1, stopped
+    restored = while_running('restored')
+    print(json.dumps({'gateway_liveness': {'up': up, 'stopped': stopped, 'restored': restored},
+                      'systemd_timer': 'not run by native host journey'}), flush=True)
 
 
 def journey(host, home):
@@ -46,6 +109,12 @@ def journey(host, home):
     assert command('incidents')['items'] == []
     assert command('plans')['items'] == []
     assert not (store / 'watchdog.db').exists()
+    assert not (home / 'scripts' / 'hermes-urgency-engine-watchdog.py').exists()
+    assert 'hermes-urgency-engine-watchdog' not in run('cron', 'list').stdout
+    assert not list(Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config'))
+                    .glob('systemd/user/urgency-gateway-liveness.*'))
+    with tempfile.TemporaryDirectory(dir=home.parent, prefix='liveness-') as scratch:
+        external_liveness(host, home / 'plugins' / 'hermes-urgency-engine', Path(scratch))
     apply('create_project', dict(project_id='watchdog-demo', title='Synthetic watchdog objective', request_id='watchdog-project'))
     apply('upsert_task', dict(board_id='watchdog-board', task_id='task', project_id='watchdog-demo',
                              goal='Deliver proof', status='running', remaining_seconds=600,
