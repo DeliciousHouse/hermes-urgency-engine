@@ -250,6 +250,149 @@ def child():
                       'mounted_from': expected_source.relative_to(package).as_posix()}))
 
 
+def secondary_child():
+    # protects=profile-scoped REST and command replay; fails_when=the secondary
+    # host reads or writes launch state/config; seam=real gateway + PluginHost;
+    # no_claim=Electron, real boards, installed application, or release.
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from fastapi.testclient import TestClient
+    from agent.secret_scope import is_multiplex_active, set_multiplex_active
+    from gateway.runtime_bootstrap import TicketStore
+    from gateway.session_authorities import SessionAuthorities
+    from hermes_cli import plugins, profiles, web_server as server
+    import tui_gateway.launch_profile_policy as launch_policy
+
+    launch = Path(os.environ['HERMES_HOME']).resolve()
+    beta = launch / 'profiles' / 'beta'
+    beta.mkdir(parents=True)
+    roots = [home / 'plugin-data' / PLUGIN for home in (launch, beta)]
+    for root in roots:
+        root.mkdir(parents=True)
+
+    def config(home, seconds, *, disabled=False):
+        document = {'security': {'redact_secrets': False}, 'plugins': {
+            **PLUGIN_CONFIG, 'isolation': 'host', 'disabled': [PLUGIN] if disabled else [],
+            'entries': {PLUGIN: {'config': {'kanban_sync_seconds': 100},
+                                  'settings': {'kanban_sync_seconds': seconds}}}}}
+        (home / 'config.yaml').write_text(json.dumps(document), encoding='utf-8')
+
+    config(launch, 120)
+    config(beta, 180)
+    authorities = SessionAuthorities(launch, multiplexed=True)
+    for home in (launch, beta):
+        authorities.add(home, SimpleNamespace(profile_id=str(home), instance_id='daemon'))
+    tickets = TicketStore('daemon', authorities.profile_ids())
+    runner = SimpleNamespace(session_authorities=authorities, session_ticket_store=tickets, _draining=False,
+        session_runtime_descriptor={'state': 'ready', 'instance_id': 'daemon',
+                                    'served_profiles': authorities.served_profiles()})
+    routes, modules, multiplexed = list(server.app.router.routes), set(sys.modules), is_multiplex_active()
+    server._dashboard_plugins_cache = None
+
+    async def app(scope, receive, send):
+        scope['hermes.gateway_socket_peer'] = ('127.0.0.1', 50000)
+        await server.app(scope, receive, send)
+
+    def files(root):
+        return {p.name: p.read_bytes() for p in root.iterdir() if p.is_file()}
+
+    url = '/api/plugins/' + PLUGIN
+    owner = {'X-Hermes-Session-Token': server._SESSION_TOKEN}
+    ticket = lambda: {'X-Hermes-Gateway-Ticket': tickets.mint(
+        profile_id=str(beta), subject='desktop', purpose='native-http')}
+    try:
+        with patch.object(server.app.state, 'gateway_runner', runner, create=True), \
+             patch.object(launch_policy, '_snapshot', None), \
+             patch.object(profiles, '_get_default_hermes_home', lambda: launch), \
+             patch.object(profiles, '_get_profiles_root', lambda: launch / 'profiles'), TestClient(app) as client:
+            # Empty reads must not create any durable plugin stores in either home.
+            assert client.get(url + '/portfolio').status_code == 401
+            for make_headers in (lambda: owner, ticket):
+                response = client.get(url + '/portfolio', headers=make_headers())
+                assert response.status_code == 200 and response.json()['data']['items'] == [], response.text
+            assert all(files(root) == {} for root in roots)
+
+            # Each request writes only its own home; identical request IDs are independent.
+            for home, make_headers, project in ((launch, lambda: owner, 'launch-project'), (beta, ticket, 'beta-project')):
+                other = roots[1 if home == launch else 0]
+                unchanged = files(other)
+                payload = {'request_id': 'same-request', 'operation': 'create_project',
+                           'arguments': {'project_id': project, 'title': project}}
+                first = client.post(url + '/commands', json=payload, headers=make_headers())
+                assert first.status_code == 200, first.text
+                replay = client.post(url + '/commands', json=payload, headers=make_headers())
+                assert replay.status_code == 200 and replay.json() == first.json(), replay.text
+                assert files(other) == unchanged
+                rows = client.get(url + '/projects/' + project + '/history', headers=make_headers()).json()['data']['items']
+                assert len(rows) == 1 and rows[0]['action'] == 'create_project', rows
+                conflict = {**payload, 'arguments': {**payload['arguments'], 'title': 'different'}}
+                refused = client.post(url + '/commands', json=conflict, headers=make_headers())
+                assert refused.status_code == 409 and refused.json()['error']['code'] == 'IDEMPOTENCY_CONFLICT', refused.text
+                rows = client.get(url + '/projects/' + project + '/history', headers=make_headers()).json()['data']['items']
+                assert len(rows) == 1 and rows[0]['action'] == 'create_project', rows
+
+            scopes = []
+            for make_headers in (lambda: owner, ticket):
+                identity = client.post(url + '/identity', headers=make_headers())
+                assert identity.status_code == 200, identity.text
+                scopes.append(identity.json()['data']['scope_id'])
+            assert scopes[0] != scopes[1]
+            before = [files(root) for root in roots]
+            cross_scope = {'request_id': 'cross-scope', 'operation': 'create_project', 'scope_id': scopes[0],
+                           'arguments': {'project_id': 'cross-scope', 'title': 'Cross scope'}}
+            denied = client.post(url + '/commands', json=cross_scope, headers=ticket())
+            assert denied.status_code == 403 and denied.json()['error']['field'] == 'scope_id', denied.text
+            assert [files(root) for root in roots] == before
+
+            for make_headers, own, foreign, seconds in ((lambda: owner, 'launch-project', 'beta-project', 120),
+                                                        (ticket, 'beta-project', 'launch-project', 180)):
+                response = client.get(url + '/portfolio', headers=make_headers())
+                assert [item['project_id'] for item in response.json()['data']['items']] == [own], response.text
+                assert client.get(url + '/projects/' + foreign, headers=make_headers()).status_code == 404
+                tasks = client.get(url + '/projects/' + own + '/source-tasks', headers=make_headers())
+                assert tasks.status_code == 200 and tasks.json()['data']['sync_seconds'] == seconds, tasks.text
+                assert client.get(url + '/projects/' + own + '/interventions', headers=make_headers()).status_code == 200
+            selected = client.get(url + '/portfolio?profile=beta', headers=owner)
+            assert [item['project_id'] for item in selected.json()['data']['items']] == ['beta-project'], selected.text
+
+            before = [files(root) for root in roots]
+            secret = {'request_id': 'secret', 'operation': 'create_project',
+                      'arguments': {'project_id': 'secret', 'title': 'password=' + 'synthetic-only'}}
+            refused = client.post(url + '/commands', json=secret, headers=ticket())
+            assert refused.status_code == 400 and refused.json()['error']['field'] == 'secret_text', refused.text
+            assert [files(root) for root in roots] == before
+            config(beta, 'invalid')
+            invalid = client.get(url + '/projects/beta-project/source-tasks', headers=ticket())
+            assert invalid.status_code == 400 and invalid.json()['error']['code'] == 'INVALID_CONFIG', invalid.text
+            assert client.get(url + '/projects/launch-project/source-tasks', headers=owner).status_code == 200
+            assert [files(root) for root in roots] == before
+            config(beta, 180, disabled=True)
+            assert client.get(url + '/portfolio', headers=ticket()).status_code == 404
+            assert client.get(url + '/portfolio?profile=beta', headers=owner).status_code == 404
+            assert client.get(url + '/portfolio', headers=owner).status_code == 200
+            assert [files(root) for root in roots] == before
+            hosts = [getattr(manager, '_plugin_host_instance', None)
+                     for manager in plugins._plugin_managers_by_home.values()]
+            active = {host.home.resolve(): host for host in hosts if host is not None and host.alive}
+            assert {launch, beta} <= set(active), 'both real hosts must run'
+            assert len({active[launch].pid, active[beta].pid, os.getpid()}) == 3, 'hosts must be distinct children'
+            print(json.dumps({'native_secondary': 'passed', 'launch_sync_seconds': 120,
+                              'secondary_sync_seconds': 180, 'replay_audit_rows_per_profile': 1}))
+    finally:
+        for manager in list(plugins._plugin_managers_by_home.values()):
+            host = getattr(manager, '_plugin_host_instance', None)
+            if host is not None:
+                proc = host._proc
+                host.shutdown()
+                assert not host.alive and (proc is None or proc.poll() is not None)
+        server.app.router.routes[:] = routes
+        server._dashboard_plugins_cache = None
+        for name in set(sys.modules) - modules:
+            if name.startswith('hermes_dashboard_plugin_'):
+                del sys.modules[name]
+        set_multiplex_active(multiplexed)
+
+
 def operator_child():
     # protects=operator command safety and reconciliation; fails_when=secrets reach
     # writer, scope changes or replay duplicates audit; seam=native REST plus a
@@ -313,6 +456,7 @@ if __name__ == '__main__':
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--child', action='store_true', help=argparse.SUPPRESS)
     mode.add_argument('--operator-child', action='store_true', help=argparse.SUPPRESS)
+    mode.add_argument('--secondary-child', action='store_true', help=argparse.SUPPRESS)
     mode.add_argument('--installed', action='store_true',
                       help='run from the enabled package in a fresh disposable HERMES_HOME')
     args = parser.parse_args()
@@ -320,6 +464,8 @@ if __name__ == '__main__':
         child()
     elif args.operator_child:
         operator_child()
+    elif args.secondary_child:
+        secondary_child()
     else:
         with tempfile.TemporaryDirectory(prefix='urgency-rest-') as directory:
             if args.installed and not os.environ.get('HERMES_HOME'):
@@ -353,6 +499,20 @@ if __name__ == '__main__':
                 'HERMES_KANBAN_TASK', 'HERMES_KANBAN_DB', 'HERMES_DELEGATED_CHILD_CONTEXT')}
             result = subprocess.run([sys.executable, str(Path(__file__).resolve()), '--operator-child'],
                                     env=operator_env, cwd=home, capture_output=True, text=True, timeout=90)
+            print(result.stdout)
+            if result.returncode:
+                print(result.stderr)
+                raise SystemExit(result.returncode)
+            # A separate disposable launch home keeps the installed fixture untouched.
+            launch = Path(directory) / 'multiplex'
+            launch.mkdir()
+            shutil.copytree(target, launch / 'plugins' / PLUGIN,
+                            ignore=shutil.ignore_patterns('__pycache__', '.git'))
+            secondary_env = {**operator_env, 'HERMES_HOME': str(launch),
+                             'HERMES_KANBAN_HOME': str(launch / 'boards'),
+                             'HERMES_RUNTIME_DIR': str(launch / 'runtime')}
+            result = subprocess.run([sys.executable, str(Path(__file__).resolve()), '--secondary-child'],
+                                    env=secondary_env, cwd=launch, capture_output=True, text=True, timeout=120)
             print(result.stdout)
             if result.returncode:
                 print(result.stderr)
