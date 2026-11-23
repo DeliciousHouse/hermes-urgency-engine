@@ -32,4 +32,12 @@ The second check permits dependency preparation in the validation environment. R
 | Renderer module checks and installed REST probes: component contracts and authenticated backend behavior in the tested host | Native Electron theme, keyboard, resize, reconnection and remote-profile acceptance |
 | No-agent cron and supervised synthetic probes: detected incidents or bounded requested effects | Successful autonomous recovery, exactly-once remote delivery, or production behavior |
 
+`tests/test_dashboard_context.py` checks request-scoped settings precedence, invalid
+values, non-creating reads, and refusal before writes using synthetic host modules.
+`tests/host_desktop.py` additionally runs real in-process REST and separate launch
+and secondary plugin hosts in disposable homes. It checks distinct settings and
+stores, disabled and denied routes, unchanged opposite-profile files, and exact
+command replay with one audit row. This is backend routing evidence, not installed
+Electron profile-switch or reconnect acceptance.
+
 For independent Desktop acceptance, follow the [16-scenario matrix](desktop.md#acceptance-matrix) in a clean installed client. Record the exact plugin and host revisions, commands, exits and observable results, including how a wrong result would show up. Mark any unexecuted check explicitly. A docs review, source check or green CI run is not a catalog approval or a release decision.

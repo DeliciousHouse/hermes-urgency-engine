@@ -172,6 +172,14 @@ once per five seconds); they never bypass the polling cadence or supply data.
 so polling is the floor, not an optimisation. The canonical Kanban sync cadence is
 separate and is displayed on the Source tasks tab.
 
+Backend settings are read for each request using Hermes's read-only configuration
+API in the selected profile. Each key uses `plugins.entries.hermes-urgency-engine.settings`
+first, then the legacy `config` mapping, then the existing default. A present invalid
+value is still validated, not replaced by a fallback. REST reads use existing local
+Sync projections; they do not dispatch Kanban tools or initialize absent stores.
+Management text is checked with Hermes's strong redactor even when the host redaction
+preference is off. Changed text is rejected before opening a writer.
+
 Queries are keyed by connection identity, activation epoch, profile and route. A read
 that returns after the scope changed is discarded, and switching connection or
 profile clears the view rather than re-labelling old rows.
