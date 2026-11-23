@@ -5,6 +5,7 @@ No mutable active-profile state, credentials, paths or board SQL are cached here
 """
 import importlib.util
 import asyncio
+from collections.abc import Mapping
 import io
 from pathlib import Path
 import sys
@@ -143,10 +144,33 @@ def history(project_id: str, request: Request):
     return respond(read)
 
 
+class _RequestServices:
+    def __init__(self):
+        from hermes_cli.config import load_config_readonly
+        self.config = load_config_readonly()
+
+    def get_config(self, key, default=None):
+        entry = self.config
+        for part in ('plugins', 'entries', 'hermes-urgency-engine'):
+            if not isinstance(entry, Mapping):
+                return default
+            entry = entry.get(part)
+        if not isinstance(entry, Mapping):
+            return default
+        for section in ('settings', 'config'):
+            values = entry.get(section)
+            if isinstance(values, Mapping) and key in values:
+                return values[key]
+        return default
+
+    def redact_text(self, text, *, force=False):
+        from agent.redact import redact_sensitive_text
+        return redact_sensitive_text(text, force=True, file_read=True, secret_file=True,
+                                     redact_url_credentials=True)
+
+
 def scoped_runtime():
-    from hermes_cli.plugins import PluginContext, PluginManifest, get_plugin_manager
-    ctx = PluginContext(PluginManifest(name='hermes-urgency-engine'), get_plugin_manager())
-    return _runtime.Runtime(ctx)
+    return _runtime.Runtime(_RequestServices())
 
 
 @router.get('/projects/{project_id}/milestones')
@@ -231,10 +255,8 @@ def execute_command(raw):
     if 'scope_id' in payload and payload['scope_id'] != identity_data()['scope_id']:
         raise _ledger.LedgerError('SOURCE_DENIED', 'desktop', 'scope_id',
                                   next_action='Return to the original scope to reconcile the retained request.')
-    from hermes_cli.plugins import PluginContext, PluginManifest, get_plugin_manager
-    ctx = PluginContext(PluginManifest(name='hermes-urgency-engine'), get_plugin_manager())
-    runtime = _runtime.Runtime(ctx)
-    if any(ctx.redact_text(value, force=True) != value for value in _strings(payload)):
+    runtime = scoped_runtime()
+    if any(runtime.ctx.redact_text(value, force=True) != value for value in _strings(payload)):
         raise _ledger.LedgerError('INVALID_INPUT', 'desktop', 'secret_text')
     with runtime.open(runtime.settings()) as ledger:
         return _desktop.management_command(ledger, payload)
