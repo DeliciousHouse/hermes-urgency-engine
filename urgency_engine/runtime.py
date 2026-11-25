@@ -137,6 +137,7 @@ def setup_parser(parser, *, conversational=False):
         snapshot = source.add_parser('snapshot', help='Read a minimal public-tool task snapshot; configured scope only')
         snapshot.add_argument('--board', required=True)
         snapshot.add_argument('--task', dest='task_id', required=True)
+        snapshot.add_argument('--transport-phases', action='store_true', help=argparse.SUPPRESS)
         for name in ('sync', 'pause', 'resume'):
             sub = source.add_parser(name)
             sub.add_argument('--request-id', required=True)
@@ -682,7 +683,7 @@ class Runtime:
             if connection is not None:
                 connection.close()
 
-    def kanban_snapshot(self, board, task_id):
+    def kanban_snapshot(self, board, task_id, *, transport_phases=False):
         from .kanban import fail, project, _id
         cfg = self.kanban_config()
         bindings = [b for b in cfg['kanban_bindings'] if b['board'] == board]
@@ -690,7 +691,11 @@ class Runtime:
             fail('binding', 'SOURCE_DENIED')
         binding, = bindings
         _id(task_id, 'task_id')
+        if transport_phases:
+            print('@urgency:board', flush=True)
         NativeSource().validate_board(binding)
+        if transport_phases:
+            print('@urgency:detail', flush=True)
         if not callable(getattr(self.ctx, 'dispatch_tool', None)):
             fail('public_tool', 'SOURCE_UNAVAILABLE')
         from tools.registry import discover_builtin_tools
@@ -746,7 +751,7 @@ class Runtime:
         operation = args.kanban_operation
         try:
             if operation == 'snapshot':
-                data = self.kanban_snapshot(args.board, args.task_id)
+                data = self.kanban_snapshot(args.board, args.task_id, transport_phases=args.transport_phases)
             elif operation in ('health', 'tasks'):
                 data = self.kanban_read(operation, arguments_from(args, 'kanban_' + operation))
             else:
@@ -760,7 +765,8 @@ class Runtime:
                             data = sync.control(operation, args.request_id, args.reason)
                         else:
                             with self.open(self.settings()) as ledger, Monitor.host(clock=self.clock) as monitor:
-                                data = sync.scan(cfg, ledger, monitor, self.data_dir() / 'data.db', NativeSource(),
+                                data = sync.scan(cfg, ledger, monitor, self.data_dir() / 'data.db',
+                                                 NativeSource(snapshot_phases=True),
                                                  request_id=args.request_id, reason=args.reason)
             result = {'ok': data.get('state') not in ('partial', 'conflict'), 'data': data}
         except LedgerError as exc:
@@ -871,7 +877,7 @@ class Runtime:
                 sync.put('last_attempt', self.clock().isoformat())
             with self.open(self.settings()) as ledger:
                 try:
-                    sync.scan(cfg, ledger, monitor, self.data_dir() / 'data.db', NativeSource(),
+                    sync.scan(cfg, ledger, monitor, self.data_dir() / 'data.db', NativeSource(snapshot_phases=True),
                               request_id=uuid.uuid4().hex, reason='Existing watchdog tick')
                 except LedgerError as exc:
                     if exc.code not in ('SCOPE_CONFLICT', 'REVISION_CONFLICT') and not exc.code.startswith('SOURCE_'):
