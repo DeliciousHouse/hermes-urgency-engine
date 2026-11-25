@@ -192,7 +192,7 @@ weight and verified weight remain visible and are not rewritten.
 
 ### Dates and evidence
 
-`kind` is `hard` or `soft`. `at` is RFC3339 with seconds and an explicit `Z` or `±HH:MM` offset, optionally 1–6 fractional digits. `timezone` is a valid IANA name. Its offset and wall time must agree with the timestamp at that instant. Spring-forward gaps and naive dates are rejected; a fall-back fold must specify one of the two valid offsets. Storage is normalized to UTC; named display timezone is retained.
+`kind` is `hard` or `soft`. `at` is RFC3339 with seconds and an explicit `Z` or `±HH:MM` offset, optionally 1–6 fractional digits. `timezone` is a valid IANA name. Its offset and wall time must agree with the timestamp at that instant. Spring-forward gaps and naive dates are rejected; a fall-back fold must specify one of the two valid offsets. A refused `at` returns `INVALID_INPUT` with field `at`; its `next_action` restates this rule and, when the value parses and the timezone is valid, gives a corrected example in that timezone. For `America/Los_Angeles`, both `2026-11-26T23:59:00` and `2026-11-27T07:59:00Z` are refused with the example `2026-11-26T23:59:00-08:00`. Storage is normalized to UTC; named display timezone is retained.
 
 `intent` is `operator` or `automatic`. A hard deadline rejects `automatic`; a soft target allows either. **This is an auditable policy distinction, not authentication.** A host adapter must enforce its own authorization before calling these APIs. No tokens or approval gates are implemented here.
 

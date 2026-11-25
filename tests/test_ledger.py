@@ -475,6 +475,36 @@ class LedgerTests(unittest.TestCase):
                 self.assertIn('tzdata', caught.exception.next_action)
             self.assertEqual(ledger.connection.execute('SELECT count(*) FROM deadlines').fetchone()[0], 2)
 
+    def test_invalid_deadline_time_restates_rule_with_zone_example(self):
+        """protects=operator can correct a refused deadline; fails_when=only the generic next_action;
+        why_new=naive and Z inputs refused for a non-UTC zone; seam=synthetic TZif; no_claim=rule loosened.
+        """
+        import re
+        from urgency_engine.ledger import LedgerError, _date
+        cases = {'2030-01-01T00:00:00': '2030-01-01T00:00:00-05:00', '2030-01-01T05:00:00Z': '2030-01-01T00:00:00-05:00',
+                 '2030-07-01T12:00:00-05:00': '2030-07-01T13:00:00-04:00', '2030-03-10T02:30:00': '2030-03-10T03:30:00-04:00',
+                 '2030-01-01T00:00': '2030-01-01T00:00:00-05:00', 'tomorrow': None}
+        for at, example in cases.items():
+            with self.subTest(at=at), self.assertRaises(LedgerError) as caught:
+                _date(at, 'Synthetic')
+            error = caught.exception
+            self.assertEqual((error.code, error.field, error.side_effects), ('INVALID_INPUT', 'at', 'none'))
+            self.assertIn('RFC3339 with seconds and an explicit offset', error.next_action)
+            self.assertIn('equals the offset of the timezone at that wall time', error.next_action)
+            found = re.search(r'for example (\S+) for Synthetic\.$', error.next_action)
+            self.assertEqual(found and found.group(1), example)
+            if example:
+                self.assertTrue(_date(example, 'Synthetic'))
+        with self.assertRaises(LedgerError) as caught:
+            _date('2030-01-01T00:00:00Z', 'No/Such_Zone')
+        self.assertEqual(caught.exception.field, 'timezone')
+        with self.open() as ledger:
+            ledger.create_project('p', 'Project', request_id='p', actor='operator')
+            with self.assertRaises(LedgerError) as caught:
+                ledger.set_deadline('d', project_id='p', kind='hard', at='2030-01-01T05:00:00Z', timezone='Synthetic',
+                    owner='operator', source='Plan', request_id='d', actor='operator')
+        self.assertIn('for example 2030-01-01T00:00:00-05:00 for Synthetic.', caught.exception.next_action)
+
     def test_dot_only_project_and_milestone_ids_are_refused_at_creation(self):
         """protects=Desktop REST routing; fails_when='.' or '..' becomes a path segment;
         why_new=URL dot-segment normalization; seam=Ledger API; no_claim=existing dot IDs repaired.

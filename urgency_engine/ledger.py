@@ -1014,6 +1014,33 @@ def open_hermes_ledger(*, clock, artifact_root, busy_timeout_ms=5000):
 
 
 def _date(value, zone_name):
+    try:
+        return _parse_date(value, zone_name)
+    except LedgerError as exc:
+        if exc.field != 'at':
+            raise
+        raise LedgerError('INVALID_INPUT', 'validate', 'at', next_action=_date_hint(value, zone_name)) from None
+
+
+def _date_hint(value, zone_name):
+    """Restate the rule; add an example only when one can be built from parsed values."""
+    from zoneinfo import ZoneInfo
+    rule = ('Give at as RFC3339 with seconds and an explicit offset (Z or +HH:MM/-HH:MM) that equals '
+            'the offset of the timezone at that wall time')
+    try:
+        zone = ZoneInfo(zone_name)
+        moment = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if moment.tzinfo is None:
+            # A naive value is read as wall time in the zone; a gap time moves to a real instant.
+            moment = moment.replace(tzinfo=zone).astimezone(timezone.utc)
+        example = moment.astimezone(zone).isoformat(timespec='seconds')
+        _parse_date(example, zone_name)
+    except Exception:
+        return rule + '.'
+    return f'{rule}, for example {example} for {zone.key}.'
+
+
+def _parse_date(value, zone_name):
     import re
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
     _text(value, 'at', 64)

@@ -740,6 +740,13 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(before, self.request('history', entity_type='deadline', entity_id='soon'))
         self.assertEqual(self.request('explain', deadline_id='soon')['data']['target_at'], '2030-01-01T00:01:00+00:00')
 
+    def test_refused_deadline_time_reaches_apply_envelope_with_example(self):
+        self.project()
+        result = self.request('set_deadline', deadline_id='d', project_id='p', kind='hard', at='2030-01-01T05:00:00Z',
+                              timezone='Synthetic', owner='operator', source='fixture', request_id='d')
+        self.assertEqual((result['ok'], result['error']['code'], result['error']['field']), (False, 'INVALID_INPUT', 'at'))
+        self.assertIn('for example 2030-01-01T00:00:00-05:00 for Synthetic.', result['error']['next_action'])
+
     def test_failures_remain_safe_and_diagnostics_rotate(self):
         """protects=failure isolation; fails_when=trace/input leaks; seam=failing opener."""
         self.ctx.settings.update(default_project='p', diagnostic_log_bytes=65536)
