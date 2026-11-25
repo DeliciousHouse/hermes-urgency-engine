@@ -529,6 +529,51 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(self.ledger.get_task('demo', 't1')['revision'], 1)
         self.assertEqual(self.sync.db.execute("SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 2)
 
+    def test_stale_intent_after_local_edit_is_cancelled_and_recollected(self):
+        """protects=sync recovers after a local estimate race; fails_when=stale intent fails every scan;
+        why_new=bounded collection window; seam=two real connections; no_claim=distributed transaction.
+        """
+        self.source.rows = [dict(id=f't{i}', tenant='synthetic') for i in range(2)]
+        self.scan()
+        original, raced = self.source.detail, []
+        self.source.title = 'New source'
+        def detail(binding, task_id):
+            if task_id == 't1' and not raced:
+                raced.append(True)
+                with Ledger(sqlite3.connect(self.root / 'data.db'), clock=lambda: self.now, artifact_root=self.root) as local:
+                    local.upsert_task('demo', 't0', project_id='project', goal='Local edit', remaining_seconds=7,
+                        expected_revision=1, request_id='local', reason='Concurrent', actor='test')
+            return original(binding, task_id)
+        self.source.detail = detail
+        with self.assertRaises(LedgerError):
+            self.scan('race')
+        self.assertEqual(self.scan('next')['state'], 'complete')
+        t0 = self.ledger.get_task('demo', 't0')
+        self.assertEqual((t0['goal'], t0['remaining_seconds']), ('New source', 7))
+        self.assertEqual(self.ledger.get_task('demo', 't1')['goal'], 'New source')
+        self.assertEqual(self.sync.db.execute("SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 0)
+
+    def test_task_capacity_refusal_cannot_block_later_cards(self):
+        """protects=one refused card is a bounded skip; fails_when=its pending intent blocks every scan;
+        why_new=deleted cards keep Ledger capacity; seam=real stores with synthetic rows; no_claim=task retirement.
+        """
+        self.source.rows = [dict(id='z', tenant='synthetic')]
+        self.scan()
+        columns = [row[1] for row in self.ledger.connection.execute('PRAGMA table_info(tasks)')]
+        template = list(self.ledger.connection.execute("SELECT * FROM tasks WHERE task_id='z'").fetchone())
+        index = columns.index('task_id')
+        self.ledger.connection.executemany(f'INSERT INTO tasks VALUES({",".join("?" * len(columns))})',
+            [template[:index] + [f'gone{n:04d}'] + template[index + 1:] for n in range(9999)])
+        self.ledger.connection.commit()
+        self.source.rows = [dict(id='a', tenant='synthetic'), dict(id='z', tenant='synthetic')]
+        self.source.title = 'Renamed'
+        with self.assertRaises(LedgerError) as caught:
+            self.scan('full')
+        self.assertEqual(caught.exception.field, 'tasks_capacity')
+        self.assertEqual(self.ledger.get_task('demo', 'z')['goal'], 'Renamed')
+        self.assertEqual(self.scan('after')['state'], 'complete')
+        self.assertEqual(self.sync.db.execute("SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 0)
+
     def test_replay_capacity_refuses_new_writes_without_pruning_old_requests(self):
         """protects=bounded durable replay; fails_when=capacity discards pending identities;
         why_new=protected storage ceiling; seam=real store; no_claim=unlimited operation history.

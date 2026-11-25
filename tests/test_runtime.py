@@ -478,29 +478,37 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(dependencies, ['available', 'available'])
             last_success = self.runtime.kanban_read('health', {})['last_success']
             title = 'Refresh'
-            for _ in range(3):
-                self.now += timedelta(seconds=301)
-                code, err = command('watchdog', 'tick')
-                health = self.runtime.kanban_read('health', {})
-                self.assertTrue(raced)
-                self.assertEqual(health['last_error'], 'REVISION_CONFLICT')
-                self.assertEqual(health['last_success'], last_success)
-                self.assertEqual(health['last_attempt'], self.now.isoformat())
-                self.assertIsNotNone(health['incomplete_scan'])
-                evaluated, detectors, dependencies = monitor_state()
-                self.assertIn('expired_deadline', detectors, err)
-                self.assertEqual(code, 0, err)
-                assert evaluated is not None
-                self.assertEqual(datetime.fromisoformat(evaluated), self.now)
-                self.assertEqual(dependencies, ['unknown', 'unknown'])
-                self.assertEqual([item['coverage'] for item in self.runtime.kanban_read('tasks', dict(project_id='p'))['items']],
-                                 ['unknown', 'unknown'])
+            self.now += timedelta(seconds=301)
+            code, err = command('watchdog', 'tick')
+            health = self.runtime.kanban_read('health', {})
+            self.assertTrue(raced)
+            self.assertEqual(health['last_error'], 'REVISION_CONFLICT')
+            self.assertEqual(health['last_success'], last_success)
+            self.assertEqual(health['last_attempt'], self.now.isoformat())
+            self.assertIsNotNone(health['incomplete_scan'])
+            evaluated, detectors, dependencies = monitor_state()
+            self.assertIn('expired_deadline', detectors, err)
+            self.assertEqual(code, 0, err)
+            assert evaluated is not None
+            self.assertEqual(datetime.fromisoformat(evaluated), self.now)
+            self.assertEqual(dependencies, ['unknown', 'unknown'])
+            self.assertEqual([item['coverage'] for item in self.runtime.kanban_read('tasks', dict(project_id='p'))['items']],
+                             ['unknown', 'unknown'])
+            # The stale intent is cancelled on the next scan and its card is
+            # collected again from the current revision: no permanent wedge.
+            self.now += timedelta(seconds=301)
+            code, err = command('watchdog', 'tick')
+            health = self.runtime.kanban_read('health', {})
+            self.assertEqual(code, 0, err)
+            self.assertIsNone(health['last_error'])
+            self.assertIsNone(health['incomplete_scan'])
+            self.assertEqual(health['last_success'], self.now.isoformat())
             code, err = command('kanban', 'sync', '--request-id', 'explicit', '--reason', 'Fixture')
-            self.assertEqual(code, 1)
-            self.assertEqual(json.loads(err)['error']['code'], 'REVISION_CONFLICT')
+            self.assertEqual(code, 0, err)
         with self.runtime.open(self.runtime.settings()) as ledger:
             self.assertEqual(ledger.get_task('demo', 't0')['remaining_seconds'], 7)
-            self.assertEqual(ledger.get_task('demo', 't1')['goal'], 'Initial')
+            self.assertEqual(ledger.get_task('demo', 't0')['goal'], 'Refresh')
+            self.assertEqual(ledger.get_task('demo', 't1')['goal'], 'Refresh')
 
     def kanban_stores(self, rows, **settings):
         from unittest.mock import patch

@@ -547,18 +547,18 @@ class Sync:
         pending = [(row['request_id'], json.loads(row['result_json'])) for row in pending]
         # A page can retain several intents. Resume in cursor order, not hash
         # order, so the last acknowledgment cannot move the cursor backwards.
+        refused = []
         for identity, plan in sorted(pending, key=lambda item: item[1].get('cursor', [])):
             if plan['binding'] != fingerprint:
-                # Only Ledger can be the first effect. Its durable receipts also
-                # cover a crash between reopen and upsert, before any Monitor call.
-                if not ledger.has_committed_operation(identity + ':reopen', plan['arguments']['request_id'],
-                                                      identity + ':claim'):
-                    with self.transaction():
-                        self.db.execute("UPDATE sync_requests SET state='cancelled' WHERE request_id=? AND state='pending'",
-                                        (identity,))
-                        self.put('cursor', None)
+                self.cancel_unapplied(identity, plan, ledger, cursor=None)
                 fail('binding', 'SCOPE_CONFLICT')
-            self.apply_plan(identity, plan, ledger, monitor)
+            refused += self.apply_or_cancel(identity, plan, ledger, monitor, stale=True)
+        if any(exc.code == 'REVISION_CONFLICT' for exc in refused):
+            # A local write since collection made an intent stale for good. It was
+            # cancelled; collect its card again from the current revision.
+            with self.transaction():
+                self.put('cursor', None)
+        self.raise_refused(exc for exc in refused if exc.code != 'REVISION_CONFLICT')
         cursor = self.meta('cursor')
         processed = 0
         total = 0
@@ -605,8 +605,10 @@ class Sync:
                     for identity, encoded in batch:
                         self.db.execute('INSERT INTO sync_requests VALUES(?,?,?,?)',
                                         (identity, hashlib.sha256(encoded.encode()).hexdigest(), 'pending', encoded))
+                refused = []
                 for identity, encoded in batch:
-                    self.apply_plan(identity, json.loads(encoded), ledger, monitor)
+                    refused += self.apply_or_cancel(identity, json.loads(encoded), ledger, monitor)
+                self.raise_refused(refused)
             plans.clear()
             batch_bytes = 0
 
@@ -806,6 +808,41 @@ class Sync:
                 occurred_at=worker['heartbeat_at'] or worker['started_at'] or occurred,
                 reason='Canonical current worker', data=dict(state=worker['state'])),
                 ledger_path, self.monitor_cfg, source='kanban-sync')
+
+    def cancel_unapplied(self, identity, plan, ledger, **meta):
+        """Cancel a pending intent that has no committed Ledger effect; keep its receipt."""
+        # Only Ledger can be the first effect. Its durable receipts also
+        # cover a crash between reopen and upsert, before any Monitor call.
+        if ledger.has_committed_operation(identity + ':reopen', plan['arguments']['request_id'], identity + ':claim'):
+            return False
+        with self.transaction():
+            self.db.execute("UPDATE sync_requests SET state='cancelled' WHERE request_id=? AND state='pending'",
+                            (identity,))
+            for key, value in meta.items():
+                self.put(key, value)
+        return True
+
+    def apply_or_cancel(self, identity, plan, ledger, monitor, *, stale=False):
+        """Apply one intent. A capacity refusal (or, on replay, a stale revision) that left
+        no Ledger effect cancels only that intent, so it cannot block every later card."""
+        try:
+            self.apply_plan(identity, plan, ledger, monitor)
+        except LedgerError as exc:
+            capacity = exc.field in ('tasks_capacity', 'sources_capacity')
+            if not (capacity or stale and exc.code == 'REVISION_CONFLICT'):
+                raise
+            # The cursor passes a refused card; it is collected again next cycle.
+            if not self.cancel_unapplied(identity, plan, ledger,
+                                         **({'cursor': plan['cursor']} if capacity and 'cursor' in plan else {})):
+                raise
+            return [exc]
+        return []
+
+    @staticmethod
+    def raise_refused(refused):
+        for exc in refused:
+            # Earlier and later cards in the batch were applied; this one was not.
+            raise LedgerError(exc.code, 'kanban', exc.field, side_effects='unknown')
 
     def apply_plan(self, identity, plan, ledger, monitor=None):
         projection = plan['projection']
