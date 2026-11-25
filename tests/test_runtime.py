@@ -678,9 +678,11 @@ class RuntimeTests(unittest.TestCase):
                        script='/home/operator/.hermes/scripts/watchdog.py', no_agent=True, deliver='chat:-100123')
         with Monitor.open(self.root / 'watchdog.db', clock=self.runtime.clock) as monitor, monitor.transaction():
             monitor.put('install', receipt)
-        for surface in ('tool', 'slash'):
-            data = self.runtime.run_request('watchdog_health', {}, surface=surface, session_id='s')['data']
-            self.assertEqual(data['installed'], {'state': 'installed', 'sha256': 'a' * 64})
+        for text in (self.runtime.tool({'operation': 'watchdog_health', 'arguments': {}}),
+                     self.runtime.slash('watchdog health', session_id='s')):
+            self.assertEqual(json.loads(text)['data']['installed'], {'state': 'installed', 'sha256': 'a' * 64})
+            for private in ('operator', 'job-1', 'chat:-100123'):
+                self.assertNotIn(private, text)
         out = io.StringIO()
         with redirect_stdout(out):
             self.assertEqual(self.runtime.cli(setup_parser(Parser()).parse_args(['watchdog', 'health'])), 0)
