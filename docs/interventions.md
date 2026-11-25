@@ -42,6 +42,8 @@ Recovery creation needs more than a unique-looking title or a same-key retry. On
 2. Run `hermes urgency interventions show ACTION_ID`. For an in-flight or unknown action, run `hermes urgency interventions reconcile ACTION_ID`, then inspect the result again. If it remains unknown, compare canonical state before deciding what action is still needed. Do not change the request ID to work around an uncertain write.
 3. Resume only by explicit operator choice: `hermes urgency interventions resume --request-id resume-1 --reason 'Inspection finished'`. Resume does not modify prior actions.
 
+The Hermes emergency stop (`hermes pause`) also refuses every apply and Desktop command with `PAUSED` (operation `host`), checked at admission and again just before the effect. Hermes publishes no pause predicate for plugins, so the plugin looks for the `ESTOP` file that `hermes pause` writes in the profile home and in its fleet root, both resolved with the public `hermes_constants` helpers. Any file there counts, including an empty one. If the home cannot be resolved or a sentinel path cannot be checked, the apply is refused rather than admitted.
+
 On `REVISION_CONFLICT`, reload the task and commitment before deciding whether to submit a fresh request. On `SOURCE_UNAVAILABLE` for stale coverage, check [Kanban health](kanban.md) and refresh the configured scan. On a storage error, preserve `interventions.db` in the plugin data directory; do not remove it to clear pending requests. The store retains at most 10,000 actions and 50,000 events. Source rollback must preserve those records and must not perform compensating native edits or deletions.
 
 ## Change a synthetic task's priority
