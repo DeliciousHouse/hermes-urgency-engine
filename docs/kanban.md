@@ -119,12 +119,12 @@ owned snapshot process gives startup, nested board validation, and public-tool
 detail (including output drain) up to 20 seconds each, plus bounded cleanup.
 This avoids charging two independent CLI startups to one deadline. The 16 MiB
 stdout cap still applies. The collection window gates the next detail launch;
-it does not cancel one already admitted. A watchdog tick adds one overall
-deadline (see [tick timing](watchdog.md)). It caps every child timeout and
-phase. At the deadline no new detail starts, even the first one. A detail cut
-off by the deadline flushes collected work and returns `partial` rather than
-`SOURCE_TIMEOUT`. An inventory cut off by the deadline is still a source error.
-Operator `kanban sync` has no overall deadline. Inventories cap at 10000 tasks, each task
+it does not cancel one already admitted. A watchdog tick adds a shared native
+collection cutoff (see [tick timing](watchdog.md)). It caps child and phase
+waits and prevents new detail reads, even the first one. If the cutoff stops
+detail collection, the scan can flush validated work and return `partial`
+after the cutoff. An inventory timeout is a `SOURCE_TIMEOUT` error.
+Operator `kanban sync` has no shared collection cutoff. Inventories cap at 10000 tasks, each task
 at 1000 parents, and admitted graphs at 50000 edges. A partial traversal revokes
 previous complete graph coverage until the tail is read and every selected
 projection is within the configured freshness interval. A slow multi-page scan
