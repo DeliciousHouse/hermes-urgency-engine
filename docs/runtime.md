@@ -65,6 +65,20 @@ return empty pages; scoped status, task and explain return `NOT_FOUND`.
 `/urgency` uses shell-like quoting, never shell execution. `focus clear` reserves
 `clear`; use `default_project` for a project with that ID.
 
+In a Kanban worker or delegated-child process (the markers listed under
+[operator writes](#operator-writes)), `urgency_query` reads only the project the
+pre-turn hook selects for that session: its focus or `default_project`. `status`,
+`watchdog_incidents` and `watchdog_plans` default to that project. `kanban_tasks`
+requires an explicit `project_id` matching the selection. `task` and `explain`
+must belong to it, and `history` is limited to that project's own entity. A
+project read outside the selection, or with no project selected, is
+`SOURCE_DENIED` (field `project_id`). `diagnose`, `watchdog_health` and
+`kanban_health` do not read session focus and still work when it cannot be loaded.
+Elsewhere the tool reads every project in the profile. In-process cron
+and delegated sessions that share the operator's process are not distinguished.
+This scopes the tool only: the `hermes urgency` read commands stay open to any
+local process, including a worker with a terminal tool.
+
 Success is `{"ok":true,"data":...}`. Failure is `{"ok":false,"error":{...}}` with
 `code`, `operation`, `field`, `retryable`, `side_effects` (`none` or `unknown`) and
 `next_action`. CLI success goes to stdout (exit 0); operation failure goes to
@@ -87,6 +101,11 @@ at most 256 KiB. `--json-file -` reads stdin with the same limit. Duplicate keys
 NaN/infinity, invalid Unicode, unknown fields and non-objects fail. The CLI stamps
 `actor="local-operator"` and, for deadline revisions, `intent="operator"`. Callers
 cannot override actor, intent, surface, profile, database or artifact root.
+Because every write carries operator attribution, `apply` returns `SOURCE_DENIED`
+(field `context`) in a worker context: a process whose environment carries
+`HERMES_KANBAN_TASK`, `HERMES_KANBAN_DB` or `HERMES_DELEGATED_CHILD_CONTEXT`, or a
+truthy `HERMES_CRON_SESSION` (an LLM cron run's terminal). Run it from your own
+shell instead, without `HERMES_KANBAN_DB` exported.
 
 The following fields are required; optional fields are listed separately. See
 [ledger contracts](ledger.md) for field types, length limits, revision rules,
