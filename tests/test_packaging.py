@@ -40,7 +40,7 @@ class PackagingTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn(name, source)
                 self.assertIn(name.strip("'").replace("', '", ' '), readme)
-        for disclosure in ('no-agent Hermes cron job that runs every minute', 'kanban ...', 'no third-party network calls'):
+        for disclosure in ('no-agent Hermes cron job that runs every minute', 'kanban ...', 'no third-party network calls', '`ESTOP`'):
             self.assertIn(disclosure, readme)
 
 if __name__ == '__main__':
