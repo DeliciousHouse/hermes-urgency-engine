@@ -411,8 +411,9 @@ class Monitor:
 
     def prune(self, cfg):
         cutoff = stamp(self.clock() - timedelta(days=cfg['watchdog_retention_days']))
-        self.db.execute('DELETE FROM observations AS o WHERE received_at<? AND ' + CONSUMED, (cutoff,))
-        self.drop_orphan_receipts()
+        # The receipt scan runs only when retention removed something; capacity() always runs it.
+        if self.db.execute('DELETE FROM observations AS o WHERE received_at<? AND ' + CONSUMED, (cutoff,)).rowcount:
+            self.drop_orphan_receipts()
         # Keep one episode high-water mark per fingerprint, not the expired rows.
         self.db.execute('''INSERT INTO monitor_meta(key,value_json)
             SELECT 'episode:' || fingerprint, CAST(MAX(episode) AS TEXT)
