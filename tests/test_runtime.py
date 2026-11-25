@@ -2,6 +2,7 @@
 import argparse
 import io
 import json
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -41,6 +42,12 @@ class Context:
     def redact_text(self, text, force=False):
         assert force
         return text.replace('SYNTHETIC_SECRET', '[REDACTED]')
+
+
+def line_anchored(text, force=False):
+    """Like the host redactor, mask credential assignments only at a line start."""
+    assert force
+    return re.sub(r'(?m)^(password|token)\s*[:=]\s*\S+', r'\1: [REDACTED]', text)
 
 
 class RuntimeTests(unittest.TestCase):
@@ -259,6 +266,45 @@ class RuntimeTests(unittest.TestCase):
             self.ctx.settings['kanban_bindings'] = []
             self.assertNotIn('Canonical task:', self.runtime.pre_llm_call(session_id='session')['context'])
         self.assertEqual({p.name: p.read_bytes() for p in self.root.glob('*.db')}, before)
+
+    def test_guidance_omits_card_titles_and_delimits_data(self):
+        """protects=pre-turn instruction channel; fails_when=a Kanban card title reaches every turn
+        or quoted data escapes its delimiters; seam=real stores and source fixture."""
+        from urgency_engine.kanban import Sync
+        from test_kanban_reconciliation import Source
+        self.project()
+        self.ctx.settings.update(default_project='p', context_max_chars=8000, kanban_sync_enabled=True,
+                                 kanban_bindings=[dict(board='demo', tenant='synthetic', project_id='p')])
+        source = Source()
+        source.title = 'INJECTED card title'
+        with Sync(sqlite3.connect(self.root / 'kanban.db'), clock=lambda: self.now, redact=str) as sync:
+            with self.runtime.open(self.runtime.settings()) as ledger:
+                sync.scan(self.runtime.kanban_config(), ledger, None, self.root / 'data.db',
+                          source, request_id='seed', reason='Fixture')
+                task = ledger.get_task('demo', 'task')
+                # An operator edit afterwards does not make the card title trusted.
+                ledger.upsert_task('demo', 'task', project_id='p', goal=task['goal'], expected_revision=task['revision'],
+                                   request_id='edit', actor='operator', reason='estimate', remaining_seconds=60)
+                ledger.upsert_task('local', 'own', project_id='p', goal='Operator goal', expected_revision=0,
+                                   request_id='own', actor='operator', reason='plan')
+        for bindings in (self.ctx.settings['kanban_bindings'], []):
+            self.ctx.settings['kanban_bindings'] = bindings
+            text = self.runtime.pre_llm_call()['context']
+            self.assertNotIn('INJECTED', text)
+            lines = text.splitlines()
+            begin, end = lines.index('BEGIN URGENCY DATA'), lines.index('END URGENCY DATA')
+            tasks = {(t['board_id'], t['task_id']): t for t in
+                     (json.loads(line.removeprefix('Task: ')) for line in lines if line.startswith('Task: '))}
+            self.assertEqual(tasks['demo', 'task']['goal_omitted'], 'kanban_card_title')
+            self.assertNotIn('goal', tasks['demo', 'task'])
+            self.assertEqual(tasks['local', 'own']['goal'], 'Operator goal')
+            self.assertTrue(all(begin < i < end for i, line in enumerate(lines) if line.startswith(('Objective: ', 'Task: '))))
+        self.ctx.settings['context_max_chars'] = 512
+        short = self.runtime.pre_llm_call()['context']
+        self.assertLessEqual(len(short), 512)
+        self.assertIn('END URGENCY DATA', short.splitlines())
+        self.assertTrue(short.endswith('[Guidance truncated; query status/explain/task for details.]'))
+        self.assertEqual(self.request('task', board_id='demo', task_id='task')['data']['goal'], 'INJECTED card title')
 
     def test_cached_tasks_show_age_and_exclude_removed_bindings_without_writes(self):
         """protects=scoped fresh reads; fails_when=stale/rebound source looks current;
@@ -624,6 +670,24 @@ class RuntimeTests(unittest.TestCase):
         with Monitor.open(self.root / 'watchdog.db', clock=self.runtime.clock) as monitor:
             self.assertEqual(monitor.tick(self.root / 'data.db', DEFAULTS)['notices'], [])
 
+    def test_watchdog_health_keeps_install_receipt_on_local_cli(self):
+        """protects=operator paths and delivery target; fails_when=receipt reaches model surfaces;
+        seam=real monitor store, tool, slash and CLI."""
+        from urgency_engine.watchdog import Monitor
+        receipt = dict(state='installed', job_id='job-1', home='/home/operator/.hermes', sha256='a' * 64,
+                       script='/home/operator/.hermes/scripts/watchdog.py', no_agent=True, deliver='chat:-100123')
+        with Monitor.open(self.root / 'watchdog.db', clock=self.runtime.clock) as monitor, monitor.transaction():
+            monitor.put('install', receipt)
+        for text in (self.runtime.tool({'operation': 'watchdog_health', 'arguments': {}}),
+                     self.runtime.slash('watchdog health', session_id='s')):
+            self.assertEqual(json.loads(text)['data']['installed'], {'state': 'installed', 'sha256': 'a' * 64})
+            for private in ('operator', 'job-1', 'chat:-100123'):
+                self.assertNotIn(private, text)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(self.runtime.cli(setup_parser(Parser()).parse_args(['watchdog', 'health'])), 0)
+        self.assertEqual(json.loads(out.getvalue())['data']['installed'], receipt)
+
     def test_write_replay_and_read_surface_denial(self):
         """protects=local provenance; fails_when=reads write; seam=temp storage."""
         first = self.project()
@@ -689,6 +753,45 @@ class RuntimeTests(unittest.TestCase):
         self.runtime.slash('focus p', session_id='s')
         self.now = datetime(2030, 1, 3, tzinfo=timezone.utc)
         self.assertIsNone(self.runtime.pre_llm_call(session_id='s'))
+
+    def seed_multiline_secret(self):
+        with self.runtime.open(self.runtime.settings()) as ledger:
+            ledger.create_project('p', 'Release', request_id='p', actor='operator')
+            ledger.upsert_task('b', 't', project_id='p', goal='Rotate creds\npassword: correcthorsebattery\nthen redeploy',
+                               expected_revision=0, request_id='task', actor='operator', reason='plan')
+            ledger.set_criteria('b', 't', [dict(criterion_id='c', description='login with\ntoken=abcdefabcdef1234',
+                                weight=1, required=True, expected_sha256=None)], expected_revision=1, reason='scope', request_id='scope', actor='operator')
+
+    def test_hook_redacts_line_anchored_secrets_before_encoding(self):
+        """protects=pre-turn redaction; fails_when=escaped newline hides a secret from the redactor
+        or redaction breaks a data line; seam=line-anchored fake redactor."""
+        self.seed_multiline_secret()
+        self.ctx.redact_text = line_anchored
+        self.ctx.settings.update(default_project='p', context_max_chars=8000)
+        text = self.runtime.pre_llm_call()['context']
+        self.assertNotIn('correcthorsebattery', text)
+        self.assertNotIn('abcdefabcdef1234', text)
+        task = [line for line in text.splitlines() if line.startswith('Task: ')]
+        self.assertEqual(len(task), 1)
+        task = json.loads(task[0].removeprefix('Task: '))
+        self.assertEqual(task['goal'], 'Rotate creds\npassword: [REDACTED]\nthen redeploy')
+        self.assertEqual(task['status'], 'planned')
+        self.assertEqual(task['criteria'][0]['description'], 'login with\ntoken: [REDACTED]')
+
+    def test_history_snapshots_are_objects_redacted_by_leaf(self):
+        """protects=history reconciliation and redaction; fails_when=snapshot stays a serialized string
+        that the redactor cannot read line by line; seam=urgency_query tool and fake redactor."""
+        self.seed_multiline_secret()
+        self.ctx.redact_text = line_anchored
+        text = self.runtime.tool({'operation': 'history', 'arguments': {'entity_type': 'task', 'entity_id': '["b","t"]'}})
+        self.assertNotIn('correcthorsebattery', text)
+        self.assertNotIn('abcdefabcdef1234', text)
+        items = json.loads(text)['data']['items']
+        self.assertEqual([item['action'] for item in items], ['upsert_task', 'set_criteria'])
+        self.assertIsNone(items[0]['before'])
+        self.assertEqual(items[0]['after']['goal'], 'Rotate creds\npassword: [REDACTED]\nthen redeploy')
+        self.assertEqual(items[1]['before']['revision'], 1)
+        self.assertEqual(items[1]['after']['criteria'][0]['description'], 'login with\ntoken: [REDACTED]')
 
     def test_invalid_json_cli_channels_and_help(self):
         """protects=bounded input; fails_when=invalid JSON reaches writes; seam=local file."""
@@ -766,6 +869,31 @@ class RuntimeTests(unittest.TestCase):
         self.ctx.redact_text = lambda *args, **kwargs: None
         self.assertIsNone(self.runtime.pre_llm_call())
 
+    def test_unavailable_redactor_suppresses_context(self):
+        self.project()
+        self.ctx.settings['default_project'] = 'p'
+
+        def unavailable(text, force=False):
+            raise RuntimeError('synthetic redactor unavailable')
+
+        for redactor in (lambda text, force=False: None, unavailable):
+            with self.subTest(redactor=redactor.__name__):
+                self.ctx.redact_text = redactor
+                self.assertIsNone(self.runtime.pre_llm_call())
+
+    def test_single_redaction_failure_suppresses_context(self):
+        self.project()
+        self.ctx.settings['default_project'] = 'p'
+        redact = self.ctx.redact_text
+
+        def unavailable_once(text, force=False):
+            self.ctx.redact_text = redact
+            raise RuntimeError('synthetic transient redactor failure')
+
+        self.ctx.redact_text = unavailable_once
+        self.assertIsNone(self.runtime.pre_llm_call())
+        self.assertIn('Urgency planning guidance', self.runtime.pre_llm_call()['context'])
+
     def test_expired_focus_does_not_fall_back_to_another_project(self):
         """protects=expired selection isolation; fails_when=default leaks; seam=clock."""
         self.project()
@@ -805,6 +933,19 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(self.runtime.pre_llm_call(session_id='s'))
         self.ctx.settings['context_enabled'] = 'false'
         self.assertFalse(self.request('status')['ok'])
+
+    def test_hook_respects_complete_data_line_cutoff(self):
+        self.project()
+        self.ctx.settings['default_project'] = 'p'
+        full = self.runtime.pre_llm_call()['context']
+        prefix = full.split('\nProgress: ', 1)[0]
+        tail = '\nEND URGENCY DATA\n[Guidance truncated; query status/explain/task for details.]'
+        cap = len(prefix + tail)
+        self.assertGreater(len(full), cap)
+        for maximum, expected_prefix in ((cap, prefix), (cap - 1, prefix.rsplit('\n', 1)[0])):
+            with self.subTest(maximum=maximum):
+                self.ctx.settings['context_max_chars'] = maximum
+                self.assertEqual(self.runtime.pre_llm_call()['context'], expected_prefix + tail)
 
     def test_hook_leaves_missing_and_empty_storage_untouched(self):
         self.ctx.settings['default_project'] = 'p'
@@ -963,6 +1104,30 @@ class ProfileGuardTests(unittest.TestCase):
                 runtime.open(runtime.settings())
             self.assertEqual((caught.exception.code, caught.exception.side_effects), ('STORAGE_FAILURE', 'none'))
             self.assertFalse((Path(directory) / 'profiles').exists())
+
+
+class GuidanceTruncationTest(unittest.TestCase):
+    def test_truncation_preserves_complete_json_lines(self):
+        fixture = RuntimeTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        response = fixture.request('create_project', project_id='p', title='A' * 250, request_id='seed')
+        self.assertTrue(response['ok'])
+        fixture.ctx.settings['default_project'] = 'p'
+        for cap in (512, 600):
+            with self.subTest(cap=cap):
+                fixture.ctx.settings['context_max_chars'] = cap
+                text = fixture.runtime.pre_llm_call()['context']
+                self.assertLessEqual(len(text), cap)
+                lines = text.splitlines()
+                self.assertIn('BEGIN URGENCY DATA', lines)
+                self.assertIn('END URGENCY DATA', lines)
+                begin, end = lines.index('BEGIN URGENCY DATA'), lines.index('END URGENCY DATA')
+                self.assertLess(begin, end)
+                for i, line in enumerate(lines):
+                    if line.startswith(('Objective: ', 'Progress: ', 'Task: ')):
+                        self.assertTrue(begin < i < end)
+                        json.loads(line.split(': ', 1)[1])
 
 
 if __name__ == '__main__':
