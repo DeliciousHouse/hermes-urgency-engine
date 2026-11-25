@@ -164,8 +164,10 @@ the host's storage opener and retain its safe journaling policy. Ordinary
 queries run the integrity checks; the hook checks the schema without a full scan.
 
 These bounds trade detail for low latency. They are not a hard OS execution
-budget: filesystem or hardware failures can still delay a call. Redaction runs
-before injection. An unavailable ledger produces a short diagnostic and permits
+budget: filesystem or hardware failures can still delay a call. Every quoted
+string is redacted on its own before JSON encoding, so a credential on its own
+line inside a goal or criterion is still matched; if redaction is unavailable
+the hook returns no context. An unavailable ledger produces a short diagnostic and permits
 other work to continue. Hermes inserts the context into the current user turn;
 this plugin does not rewrite the system prompt. Deterministic tests verify text
 and dispatch, not whether a model follows the advice or delivers better work.

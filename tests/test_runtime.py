@@ -2,6 +2,7 @@
 import argparse
 import io
 import json
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -41,6 +42,12 @@ class Context:
     def redact_text(self, text, force=False):
         assert force
         return text.replace('SYNTHETIC_SECRET', '[REDACTED]')
+
+
+def line_anchored(text, force=False):
+    """Like the host redactor, mask credential assignments only at a line start."""
+    assert force
+    return re.sub(r'(?m)^(password|token)\s*[:=]\s*\S+', r'\1: [REDACTED]', text)
 
 
 class RuntimeTests(unittest.TestCase):
@@ -689,6 +696,30 @@ class RuntimeTests(unittest.TestCase):
         self.runtime.slash('focus p', session_id='s')
         self.now = datetime(2030, 1, 3, tzinfo=timezone.utc)
         self.assertIsNone(self.runtime.pre_llm_call(session_id='s'))
+
+    def seed_multiline_secret(self):
+        with self.runtime.open(self.runtime.settings()) as ledger:
+            ledger.create_project('p', 'Release', request_id='p', actor='operator')
+            ledger.upsert_task('b', 't', project_id='p', goal='Rotate creds\npassword: correcthorsebattery\nthen redeploy',
+                               expected_revision=0, request_id='task', actor='operator', reason='plan')
+            ledger.set_criteria('b', 't', [dict(criterion_id='c', description='login with\ntoken=abcdefabcdef1234',
+                                weight=1, required=True, expected_sha256=None)], expected_revision=1, reason='scope', request_id='scope', actor='operator')
+
+    def test_hook_redacts_line_anchored_secrets_before_encoding(self):
+        """protects=pre-turn redaction; fails_when=escaped newline hides a secret from the redactor
+        or redaction breaks a data line; seam=line-anchored fake redactor."""
+        self.seed_multiline_secret()
+        self.ctx.redact_text = line_anchored
+        self.ctx.settings.update(default_project='p', context_max_chars=8000)
+        text = self.runtime.pre_llm_call()['context']
+        self.assertNotIn('correcthorsebattery', text)
+        self.assertNotIn('abcdefabcdef1234', text)
+        task = [line for line in text.splitlines() if line.startswith('Task: ')]
+        self.assertEqual(len(task), 1)
+        task = json.loads(task[0].removeprefix('Task: '))
+        self.assertEqual(task['goal'], 'Rotate creds\npassword: [REDACTED]\nthen redeploy')
+        self.assertEqual(task['status'], 'planned')
+        self.assertEqual(task['criteria'][0]['description'], 'login with\ntoken: [REDACTED]')
 
     def test_invalid_json_cli_channels_and_help(self):
         """protects=bounded input; fails_when=invalid JSON reaches writes; seam=local file."""
