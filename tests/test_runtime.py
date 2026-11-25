@@ -502,6 +502,56 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(ledger.get_task('demo', 't0')['remaining_seconds'], 7)
             self.assertEqual(ledger.get_task('demo', 't1')['goal'], 'Initial')
 
+    def kanban_stores(self, rows, **settings):
+        from unittest.mock import patch
+        from urgency_engine.kanban import Sync, NativeSource
+        from urgency_engine.watchdog import Monitor
+        self.project()
+        self.ctx.settings.update(watchdog_enabled=True, kanban_sync_enabled=True,
+            kanban_bindings=[dict(board='demo', tenant='synthetic', project_id='p')], **settings)
+        for target, value in ((Sync, lambda **kw: Sync(sqlite3.connect(self.root / 'kanban.db'), **kw)),
+                              (Monitor, lambda **kw: Monitor.open(self.root / 'watchdog.db', **kw))):
+            self.enterContext(patch.object(target, 'host', side_effect=value))
+        self.enterContext(patch.object(NativeSource, 'inventory', return_value=rows))
+        self.enterContext(patch.object(NativeSource, 'detail', side_effect=lambda binding, task_id: dict(
+            task=dict(id=task_id, tenant='synthetic', title='Work', status='ready'), parents=[])))
+        parser = setup_parser(Parser())
+        def command(*args):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                return self.runtime.cli(parser.parse_args(args))
+        return command
+
+    def test_kanban_sync_admits_monitor_facts_under_the_configured_row_cap(self):
+        """protects=operator watchdog limits; fails_when=sync falls back to default monitor settings;
+        why_new=sync is a second Monitor writer; seam=real stores, synthetic source; no_claim=disk quota.
+        """
+        from urgency_engine.watchdog import Monitor
+        command = self.kanban_stores([dict(id=f't{n:02d}', tenant='synthetic') for n in range(30)],
+                                     watchdog_max_rows=100)
+        self.assertEqual(command('kanban', 'sync', '--request-id', 'capped', '--reason', 'Fixture'), 0)
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now, readonly=True) as monitor:
+            self.assertLessEqual(monitor.rows(), 100)
+            self.assertEqual(monitor.db.execute('SELECT count(*) FROM task_signals').fetchone()[0], 30)
+
+    def test_capacity_refusals_during_due_sync_do_not_skip_the_tick(self):
+        """protects=deadline evaluation; fails_when=a source capacity refusal aborts the watchdog tick;
+        why_new=lifetime capacity caps; seam=real monitor store; no_claim=source coverage.
+        """
+        from datetime import timedelta
+        from unittest.mock import patch
+        from urgency_engine.kanban import Sync
+        from urgency_engine.ledger import LedgerError
+        from urgency_engine.watchdog import Monitor
+        command = self.kanban_stores([])
+        for error in (LedgerError('CAPACITY_EXCEEDED', 'watchdog', 'watchdog_max_rows'),
+                      LedgerError('INVALID_INPUT', 'validate', 'tasks_capacity')):
+            with self.subTest(code=error.code):
+                self.now += timedelta(seconds=301)
+                with patch.object(Sync, 'scan', side_effect=error):
+                    self.assertEqual(command('watchdog', 'tick'), 0)
+                with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now, readonly=True) as monitor:
+                    self.assertEqual(monitor.meta('last_success'), self.now.isoformat())
+
     def test_empty_bindings_revoke_on_cli_and_due_tick(self):
         """protects=last binding withdrawal; fails_when=runtime bypasses reconciliation;
         why_new=empty config at native entrypoints; seam=real stores; no_claim=live watcher.

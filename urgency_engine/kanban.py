@@ -275,8 +275,9 @@ SCHEMA = (
 
 
 class Sync:
-    def __init__(self, connection, *, clock, redact, readonly=False):
-        self.db, self.clock, self.redact = connection, clock, redact
+    def __init__(self, connection, *, clock, redact, readonly=False, monitor_cfg=None):
+        # monitor_cfg: the operator's watchdog settings for every Monitor admission.
+        self.db, self.clock, self.redact, self.monitor_cfg = connection, clock, redact, monitor_cfg
         connection.row_factory = sqlite3.Row
         connection.execute('PRAGMA busy_timeout=100')
         try:
@@ -296,9 +297,10 @@ class Sync:
             raise
 
     @classmethod
-    def host(cls, *, clock, redact):
+    def host(cls, *, clock, redact, monitor_cfg=None):
         from plugins.plugin_storage import plugin_db
-        return cls(plugin_db('hermes-urgency-engine', 'kanban.db'), clock=clock, redact=redact)
+        return cls(plugin_db('hermes-urgency-engine', 'kanban.db'), clock=clock, redact=redact,
+                   monitor_cfg=monitor_cfg)
 
     def __enter__(self):
         return self
@@ -766,7 +768,7 @@ class Sync:
                     reason='Mapped canonical dependency coverage', data=desired)
                 with self.transaction():
                     self.put(pending_key, event)
-            monitor.observe(event, Path(ledger_path), source='kanban-sync')
+            monitor.observe(event, Path(ledger_path), self.monitor_cfg, source='kanban-sync')
             with self.transaction():
                 self.put(cache_key, dict(data=event['data'], request_id=event['request_id'],
                                          occurred_at=event['occurred_at']))
@@ -797,13 +799,13 @@ class Sync:
             data=dict(claim_at=worker['started_at'] if active else None,
                       heartbeat_at=worker['heartbeat_at'] if active else None,
                       agent_available=True if active else None)),
-            ledger_path, source='kanban-sync')
+            ledger_path, self.monitor_cfg, source='kanban-sync')
         if worker['run_id'] and worker['state'] in ('running', 'failed', 'exhausted', 'unavailable'):
             monitor.observe(dict(request_id=identity + ':worker', project_id=projection['project_id'],
                 board_id=projection['board_id'], task_id=projection['task_id'], kind='worker_outcome',
                 occurred_at=worker['heartbeat_at'] or worker['started_at'] or occurred,
                 reason='Canonical current worker', data=dict(state=worker['state'])),
-                ledger_path, source='kanban-sync')
+                ledger_path, self.monitor_cfg, source='kanban-sync')
 
     def apply_plan(self, identity, plan, ledger, monitor=None):
         projection = plan['projection']
