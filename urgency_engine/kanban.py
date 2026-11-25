@@ -349,8 +349,9 @@ SCHEMA = (
 
 
 class Sync:
-    def __init__(self, connection, *, clock, redact, readonly=False):
-        self.db, self.clock, self.redact = connection, clock, redact
+    def __init__(self, connection, *, clock, redact, readonly=False, monitor_cfg=None):
+        # monitor_cfg: the operator's watchdog settings for every Monitor admission.
+        self.db, self.clock, self.redact, self.monitor_cfg = connection, clock, redact, monitor_cfg
         connection.row_factory = sqlite3.Row
         connection.execute('PRAGMA busy_timeout=100')
         try:
@@ -370,9 +371,10 @@ class Sync:
             raise
 
     @classmethod
-    def host(cls, *, clock, redact):
+    def host(cls, *, clock, redact, monitor_cfg=None):
         from plugins.plugin_storage import plugin_db
-        return cls(plugin_db('hermes-urgency-engine', 'kanban.db'), clock=clock, redact=redact)
+        return cls(plugin_db('hermes-urgency-engine', 'kanban.db'), clock=clock, redact=redact,
+                   monitor_cfg=monitor_cfg)
 
     def __enter__(self):
         return self
@@ -387,7 +389,14 @@ class Sync:
             yield
             if write:
                 if self.db.execute('SELECT count(*) FROM sync_requests').fetchone()[0] > 50000:
-                    fail('requests_capacity', 'SOURCE_LIMIT')
+                    # Finished receipts are bounded replay history: keep the newest 10000.
+                    # Pending intents, control receipts and the current scan are never dropped.
+                    self.db.execute("DELETE FROM sync_requests WHERE rowid IN (SELECT rowid FROM sync_requests "
+                                    "WHERE state IN ('scan_complete','scan_pending','applied','cancelled','monitor_refused') "
+                                    "AND request_id IS NOT ? ORDER BY rowid DESC LIMIT -1 OFFSET 10000)",
+                                    (self.meta('incomplete_scan'),))
+                    if self.db.execute('SELECT count(*) FROM sync_requests').fetchone()[0] > 50000:
+                        fail('requests_capacity', 'SOURCE_LIMIT')
                 self.db.execute('DELETE FROM sync_events WHERE occurred_at < ?',
                                 ((self.clock() - timedelta(days=30)).isoformat(),))
                 self.db.execute('DELETE FROM sync_events WHERE sequence IN '
@@ -581,7 +590,6 @@ class Sync:
                 # Clear only pre-scan hints. Hints arriving during I/O survive.
                 self.put('dirty_bindings', [])
             try:
-                self.withdraw_graph(cfg, monitor, ledger_path)
                 result = self._scan(cfg, ledger, monitor, ledger_path, source,
                                     request_id=request_id, reason=reason)
             except Exception as exc:
@@ -594,7 +602,10 @@ class Sync:
                         projection['coverage'] = 'unknown'
                         self.db.execute('UPDATE sources SET coverage=?,projection_json=? WHERE board_id=? AND task_id=?',
                                         ('unknown', _json(projection), row['board_id'], row['task_id']))
-                if code in ('SCOPE_CONFLICT', 'REVISION_CONFLICT') or (code.startswith('SOURCE_') and code != 'SOURCE_ERROR'):
+                if isinstance(exc, LedgerError) and (
+                        code in ('SCOPE_CONFLICT', 'REVISION_CONFLICT')
+                        or (code.startswith('SOURCE_') and code != 'SOURCE_ERROR')
+                        or (code == 'INVALID_INPUT' and exc.field == 'tasks_capacity')):
                     self.admit_graph(cfg, monitor, set(), ledger_path)
                 raise
             with self.transaction():
@@ -610,7 +621,9 @@ class Sync:
         _id(request_id, 'request_id')
         _text(reason, 'reason', 1024)
         cfg = settings(cfg)
+        monitor_refusals = self.withdraw_graph(cfg, monitor, ledger_path)
         if not cfg['kanban_sync_enabled'] or not cfg['kanban_bindings']:
+            self.raise_refused(monitor_refusals)
             return dict(state='disabled', count=0)
         now = self.clock().isoformat()
         count = 0
@@ -619,18 +632,20 @@ class Sync:
         pending = [(row['request_id'], json.loads(row['result_json'])) for row in pending]
         # A page can retain several intents. Resume in cursor order, not hash
         # order, so the last acknowledgment cannot move the cursor backwards.
+        refused = []
         for identity, plan in sorted(pending, key=lambda item: item[1].get('cursor', [])):
             if plan['binding'] != fingerprint:
-                # Only Ledger can be the first effect. Its durable receipts also
-                # cover a crash between reopen and upsert, before any Monitor call.
-                if not ledger.has_committed_operation(identity + ':reopen', plan['arguments']['request_id'],
-                                                      identity + ':claim'):
-                    with self.transaction():
-                        self.db.execute("UPDATE sync_requests SET state='cancelled' WHERE request_id=? AND state='pending'",
-                                        (identity,))
-                        self.put('cursor', None)
+                self.cancel_unapplied(identity, plan, ledger, cursor=None)
                 fail('binding', 'SCOPE_CONFLICT')
-            self.apply_plan(identity, plan, ledger, monitor)
+            refused += self.apply_or_cancel(identity, plan, ledger, monitor, stale=True)
+        if any(exc.code == 'REVISION_CONFLICT' for exc in refused):
+            # A local write since collection made an intent stale for good. It was
+            # cancelled; collect its card again from the current revision.
+            with self.transaction():
+                self.put('cursor', None)
+        self.raise_refused(exc for exc in refused if exc.code != 'REVISION_CONFLICT'
+                           and not self.monitor_at_capacity(exc))
+        monitor_refusals.extend(exc for exc in refused if self.monitor_at_capacity(exc))
         cursor = self.meta('cursor')
         processed = 0
         total = 0
@@ -655,8 +670,8 @@ class Sync:
                     fail('duplicate_task')
                 seen.add(key)
             inventories.append((binding, rows))
-        retained = {(r['board_id'], r['task_id']): (r['tenant'], r['project_id'])
-                    for r in self.db.execute('SELECT board_id,task_id,tenant,project_id FROM sources')}
+        retained = {(r['board_id'], r['task_id']): (r['tenant'], r['project_id'], r['applied_digest'])
+                    for r in self.db.execute('SELECT board_id,task_id,tenant,project_id,applied_digest FROM sources')}
         for key in retained:
             if key not in seen:
                 self.mark_unknown(key, 'SOURCE_ABSENT')
@@ -664,6 +679,7 @@ class Sync:
         batch_bytes = 0
         detail_deadline = monotonic() + 20
         prefix_covered = True
+        refused_prefix = False
 
         def apply_collected():
             nonlocal batch_bytes
@@ -677,8 +693,11 @@ class Sync:
                     for identity, encoded in batch:
                         self.db.execute('INSERT INTO sync_requests VALUES(?,?,?,?)',
                                         (identity, hashlib.sha256(encoded.encode()).hexdigest(), 'pending', encoded))
+                refused = []
                 for identity, encoded in batch:
-                    self.apply_plan(identity, json.loads(encoded), ledger, monitor)
+                    refused += self.apply_or_cancel(identity, json.loads(encoded), ledger, monitor)
+                self.raise_refused(exc for exc in refused if not self.monitor_at_capacity(exc))
+                monitor_refusals.extend(exc for exc in refused if self.monitor_at_capacity(exc))
             plans.clear()
             batch_bytes = 0
 
@@ -689,7 +708,9 @@ class Sync:
                 if cursor and position <= cursor:
                     # A fresh inventory can insert a task behind a resumed cursor.
                     # Traversing the remaining tail does not prove we saw that task.
-                    prefix_covered &= retained.get((binding['board'], task_id)) == (binding['tenant'], binding['project_id'])
+                    prior = retained.get((binding['board'], task_id))
+                    prefix_covered &= prior is not None and prior[:2] == (binding['tenant'], binding['project_id'])
+                    refused_prefix |= prior is not None and prior[2] is None
                     continue
                 key = binding['board'], task_id
                 try:
@@ -700,7 +721,8 @@ class Sync:
                     task = None
                 if processed and monotonic() >= detail_deadline:
                     apply_collected()
-                    self.admit_graph(cfg, monitor, set(), ledger_path)
+                    monitor_refusals.extend(self.admit_graph(cfg, monitor, set(), ledger_path))
+                    self.raise_refused(monitor_refusals)
                     return dict(state='partial', count=count, cursor=self.meta('cursor'))
                 try:
                     document = source.detail(binding, task_id)
@@ -722,7 +744,7 @@ class Sync:
                     if datetime.fromisoformat(projection['source_updated_at']) < datetime.fromisoformat(existing['source_updated_at']):
                         self.mark_unknown(key, 'SOURCE_STALE')
                         fail('source_updated_at', 'SOURCE_STALE')
-                if existing and existing['source_digest'] == projection['source_digest']:
+                if existing and existing['source_digest'] == existing['applied_digest'] == projection['source_digest']:
                     # Do not advance past earlier, still volatile changed tasks.
                     apply_collected()
                     with self.transaction():
@@ -735,10 +757,10 @@ class Sync:
                 if task and task['status'] == 'verified' and projection['status'] not in ('done', 'archived') and not existing:
                     fail('status', 'STATE_CONFLICT')
                 identity = hashlib.sha256(_json([request_id, key, projection['source_digest']]).encode()).hexdigest()
-                if self.db.execute("SELECT 1 FROM sync_requests WHERE request_id=? AND state='cancelled'",
+                if self.db.execute("SELECT 1 FROM sync_requests WHERE request_id=? AND state IN ('cancelled','monitor_refused')",
                                    (identity,)).fetchone():
-                    # Restoring a binding and retrying its old scan must not
-                    # resurrect the cancelled intent or discard its receipt.
+                    # Fresh collection must not overwrite the old receipt or
+                    # reuse an identity that may already have a Monitor effect.
                     identity = hashlib.sha256(_json([identity, uuid.uuid4().hex]).encode()).hexdigest()
                 arguments = dict(board_id=key[0], task_id=key[1], project_id=binding['project_id'], goal=projection['title'],
                     assignee=projection['assignee'], status='running' if projection['status'] == 'running' else
@@ -753,6 +775,10 @@ class Sync:
                               and projection['status'] not in ('done', 'archived') and task)
                 plan = dict(binding=fingerprint, projection=projection, arguments=arguments,
                             reopen=reopen, cursor=position)
+                if task and existing and (existing['title'], existing['assignee'], existing['source_status']) == (
+                        projection['title'], projection['assignee'], projection['status']):
+                    # Worker liveness, parents or priority only: Monitor facts, no Ledger rewrite.
+                    plan['facts_only'] = True
                 if reopen:
                     plan['reopen_revision'] = arguments['expected_revision']
                     arguments['expected_revision'] += 1
@@ -764,15 +790,19 @@ class Sync:
                 batch_bytes += len(encoded)
                 count += 1
         apply_collected()
-        self.admit_graph(cfg, monitor, seen, ledger_path)
+        if refused_prefix:
+            monitor_refusals.append(LedgerError('CAPACITY_EXCEEDED', 'kanban', 'watchdog_max_rows'))
+        monitor_refusals.extend(self.admit_graph(cfg, monitor, seen if not monitor_refusals else set(), ledger_path))
         with self.transaction():
             self.put('cursor', None)
-            self.put('desktop_complete_scope', hashlib.sha256(_json(cfg).encode()).hexdigest() if prefix_covered else None)
+            self.put('desktop_complete_scope', hashlib.sha256(_json(cfg).encode()).hexdigest()
+                     if prefix_covered and not monitor_refusals else None)
+        self.raise_refused(monitor_refusals)
         return dict(state='complete', count=count)
 
     def admit_graph(self, cfg, monitor, inventory, ledger_path):
         if monitor is None:
-            return
+            return []
         bindings = {(b['board'], b['tenant'], b['project_id']) for b in cfg['kanban_bindings']}
         rows = [json.loads(row[0]) for row in self.db.execute('SELECT projection_json FROM sources')]
         scoped = {(p['board_id'], p['task_id']): p for p in rows
@@ -785,6 +815,7 @@ class Sync:
         if sum(len(p['parents']) for p in mapped.values()) > 50000:
             fail('edges', 'SOURCE_LIMIT')
         complete = len(mapped) == len(inventory)
+        refused = []
         for projection in sorted(rows, key=lambda p: (p['board_id'], p['task_id'])):
             key = projection['board_id'], projection['task_id']
             parents = [(key[0], parent) for parent in projection['parents']]
@@ -793,11 +824,13 @@ class Sync:
             data: dict = dict(dependency_state='available' if known else 'unknown')
             if known:
                 data['dependencies'] = [list(parent) for parent in parents]
-            self.admit_graph_event(projection, data, monitor, ledger_path)
+            refused += self.admit_graph_event(projection, data, monitor, ledger_path)
+        return refused
 
     def withdraw_graph(self, cfg, monitor, ledger_path):
         bindings = {(b['board'], b['tenant'], b['project_id']) for b in cfg['kanban_bindings']}
         rows = [json.loads(row[0]) for row in self.db.execute('SELECT projection_json FROM sources')]
+        refused = []
         for projection in rows:
             key = projection['board_id'], projection['task_id']
             desired = self.meta('graph:' + _json(list(key)) + ':desired') if monitor is not None else None
@@ -805,8 +838,9 @@ class Sync:
             if withdrawn:
                 self.mark_unknown(key, 'SOURCE_WITHDRAWN')
             if monitor is not None and (withdrawn or desired is not None):
-                self.admit_graph_event(projection, dict(dependency_state='unknown') if withdrawn else desired,
-                                       monitor, ledger_path)
+                refused += self.admit_graph_event(projection, dict(dependency_state='unknown') if withdrawn else desired,
+                                                  monitor, ledger_path)
+        return refused
 
     def admit_graph_event(self, projection, data, monitor, ledger_path):
         key = projection['board_id'], projection['task_id']
@@ -818,19 +852,19 @@ class Sync:
         desired = self.meta(desired_key)
         saved = self.meta(cache_key)
         if desired is None and self.meta(pending_key) is None and saved and saved['data'] == data:
-            return
+            return []
         if desired is None or (data['dependency_state'] == 'unknown' and desired != data):
             desired = data
             with self.transaction():
                 self.put(desired_key, desired)
         while True:
             saved = self.meta(cache_key)
-            event = self.meta(pending_key)
+            event: dict | None = self.meta(pending_key)
             if event is None and saved and saved['data'] == desired:
                 with self.transaction():
                     self.put(desired_key, None)
                 if desired == data:
-                    return
+                    return []
                 desired = data
                 with self.transaction():
                     self.put(desired_key, desired)
@@ -845,7 +879,17 @@ class Sync:
                     reason='Mapped canonical dependency coverage', data=desired)
                 with self.transaction():
                     self.put(pending_key, event)
-            monitor.observe(event, Path(ledger_path), source='kanban-sync')
+            try:
+                monitor.observe(event, Path(ledger_path), self.monitor_cfg, source='kanban-sync')
+            except LedgerError as exc:
+                if not self.monitor_at_capacity(exc):
+                    raise
+                # This admission rolled back. Recollect known coverage from a
+                # fresh scan and retry withdrawal with a fresh timestamp.
+                with self.transaction():
+                    self.put(pending_key, None)
+                    self.put(desired_key, dict(dependency_state='unknown'))
+                return [exc]
             with self.transaction():
                 self.put(cache_key, dict(data=event['data'], request_id=event['request_id'],
                                          occurred_at=event['occurred_at']))
@@ -876,13 +920,51 @@ class Sync:
             data=dict(claim_at=worker['started_at'] if active else None,
                       heartbeat_at=worker['heartbeat_at'] if active else None,
                       agent_available=True if active else None)),
-            ledger_path, source='kanban-sync')
+            ledger_path, self.monitor_cfg, source='kanban-sync')
         if worker['run_id'] and worker['state'] in ('running', 'failed', 'exhausted', 'unavailable'):
             monitor.observe(dict(request_id=identity + ':worker', project_id=projection['project_id'],
                 board_id=projection['board_id'], task_id=projection['task_id'], kind='worker_outcome',
                 occurred_at=worker['heartbeat_at'] or worker['started_at'] or occurred,
                 reason='Canonical current worker', data=dict(state=worker['state'])),
-                ledger_path, source='kanban-sync')
+                ledger_path, self.monitor_cfg, source='kanban-sync')
+
+    def cancel_unapplied(self, identity, plan, ledger, **meta):
+        """Cancel a pending intent that has no committed Ledger effect; keep its receipt."""
+        # Only Ledger can be the first effect. Its durable receipts also
+        # cover a crash between reopen and upsert, before any Monitor call.
+        if ledger.has_committed_operation(identity + ':reopen', plan['arguments']['request_id'], identity + ':claim'):
+            return False
+        with self.transaction():
+            self.db.execute("UPDATE sync_requests SET state='cancelled' WHERE request_id=? AND state='pending'",
+                            (identity,))
+            for key, value in meta.items():
+                self.put(key, value)
+        return True
+
+    def apply_or_cancel(self, identity, plan, ledger, monitor, *, stale=False):
+        """Apply one intent. A capacity refusal (or, on replay, a stale revision) that left
+        no Ledger effect cancels only that intent, so it cannot block every later card."""
+        try:
+            return self.apply_plan(identity, plan, ledger, monitor)
+        except LedgerError as exc:
+            capacity = exc.field in ('tasks_capacity', 'sources_capacity')
+            if not (capacity or stale and exc.code == 'REVISION_CONFLICT'):
+                raise
+            # The cursor passes a refused card; it is collected again next cycle.
+            if not self.cancel_unapplied(identity, plan, ledger,
+                                         **({'cursor': plan['cursor']} if capacity and 'cursor' in plan else {})):
+                raise
+            return [exc]
+
+    @staticmethod
+    def monitor_at_capacity(exc):
+        return (exc.code, exc.field) == ('CAPACITY_EXCEEDED', 'watchdog_max_rows')
+
+    @staticmethod
+    def raise_refused(refused):
+        for exc in refused:
+            # Some effects may already be committed even though sync is incomplete.
+            raise LedgerError(exc.code, 'kanban', exc.field, side_effects='unknown')
 
     def apply_plan(self, identity, plan, ledger, monitor=None):
         projection = plan['projection']
@@ -891,26 +973,37 @@ class Sync:
         if (not existing
                 and self.db.execute('SELECT count(*) FROM sources').fetchone()[0] >= 20000):
             fail('sources_capacity', 'SOURCE_LIMIT')
-        if plan.get('reopen'):
-            ledger.reopen_task(*key, expected_revision=plan['reopen_revision'],
-                request_id=identity + ':reopen', reason='Canonical task reopened', actor='kanban-sync')
-        task = ledger.upsert_task(**plan['arguments'])
-        if projection['status'] == 'done':
-            ledger.claim_complete(*key, expected_revision=task['revision'],
-                request_id=identity + ':claim', reason='Canonical completion claim', actor='kanban-sync')
-        self.admit_facts(ledger, monitor, projection, identity)
-        # Keep the intent pending through both stores. Publish the projection,
-        # acknowledgment and cursor together only after their replay-safe calls.
+        if not plan.get('facts_only'):
+            if plan.get('reopen'):
+                ledger.reopen_task(*key, expected_revision=plan['reopen_revision'],
+                    request_id=identity + ':reopen', reason='Canonical task reopened', actor='kanban-sync')
+            task = ledger.upsert_task(**plan['arguments'])
+            if projection['status'] == 'done':
+                ledger.claim_complete(*key, expected_revision=task['revision'],
+                    request_id=identity + ':claim', reason='Canonical completion claim', actor='kanban-sync')
+        refused = []
+        try:
+            self.admit_facts(ledger, monitor, projection, identity)
+        except LedgerError as exc:
+            if not self.monitor_at_capacity(exc):
+                raise
+            refused.append(exc)
+            projection = dict(projection, coverage='unknown')
+        # Publish the projection, receipt and cursor together. An explicit quota
+        # refusal keeps the Ledger effect but requires fresh Monitor collection.
         # The indexed revision is a high-water mark; the public projection stays nullable.
         with self.transaction():
             self.db.execute('INSERT OR REPLACE INTO sources VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 (*key, projection['project_id'], projection['tenant'],
                  projection['source_updated_at'] or (existing['source_updated_at'] if existing else None),
                  projection['source_digest'], projection['status'], projection['assignee'],
-                 projection['title'], projection['observed_at'], projection['coverage'], _json(projection), projection['source_digest']))
+                 projection['title'], projection['observed_at'], projection['coverage'], _json(projection),
+                 None if refused else projection['source_digest']))
             self.put('ledger_path', str(ledger.connection.execute('PRAGMA database_list').fetchone()[2]))
-            self.db.execute("UPDATE sync_requests SET state='applied' WHERE request_id=?", (identity,))
+            self.db.execute('UPDATE sync_requests SET state=? WHERE request_id=?',
+                            ('monitor_refused' if refused else 'applied', identity))
             if 'cursor' in plan:
                 self.put('cursor', plan['cursor'])
+        return refused
 
 
