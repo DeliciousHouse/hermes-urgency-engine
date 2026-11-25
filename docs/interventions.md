@@ -4,7 +4,7 @@ Use the local Hermes CLI to act on an active watchdog plan. The watchdog still o
 
 ## Command and request reference
 
-Set `plugins.entries.hermes-urgency-engine.settings.intervention_mode` in Hermes settings. The default, `advisory`, refuses writes through this surface. `supervised` enables explicit local CLI requests; `autonomous` is recognized but does not authorize any write. Worker/delegated contexts cannot apply or control interventions. Set up an exact board, tenant and project [Kanban binding](kanban.md) and enable the [watchdog](watchdog.md) before applying an action.
+Set `plugins.entries.hermes-urgency-engine.settings.intervention_mode` in Hermes settings. The default, `advisory`, refuses writes through this surface. `supervised` enables explicit local CLI requests; `autonomous` is recognized but does not authorize any write. Worker, delegated and LLM cron contexts (see [operator writes](runtime.md#operator-writes)) cannot apply or control interventions. Set up an exact board, tenant and project [Kanban binding](kanban.md) and enable the [watchdog](watchdog.md) before applying an action.
 
 | `hermes urgency interventions …` | Result |
 | --- | --- |
