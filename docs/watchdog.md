@@ -102,24 +102,27 @@ passes the tick a wall-clock sync deadline 40 seconds before its own timeout
 (`URGENCY_ENGINE_TICK_DEADLINE`). The tick's Kanban sync uses at most 100
 seconds and never runs past that deadline. Every native child is cut off at the
 deadline, and collection returns `partial` with validated work flushed. A
-`SOURCE_*` failure is recorded and does not stop the tick, so deadline and
-checkpoint evaluation still runs in the same tick. Other sync errors, such as
-`STORE_BUSY` while an operator sync holds the scan lock, still fail that tick.
+`SOURCE_*` failure is recorded and does not stop the tick from calling the
+monitor's detector pass. The pass still observes its normal
+[scan limits](#storage-and-bounds): task detectors run first, so missed
+checkpoints and other task incidents can use up the shared 100-transition
+budget and leave project deadlines unprocessed in that tick. Other sync
+errors, such as `STORE_BUSY` while an operator sync holds the scan lock, still
+fail that tick.
 
 Without a deadline (a tick run by hand, or a launcher installed by an earlier
 release, which kills the tick after 35 seconds), the sync uses at most 8
-seconds, so a 20-second tick start, child cleanup, the flush and deadline
-evaluation still fit in 35 seconds. On a slow host that is usually too short for
-inventory, so the tick records `SOURCE_TIMEOUT` and evaluates deadlines without
-sync progress. The earlier launcher also gives `plugins list` only 20 seconds.
-After upgrading, run `hermes urgency watchdog install` once: it keeps the
-existing job and replaces the launcher if its bytes still match the install
-receipt. An edited launcher is never replaced and returns `INSTALL_CONFLICT`.
+seconds to leave time for child cleanup, the flush and the detector pass. On a
+slow host that is usually too short for inventory: the tick records
+`SOURCE_TIMEOUT` and calls the same bounded detector pass without sync progress.
+The earlier launcher also gives `plugins list` only 20 seconds. After upgrading,
+run `hermes urgency watchdog install` once: it keeps the existing job and
+replaces the launcher if its bytes still match the install receipt. An edited
+launcher is never replaced and returns `INSTALL_CONFLICT`.
 
 With a 20-second CLI start, the 100-second budget covers inventory for one binding and at
 least one detail. With several bindings, inventory alone can exceed it. The
-tick then records `SOURCE_TIMEOUT` and still evaluates deadlines, but the sync
-makes no progress.
+tick then records `SOURCE_TIMEOUT` without making sync progress.
 
 Lifecycle hooks only mark dirty bindings; missing
 worker/dependency telemetry stays unknown. Explicit availability/dependency
