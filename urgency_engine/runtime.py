@@ -293,8 +293,8 @@ class Runtime:
             if 'expected_revision' in arguments and (type(arguments['expected_revision']) is not int or arguments['expected_revision'] < 0):
                 invalid('expected_revision')
             settings = self.settings()
-            if scoped:
-                # A worker reads only the project the pre-turn hook would select for its session.
+            if scoped and operation not in ('diagnose', 'watchdog_health', 'kanban_health'):
+                # Project reads require the focus the pre-turn hook would select for this session.
                 project = self.selected(session_id, settings)
                 denied = LedgerError('SOURCE_DENIED', 'runtime', 'project_id',
                                      next_action='Worker reads are limited to the session project.')

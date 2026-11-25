@@ -126,6 +126,18 @@ class WorkerFenceTests(unittest.TestCase):
         with patch.dict(os.environ, dict(CLEAR, **WORKERS[0])):
             return json.loads(self.runtime.tool({'operation': operation, 'arguments': arguments}, session_id=session_id))
 
+    def test_worker_diagnostics_ignore_invalid_focus_without_unscoping_project_reads(self):
+        self.ctx.settings['default_project'] = 'p'
+        self.ctx.state.path.write_text('{', encoding='utf-8')
+        for operation in ('diagnose', 'kanban_health'):
+            with self.subTest(operation=operation):
+                request = {'operation': operation, 'arguments': {}}
+                with patch.dict(os.environ, CLEAR):
+                    operator = json.loads(self.runtime.tool(request, session_id='s'))
+                self.assertTrue(operator['ok'], operator)
+                self.assertEqual(self.tool(operation), operator)
+        self.assertFalse(self.tool('status')['ok'])
+
     def test_worker_tool_reads_only_the_session_project(self):
         """protects=project scoping; fails_when=worker reads another project's ledger."""
         def denied(operation, **arguments):
@@ -145,6 +157,8 @@ class WorkerFenceTests(unittest.TestCase):
         denied('history', entity_type='project', entity_id='q')
         denied('history', entity_type='task', entity_id='q')
         denied('watchdog_incidents', project_id='q')
+        self.assertEqual(self.tool('kanban_tasks')['error']['code'], 'INVALID_INPUT')
+        self.assertTrue(self.tool('kanban_tasks', project_id='p')['ok'])
         denied('kanban_tasks', project_id='q')
         with patch.dict(os.environ, CLEAR):
             result = json.loads(self.runtime.tool({'operation': 'status', 'arguments': {}}, session_id='s'))

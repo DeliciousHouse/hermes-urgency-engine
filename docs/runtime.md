@@ -64,11 +64,13 @@ return empty pages; scoped status, task and explain return `NOT_FOUND`.
 In a Kanban worker or delegated-child process (the markers listed under
 [operator writes](#operator-writes)), `urgency_query` reads only the project the
 pre-turn hook selects for that session: its focus or `default_project`. `status`,
-`watchdog_incidents` and `watchdog_plans` default to that project, `kanban_tasks`,
-`task` and `explain` must belong to it, and `history` is limited to that project's
-own entity. Anything else, or any project read when no project is selected, is
-`SOURCE_DENIED` (field `project_id`). `diagnose` and the health reads stay
-available. Elsewhere the tool reads every project in the profile. In-process cron
+`watchdog_incidents` and `watchdog_plans` default to that project. `kanban_tasks`
+requires an explicit `project_id` matching the selection. `task` and `explain`
+must belong to it, and `history` is limited to that project's own entity. A
+project read outside the selection, or with no project selected, is
+`SOURCE_DENIED` (field `project_id`). `diagnose`, `watchdog_health` and
+`kanban_health` do not read session focus and still work when it cannot be loaded.
+Elsewhere the tool reads every project in the profile. In-process cron
 and delegated sessions that share the operator's process are not distinguished.
 This scopes the tool only: the `hermes urgency` read commands stay open to any
 local process, including a worker with a terminal tool.
