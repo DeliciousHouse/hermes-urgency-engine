@@ -34,6 +34,17 @@ class InterventionTests(unittest.TestCase):
         self.ctx = Context(self.root / 'state.json')
         self.ctx.settings['intervention_mode'] = 'supervised'
         self.runtime = Runtime(self.ctx, data_dir=lambda: self.root)
+        # host_stop() stats <home>/ESTOP and <root>/ESTOP; never let it see the developer's own Hermes.
+        fleet = tempfile.TemporaryDirectory()
+        self.addCleanup(fleet.cleanup)
+        self.fleet = Path(fleet.name)
+        self.home = self.fleet / 'profiles' / 'test'
+        self.home.mkdir(parents=True)
+        constants = types.SimpleNamespace(get_hermes_home=lambda: self.home,
+                                          get_default_hermes_root=lambda home=None: self.fleet)
+        stub = patch.dict(sys.modules, {'hermes_constants': constants})
+        stub.start()
+        self.addCleanup(stub.stop)
 
     def cli(self, *args):
         out, err = io.StringIO(), io.StringIO()
@@ -221,16 +232,35 @@ class InterventionTests(unittest.TestCase):
         self.assertEqual(self.apply(payload)[0], 0)
 
     def test_host_stop_refuses_new_effects(self):
-        """protects=host stop fence; fails_when=estop admits a write;
-        why_new=operator execution; seam=host stop predicate; no_claim=live fleet state.
+        """protects=host stop fence; fails_when=ESTOP sentinel admits a write;
+        why_new=operator execution; seam=host sentinel paths; no_claim=live fleet state.
         """
         before, payload = self.seed()
-        with patch.dict('sys.modules', {'agent.estop': types.SimpleNamespace(is_engaged=lambda: True)}):
-            code, result = self.apply(payload)
-            self.assertEqual(code, 1, result)
-            self.assertEqual(result['error']['code'], 'PAUSED')
+        for sentinel in (self.home / 'ESTOP', self.fleet / 'ESTOP'):
+            with self.subTest(sentinel=sentinel):
+                sentinel.write_text('', encoding='utf-8')  # corrupt/empty body still pauses
+                try:
+                    code, result = self.apply(payload)
+                finally:
+                    sentinel.unlink()
+                self.assertEqual(code, 1, result)
+                self.assertEqual(result['error']['code'], 'PAUSED')
         with self.ledger() as ledger:
             self.assertEqual(ledger.get_task('demo', 'task'), before)
+
+    def test_host_stop_fails_closed(self):
+        """protects=fail-closed stop; fails_when=unknown pause state admits a write;
+        why_new=no public host predicate; seam=resolver/stat failure; no_claim=host internals.
+        """
+        interventions.host_stop()  # no sentinel: admits
+        broken = types.SimpleNamespace(get_hermes_home=lambda: 1 / 0, get_default_hermes_root=lambda home=None: self.fleet)
+        cases = (patch.dict(sys.modules, {'hermes_constants': broken}),
+                 patch.dict(sys.modules, {'hermes_constants': None}),
+                 patch.object(interventions.os, 'stat', side_effect=PermissionError))
+        for case in cases:
+            with self.subTest(case=case), case, self.assertRaises(LedgerError) as caught:
+                interventions.host_stop()
+            self.assertEqual(caught.exception.code, 'PAUSED')
 
     def test_concurrent_admission_issues_one_effect(self):
         """protects=one effect per request; fails_when=reservation admits twice;

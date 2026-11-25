@@ -28,7 +28,9 @@ hermes urgency --help
 hermes urgency diagnose
 ```
 
-The plugin has no additional Python dependencies. The native plugin is installed
+The plugin has no additional Python dependencies, and its `pyproject.toml` builds
+nothing for Hermes, so installing or enabling it in any number of profiles adds
+nothing to the shared Hermes environment. The native plugin is installed
 from the Git repository or source archive, not by `pip install`. The wheel supplies
 the Python library. The source archive includes the manifest and entry point.
 The local CLI requires the default `plugins.isolation: in_process` mode;
