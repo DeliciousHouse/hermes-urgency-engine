@@ -1065,11 +1065,15 @@ class WatchdogInstallTests(unittest.TestCase):
         launcher.write_bytes(old)
         self.receipt({**receipt, 'sha256': hashlib.sha256(old).hexdigest()})
         self.jobs.clear()  # The scheduler no longer has the job, but the receipt owns the file.
+        sibling = launcher.with_name(launcher.name + '.tmp')
+        sibling.write_bytes(b'operator backup\n')
 
         with patch('urgency_engine.runtime.os.replace', side_effect=PermissionError('transient file sharing refusal')):
             with self.assertRaises(PermissionError):
                 self.install()
         self.assertEqual(launcher.read_bytes(), old)
+        self.assertEqual(set(launcher.parent.iterdir()), {launcher, sibling})
+        self.assertEqual(sibling.read_bytes(), b'operator backup\n')
 
         self.assertEqual(self.install('uninstall')['state'], 'uninstalled')
         self.assertFalse(launcher.exists())

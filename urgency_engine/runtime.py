@@ -12,6 +12,7 @@ import re
 import shlex
 import sqlite3
 import sys
+import tempfile
 import time
 import traceback
 from typing import NoReturn
@@ -925,11 +926,11 @@ class Runtime:
             ))
         def refresh():
             if script.read_bytes() != content:
-                temporary = script.with_name(script.name + '.tmp')
-                temporary.unlink(missing_ok=True)
-                with temporary.open('xb') as stream:
-                    stream.write(content)
-                os.replace(temporary, script)
+                with tempfile.TemporaryDirectory(dir=script.parent) as directory:
+                    temporary = Path(directory) / script.name
+                    with temporary.open('xb') as stream:
+                        stream.write(content)
+                    os.replace(temporary, script)
         if script.is_symlink() or (script.exists() and not owned()):
             conflict('launcher')
         if receipt and receipt.get('home') != str(home):
