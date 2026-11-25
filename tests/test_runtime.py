@@ -538,7 +538,9 @@ class RuntimeTests(unittest.TestCase):
                                      watchdog_max_rows=100)
         self.assertEqual(command('kanban', 'sync', '--request-id', 'capped', '--reason', 'Fixture'), 0)
         with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now, readonly=True) as monitor:
-            self.assertLessEqual(monitor.rows(), 100)
+            tables = ('observations', 'task_signals', 'incidents', 'plans', 'monitor_audit', 'monitor_meta', 'dependencies')
+            rows = sum(monitor.db.execute(f'SELECT count(*) FROM {table}').fetchone()[0] for table in tables)
+            self.assertLessEqual(rows, 100)
             self.assertEqual(monitor.db.execute('SELECT count(*) FROM task_signals').fetchone()[0], 30)
 
     def test_capacity_refusals_during_due_sync_do_not_skip_the_tick(self):

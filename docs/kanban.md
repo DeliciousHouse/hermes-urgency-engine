@@ -137,8 +137,9 @@ toward the 20000-row and the Ledger's 10000-task limits. A card refused for
 capacity is cancelled with no Ledger effect and reported (`SOURCE_LIMIT`
 `sources_capacity` or `INVALID_INPUT` `tasks_capacity`) after the rest of its
 batch is applied; the cursor passes it, so later cards keep syncing and the card
-is retried on the next cycle. These are row/input safeguards, not a disk quota
-or native CLI throughput guarantee.
+is retried on the next cycle. A Ledger task-capacity refusal makes cached graph
+coverage `unknown` in both the source projection and Monitor. These are row/input
+safeguards, not a disk quota or native CLI throughput guarantee.
 
 ## Why collection, application and verification are separate
 

@@ -598,6 +598,42 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(self.ledger.get_task('demo', 't1')['goal'], 'New source')
         self.assertEqual(self.sync.db.execute("SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 0)
 
+    def test_task_capacity_revokes_prior_monitor_graph(self):
+        from urgency_engine.watchdog import Monitor
+        self.source.rows = [dict(id='z', tenant='synthetic')]
+        path = self.root / 'data.db'
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
+            def scan(identity):
+                return self.sync.scan(self.cfg, self.ledger, monitor, path, self.source,
+                                      request_id=identity, reason='Fixture')
+
+            def dependency_state():
+                return monitor.db.execute(
+                    'SELECT dependency_state FROM task_signals WHERE task_id=?', ('z',)
+                ).fetchone()[0]
+
+            self.assertEqual(scan('before')['state'], 'complete')
+            self.assertEqual(dependency_state(), 'available')
+            db = self.ledger.connection
+            columns = [row[1] for row in db.execute('PRAGMA table_info(tasks)')]
+            index = columns.index('task_id')
+            template = list(db.execute('SELECT * FROM tasks WHERE task_id=?', ('z',)).fetchone())
+            marks = ','.join('?' for _ in columns)
+            db.executemany(f'INSERT INTO tasks VALUES({marks})',
+                           (template[:index] + [f'gone{i:04d}'] + template[index + 1:]
+                            for i in range(9999)))
+            db.commit()
+            self.source.rows.insert(0, dict(id='a', tenant='synthetic'))
+            with self.assertRaises(LedgerError) as caught:
+                scan('refusal')
+            self.assertEqual((caught.exception.code, caught.exception.field),
+                             ('INVALID_INPUT', 'tasks_capacity'))
+            self.assertEqual(self.sync.meta('last_error'), 'INVALID_INPUT')
+            self.assertEqual(self.sync.db.execute(
+                'SELECT coverage FROM sources WHERE task_id=?', ('z',)
+            ).fetchone()[0], 'unknown')
+            self.assertEqual(dependency_state(), 'unknown')
+
     def test_task_capacity_refusal_cannot_block_later_cards(self):
         """protects=one refused card is a bounded skip; fails_when=its pending intent blocks every scan;
         why_new=deleted cards keep Ledger capacity; seam=real stores with synthetic rows; no_claim=task retirement.

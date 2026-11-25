@@ -558,6 +558,70 @@ class WatchdogTests(unittest.TestCase):
             self.assertLessEqual(monitor.rows(), 100)
         self.assertIn('stalled', self.detectors())
 
+    def test_retention_cycles_near_row_cap_leave_room_for_a_new_due_incident(self):
+        cfg = {**DEFAULTS, 'watchdog_max_rows': 100}
+        db_path = self.ledger_path
+
+        def tool_event(identity):
+            return dict(request_id=identity, reason='fixture', project_id='demo', board_id=None,
+                        task_id=None, kind='tool_outcome', occurred_at=self.now.isoformat(),
+                        data=dict(tool_name='read', outcome='success', duration_seconds=0))
+
+        def receipt(monitor, event):
+            return monitor.db.execute('SELECT sequence FROM monitor_audit WHERE request_id=?',
+                                      (event['request_id'],)).fetchone()
+
+        with self.monitor() as monitor:
+            monitor.observe(dict(request_id='unavailable', reason='fixture', project_id='demo', board_id='board',
+                task_id='task', kind='task_signal', occurred_at=self.now.isoformat(),
+                data=dict(agent_available=False)), db_path, cfg)
+            notice, = monitor.tick(db_path, cfg)['notices']
+            incident, = monitor.page('incidents', active=True)['items']
+            plan, = monitor.page('plans', active=True)['items']
+            self.assertEqual(incident['incident_id'], notice['incident_id'])
+            self.assertEqual(incident['detector'], 'delegated_work_unavailable')
+            self.assertEqual(plan['incident_id'], incident['incident_id'])
+        for cycle in range(3):
+            with self.monitor() as monitor:
+                for n in range(60):
+                    event = tool_event(f'tool-{cycle}-{n:02d}')
+                    monitor.observe(event, db_path, cfg)
+                retained = tool_event(f'tool-{cycle}-58')
+                sequence = receipt(monitor, retained)[0]
+                rows = monitor.rows()
+                self.assertGreaterEqual(rows, 95)
+                self.assertLessEqual(rows, 100)
+                monitor.observe(retained, db_path, cfg)
+                self.assertEqual(receipt(monitor, retained)[0], sequence)
+                self.assertEqual(monitor.rows(), rows)
+                self.assertEqual(monitor.page('incidents', active=True)['items'], [incident])
+                self.assertEqual(monitor.page('plans', active=True)['items'], [plan])
+                if cycle < 2:
+                    self.now += timedelta(days=31)
+                    monitor.observe(tool_event(f'expiry-{cycle}'), db_path, cfg)
+                    self.assertIsNone(receipt(monitor, retained))
+                    self.assertNotIn(retained['request_id'], {o['event_id'] for o in monitor.page('observations')['items']})
+                    monitor.observe(retained, db_path, cfg)
+                    self.assertGreater(receipt(monitor, retained)[0], sequence)
+        with self.ledger() as ledger:
+            ledger.set_deadline('hard', project_id='demo', kind='hard', at=self.now.isoformat(), timezone='UTC',
+                                owner='fixture', source='fixture', request_id='deadline', actor='fixture')
+        self.now += timedelta(seconds=1)
+        with self.monitor() as monitor:
+            result = monitor.tick(db_path, cfg)
+            self.assertTrue(result['evaluated'])
+            self.assertEqual(datetime.fromisoformat(monitor.health()['last_success']), self.now)
+            self.assertLessEqual(monitor.rows(), 100)
+        with self.monitor(True) as monitor:
+            incidents = {item['incident_id']: item for item in monitor.page('incidents', active=True)['items']}
+            plans = {item['incident_id']: item for item in monitor.page('plans', active=True)['items']}
+            self.assertEqual(incidents[incident['incident_id']], incident)
+            self.assertEqual(plans[incident['incident_id']], plan)
+            deadline, = (item for item in incidents.values() if item['detector'] == 'expired_deadline')
+            self.assertNotEqual(deadline['incident_id'], incident['incident_id'])
+            self.assertIn(deadline['incident_id'], {item['incident_id'] for item in result['notices']})
+            self.assertIn(deadline['incident_id'], plans)
+
     def test_expired_observe_receipts_keep_the_evidence_watermark_monotonic(self):
         """protects=replay receipts expire with their observation; fails_when=receipts never expire
         or a reused sequence hides new evidence; why_new=retention; seam=real store; no_claim=replay after expiry.

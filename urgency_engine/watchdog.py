@@ -638,6 +638,8 @@ class Monitor:
                      evaluations=evaluation_counts, unknown_policy='retain_episode_no_reminder',
                      missing_signals='insufficient_evidence', source_consistency='two snapshots; subsequent changes observed next tick'))
             self.put('next_due', stamp(now + timedelta(seconds=cfg['watchdog_risk_seconds'] if high else cfg['watchdog_normal_seconds'])))
+            # Final cursor and health keys also count, including the first deadline cursor.
+            self.capacity(cfg, 0)
             return dict(notices=notices, omitted=omitted, evaluated=True, transitions=transitions, scan_complete=complete)
 
     @staticmethod

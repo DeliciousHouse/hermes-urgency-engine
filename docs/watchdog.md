@@ -209,7 +209,9 @@ are not a hard real-time guarantee. Selection is capped at 40 before notice
 accounting, inside the tick transaction. Incidents beyond that cap keep their next
 reminder due instead of consuming it.
 A 10000-task board needs a larger row cap than the default because each task also
-has retained monitor metadata. Exceeding capacity rolls back the transaction.
+has retained monitor metadata. The row cap includes the cursor and health rows
+written at the end of a tick. If reclaimable telemetry cannot make room, the
+transaction rolls back.
 Old observations and resolved episodes expire by retention time. An observation's
 `observe` receipt in `monitor_audit` expires with it, so replaying its request ID
 afterwards records a new event; the newest receipt is always kept. Before a write
