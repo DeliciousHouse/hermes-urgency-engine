@@ -275,6 +275,12 @@ def _strings(value):
 
 @router.post('/commands')
 async def commands(request: Request):
+    # A JSON media type keeps cross-origin writes behind a CORS preflight; a
+    # text/plain body is a simple request that a browser sends without one.
+    if request.headers.get('content-type', '').split(';', 1)[0].strip().lower() != 'application/json':
+        return JSONResponse(_runtime.Runtime.error(_ledger.LedgerError(
+            'INVALID_INPUT', 'desktop', 'content_type', next_action='Send the command body as Content-Type: application/json.'),
+            'desktop'), status_code=400)
     raw = bytearray()
     async for chunk in request.stream():
         # Refuse before the oversized chunk is retained, not after.

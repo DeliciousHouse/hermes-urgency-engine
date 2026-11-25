@@ -222,8 +222,11 @@ def child():
     malformed = client.post(url + '/commands', json={'actor': 'operator'}, headers=headers)
     assert malformed.status_code == 400, (malformed.status_code, malformed.text)
     for raw in ('{', '{"operation":"edit_project","operation":"set_deadline"}'):
-        malformed = client.post(url + '/commands', content=raw, headers=headers)
+        malformed = client.post(url + '/commands', content=raw, headers={**headers, 'Content-Type': 'application/json'})
         assert malformed.status_code == 400, (malformed.status_code, malformed.text)
+        assert malformed.json()['error']['field'] != 'content_type', malformed.text
+    plain = client.post(url + '/commands', content='{}', headers={**headers, 'Content-Type': 'text/plain'})
+    assert plain.status_code == 400 and plain.json()['error']['field'] == 'content_type', plain.text
     assert client.post(url + '/commands', json={}).status_code == 401
     (root / 'data.db').rename(root / 'saved.db')
     empty = client.get(url + '/portfolio', headers=headers)

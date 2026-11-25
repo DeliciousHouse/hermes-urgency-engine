@@ -57,6 +57,30 @@ class DashboardContextTests(unittest.TestCase):
         sys.modules[spec.name] = self.api
         spec.loader.exec_module(self.api)
 
+    def test_commands_refuse_non_json_media_type_before_reading_body(self):
+        """protects=CORS preflight on writes; fails_when=a text/plain simple request reaches the writer."""
+        import asyncio
+        class Request:
+            def __init__(self, media, body=None):
+                self.headers = {} if media is None else {'content-type': media}
+                self.body = body
+            async def stream(self):
+                if self.body is None:
+                    raise AssertionError('body read')
+                yield self.body
+        for media in ('text/plain', 'text/plain;charset=UTF-8', 'application/x-www-form-urlencoded',
+                      'multipart/form-data; boundary=x', 'application/jsonx', '', None):
+            with self.subTest(media=media):
+                response = asyncio.run(self.api.commands(Request(media)))
+                self.assertEqual(response.status_code, 400)
+                error = response.content['error']
+                self.assertEqual((error['code'], error['field'], error['side_effects']),
+                                 ('INVALID_INPUT', 'content_type', 'none'))
+        for media in ('application/json', 'Application/JSON; charset=utf-8'):
+            with self.subTest(media=media):
+                response = asyncio.run(self.api.commands(Request(media, b'{')))
+                self.assertEqual(response.content['error']['field'], 'body')
+
     def test_public_config_precedence_and_defaults(self):
         self.config = {'context_enabled': False, 'default_project': 'unrelated', 'plugins': {
             'entries': {'hermes-urgency-engine': {

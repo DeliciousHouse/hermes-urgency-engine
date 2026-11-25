@@ -58,7 +58,10 @@ refused. The renderer includes the namespace and the backend compares it with th
 current authenticated profile before opening the Ledger writer. A mismatch is
 `SOURCE_DENIED` with field `scope_id`. This is a routing safeguard, not authority.
 The body is bounded by the host's `MAX_INPUT_BYTES` and refused
-before an oversized chunk is retained. The allowlist is exactly:
+before an oversized chunk is retained. A media type other than `application/json`
+(parameters such as `charset` are allowed) is `INVALID_INPUT` (400) with field
+`content_type` before the body is read, so a browser cannot send a command as a
+CORS-simple `text/plain` request without a preflight. The allowlist is exactly:
 
 | Operation | Required arguments | Revision checked against |
 |---|---|---|
