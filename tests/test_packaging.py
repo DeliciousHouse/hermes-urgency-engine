@@ -29,5 +29,19 @@ class PackagingTests(unittest.TestCase):
         self.assertTrue((ROOT / 'scripts' / 'watchdog.py').is_file())
 
 
+    def test_readme_discloses_machine_side_effects(self):
+        # Catalog rule 13: the README itself names files written outside plugin data,
+        # background jobs and spawned processes. Each disclosed name must match the code.
+        readme = (ROOT / 'README.md').read_text(encoding='utf-8')
+        runtime = (ROOT / 'urgency_engine' / 'runtime.py').read_text(encoding='utf-8')
+        launcher = (ROOT / 'scripts' / 'watchdog.py').read_text(encoding='utf-8')
+        for name, source in (("'hermes-urgency-engine-watchdog.py'", runtime), ("'hermes_cli.main'", launcher),
+                             ("'plugins', 'list', '--json'", launcher), ("'urgency', 'watchdog', 'tick'", launcher)):
+            with self.subTest(name=name):
+                self.assertIn(name, source)
+                self.assertIn(name.strip("'").replace("', '", ' '), readme)
+        for disclosure in ('no-agent Hermes cron job that runs every minute', 'kanban ...', 'no third-party network calls'):
+            self.assertIn(disclosure, readme)
+
 if __name__ == '__main__':
     unittest.main()
