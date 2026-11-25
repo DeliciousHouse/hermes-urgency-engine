@@ -972,6 +972,9 @@ class Runtime:
         else:
             # Reserve before external work. Unknown create outcomes are reconciled,
             # never blindly repeated; no external call runs under a DB write lock.
+            # A stale owned launcher is refreshed while the receipt still names it.
+            if script.exists() and receipt and receipt.get('state') != 'installing':
+                refresh()
             with monitor.transaction():
                 current = monitor.meta('install')
                 if current and current.get('state') == 'installing':
@@ -983,8 +986,6 @@ class Runtime:
             if not script.exists():
                 with script.open('xb') as stream:
                     stream.write(content)
-            else:
-                refresh()
             result = self.cron('create', schedule='every 1m', name='hermes-urgency-engine-watchdog',
                                script=script.name, no_agent=True, deliver=deliver, enabled_toolsets=[])
             found = jobs()

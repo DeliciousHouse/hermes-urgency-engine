@@ -692,7 +692,7 @@ class RuntimeTests(unittest.TestCase):
         def cron(action, **arguments):
             calls.append(action)
             if action == 'create':
-                jobs.append(dict(job_id='job-%d' % len(calls), no_agent=True, **arguments))
+                jobs.append(dict(arguments, job_id='job-%d' % len(calls)))
                 return {'success': True, 'job_id': jobs[-1]['job_id']}
             if action == 'remove':
                 jobs[:] = [job for job in jobs if job['job_id'] != arguments['job_id']]
@@ -716,6 +716,13 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual((receipt['job_id'], receipt['sha256']), ('job-old', hashlib.sha256(packaged).hexdigest()))
             self.assertNotIn('create', calls)
             self.assertEqual(sorted(p.name for p in script.parent.iterdir()), [script.name])
+
+            # The job is gone but the earlier launcher and receipt remain: refresh, then recreate.
+            earlier_release_install(monitor)
+            jobs.clear()
+            receipt = self.runtime.monitor_install(monitor, 'install', 'local')
+            self.assertEqual((script.read_bytes(), calls.count('create')), (packaged, 1))
+            self.assertEqual(receipt['sha256'], hashlib.sha256(packaged).hexdigest())
 
             earlier_release_install(monitor)
             self.assertEqual(self.runtime.monitor_install(monitor, 'uninstall', 'local')['state'], 'uninstalled')
