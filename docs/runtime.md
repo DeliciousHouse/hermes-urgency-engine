@@ -56,6 +56,8 @@ Tool argument names are `project_id`, `board_id`, `task_id`, `deadline_id`,
 `entity_type`, `entity_id`, `limit` and `after`, as applicable. `after` is a string
 for project pages and an integer for history. Unknown fields and operations fail.
 Status and history return `items`, `has_more` and `next`; pass `next` as `after`.
+History items carry the audit snapshots as decoded `before` and `after` objects
+(the Ledger API's `before_json`/`after_json` strings), so each value is redacted on its own.
 Before the ledger is initialized, status without a project filter and history
 return empty pages; scoped status, task and explain return `NOT_FOUND`.
 `diagnose` reports `storage: uninitialized` and `schema: 0`. Use
@@ -173,9 +175,15 @@ journal setup. SQLite can still maintain WAL coordination files for an existing
 WAL ledger. The hook never snapshots
 forecasts, moves targets, changes criteria or grants credit.
 
-The hook labels objective/task text as untrusted data. It includes up to five
+The hook places its quoted values, one label and JSON value per line, between
+`BEGIN URGENCY DATA` and `END URGENCY DATA` lines and labels them untrusted data.
+Truncation keeps both delimiter lines and drops any guidance lines that do not
+fit in full, so the data block can be empty. The hook includes up to five
 active deadlines ordered by urgency descending, target ascending and ID; up to
-five tasks with criteria; and the recorded byte-evidence limitation. Missing
+five tasks with criteria; and the recorded byte-evidence limitation. A task goal
+that Kanban sync ever wrote is a card title that other agents can edit, so the
+hook replaces it with `"goal_omitted":"kanban_card_title"`, even after the binding
+is removed or an operator edits the task; `urgency_query task` still returns it on request. Missing
 blocker information stays unknown. Long guidance is explicitly truncated. The
 hook reads one size-limited snapshot of the atomically replaced focus file
 without taking the writer lock. It applies a 750 ms cooperative work budget and
@@ -185,8 +193,10 @@ the host's storage opener and retain its safe journaling policy. Ordinary
 queries run the integrity checks; the hook checks the schema without a full scan.
 
 These bounds trade detail for low latency. They are not a hard OS execution
-budget: filesystem or hardware failures can still delay a call. Redaction runs
-before injection. An unavailable ledger produces a short diagnostic and permits
+budget: filesystem or hardware failures can still delay a call. Every quoted
+string is redacted on its own before JSON encoding, so a credential on its own
+line inside a goal or criterion is still matched; if redaction is unavailable
+the hook returns no context. An unavailable ledger produces a short diagnostic and permits
 other work to continue. Hermes inserts the context into the current user turn;
 this plugin does not rewrite the system prompt. Deterministic tests verify text
 and dispatch, not whether a model follows the advice or delivers better work.

@@ -41,7 +41,10 @@ Reads return `{"ok":true,"data":...}`; pages include `schema_version: 1`,
 Before initialization, reads return uninitialized health or empty pages without
 creating storage. String exports use Hermes redaction. Do not put secrets in IDs.
 Read-only `/urgency watchdog health|incidents|plans` and `urgency_query` operations
-`watchdog_health`, `watchdog_incidents`, `watchdog_plans` share these envelopes.
+`watchdog_health`, `watchdog_incidents`, `watchdog_plans` share these envelopes,
+except that their health reduces the install receipt to `state` and `sha256`. The
+home and launcher paths, cron job ID and delivery target appear only in the local
+`hermes urgency watchdog health` output.
 Tool filters use `project_id`, `limit`, `after`. Pre-turn guidance includes up to
 three active plans for the selected project within the existing guidance budget.
 Nonquiet `tick` output includes `notices` (at most 40), `omitted` (eligible notices
