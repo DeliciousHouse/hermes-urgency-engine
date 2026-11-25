@@ -291,7 +291,11 @@ class Runtime:
                 invalid('expected_revision')
             settings = self.settings()
             if operation.startswith('watchdog_'):
-                return {'ok': True, 'data': self.monitor_read(operation.removeprefix('watchdog_'), arguments)}
+                data = self.monitor_read(operation.removeprefix('watchdog_'), arguments)
+                if data.get('installed') is not None:
+                    # Paths, cron job and delivery target stay on the local watchdog CLI.
+                    data['installed'] = {key: data['installed'].get(key) for key in ('state', 'sha256')}
+                return {'ok': True, 'data': data}
             if operation.startswith('kanban_'):
                 return {'ok': True, 'data': self.kanban_read(operation.removeprefix('kanban_'), arguments)}
             if operation in MUTATIONS:

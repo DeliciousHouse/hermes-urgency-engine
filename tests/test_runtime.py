@@ -631,6 +631,22 @@ class RuntimeTests(unittest.TestCase):
         with Monitor.open(self.root / 'watchdog.db', clock=self.runtime.clock) as monitor:
             self.assertEqual(monitor.tick(self.root / 'data.db', DEFAULTS)['notices'], [])
 
+    def test_watchdog_health_keeps_install_receipt_on_local_cli(self):
+        """protects=operator paths and delivery target; fails_when=receipt reaches model surfaces;
+        seam=real monitor store, tool, slash and CLI."""
+        from urgency_engine.watchdog import Monitor
+        receipt = dict(state='installed', job_id='job-1', home='/home/operator/.hermes', sha256='a' * 64,
+                       script='/home/operator/.hermes/scripts/watchdog.py', no_agent=True, deliver='chat:-100123')
+        with Monitor.open(self.root / 'watchdog.db', clock=self.runtime.clock) as monitor, monitor.transaction():
+            monitor.put('install', receipt)
+        for surface in ('tool', 'slash'):
+            data = self.runtime.run_request('watchdog_health', {}, surface=surface, session_id='s')['data']
+            self.assertEqual(data['installed'], {'state': 'installed', 'sha256': 'a' * 64})
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(self.runtime.cli(setup_parser(Parser()).parse_args(['watchdog', 'health'])), 0)
+        self.assertEqual(json.loads(out.getvalue())['data']['installed'], receipt)
+
     def test_write_replay_and_read_surface_denial(self):
         """protects=local provenance; fails_when=reads write; seam=temp storage."""
         first = self.project()
