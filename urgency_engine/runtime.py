@@ -1107,8 +1107,16 @@ class Runtime:
     def pre_llm_call(self, session_id=None, **kwargs):
         stop_at = time.monotonic() + .75
         maximum, quoted = 4000, False
+
+        class RedactionUnavailable(Exception):
+            pass
+
         def quote(label, value):
-            return label + encode(self.clean(value))
+            try:
+                cleaned = self.clean(value)
+            except Exception:
+                raise RedactionUnavailable from None
+            return label + encode(cleaned)
         try:
             settings = self.settings()
             maximum = settings['context_max_chars']
@@ -1188,6 +1196,8 @@ class Runtime:
             if more_tasks:
                 lines.append('Task/criteria listing truncated; use urgency_query task for details.')
             text, quoted = '\n'.join(lines), True
+        except RedactionUnavailable:
+            return None
         except LedgerError as exc:
             text = f'Urgency guidance unavailable ({exc.code}). {exc.next_action} Continue other work; do not infer healthy progress.'
         except Exception:
@@ -1217,10 +1227,8 @@ class Runtime:
                     text = text[:maximum - len(suffix)]
                 text += suffix
             return {'context': text}
-        except ValueError:
-            return None
         except Exception:
-            return {'context': 'Urgency guidance unavailable: redaction failed. Continue other work.'}
+            return None
 
 
 TOOL_SCHEMA = {
