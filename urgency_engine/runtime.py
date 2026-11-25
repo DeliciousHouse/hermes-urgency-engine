@@ -262,7 +262,7 @@ class Runtime:
         result['error']['diagnostic_id'] = token
         return result
 
-    def run_request(self, operation, arguments, *, surface, session_id=None):
+    def run_request(self, operation, arguments, *, surface, session_id=None, scoped=False):
         safe_operation = operation if isinstance(operation, str) and operation in READ_FIELDS | MUTATIONS else 'unknown'
         try:
             if surface not in ('cli', 'slash', 'tool', 'hook'):
@@ -292,6 +292,17 @@ class Runtime:
             if 'expected_revision' in arguments and (type(arguments['expected_revision']) is not int or arguments['expected_revision'] < 0):
                 invalid('expected_revision')
             settings = self.settings()
+            if scoped:
+                # A worker reads only the project the pre-turn hook would select for its session.
+                project = self.selected(session_id, settings)
+                denied = LedgerError('SOURCE_DENIED', 'runtime', 'project_id',
+                                     next_action='Worker reads are limited to the session project.')
+                if operation in ('status', 'watchdog_incidents', 'watchdog_plans', 'kanban_tasks'):
+                    if project is None or arguments.get('project_id', project) != project:
+                        raise denied
+                    arguments = {**arguments, 'project_id': project}
+                elif operation == 'history' and (arguments['entity_type'], arguments['entity_id']) != ('project', project):
+                    raise denied
             if operation.startswith('watchdog_'):
                 return {'ok': True, 'data': self.monitor_read(operation.removeprefix('watchdog_'), arguments)}
             if operation.startswith('kanban_'):
@@ -314,6 +325,11 @@ class Runtime:
                     storage = Ledger(sqlite3.connect(':memory:'), clock=self.clock,
                                      artifact_root=Path(__file__).resolve().parent)
             with storage as ledger:
+                if scoped and operation in ('task', 'explain'):
+                    owner = (ledger.get_task(**arguments) if operation == 'task'
+                             else ledger.get_deadline(arguments['deadline_id']))
+                    if owner['project_id'] != project:
+                        raise denied
                 if operation in ('explain', 'snapshot_forecast'):
                     with self.forecast_scope(ledger):
                         data = (self.mutate(ledger, operation, arguments) if operation in MUTATIONS else
@@ -597,7 +613,10 @@ class Runtime:
     def tool(self, args, **kwargs):
         if not isinstance(args, dict) or set(args) - {'operation', 'arguments'}:
             return encode(self.error(LedgerError('INVALID_INPUT', 'unknown', 'arguments'), 'unknown'))
-        result = self.run_request(args.get('operation'), args.get('arguments', {}), surface='tool', session_id=None)
+        # Kanban worker and delegated-child processes carry host markers in their environment.
+        scoped = interventions.worker_context()
+        result = self.run_request(args.get('operation'), args.get('arguments', {}), surface='tool',
+                                  session_id=kwargs.get('session_id'), scoped=scoped)
         return self.render(result)
 
     def monitor_config(self):

@@ -94,6 +94,34 @@ class WorkerFenceTests(unittest.TestCase):
             self.assertEqual(self.cli('watchdog', 'tick')[0], 0)
             self.assertEqual(self.cli('watchdog', 'health')[0], 0)
 
+    def tool(self, operation, session_id='s', **arguments):
+        with patch.dict(os.environ, dict(CLEAR, **WORKERS[0])):
+            return json.loads(self.runtime.tool({'operation': operation, 'arguments': arguments}, session_id=session_id))
+
+    def test_worker_tool_reads_only_the_session_project(self):
+        """protects=project scoping; fails_when=worker reads another project's ledger."""
+        def denied(operation, **arguments):
+            result = self.tool(operation, **arguments)
+            self.assertEqual(result['error']['code'], 'SOURCE_DENIED', (operation, arguments))
+        denied('status')
+        denied('task', board_id='b', task_id='p')
+        self.ctx.settings['default_project'] = 'p'
+        self.assertEqual([item['project_id'] for item in self.tool('status')['data']['items']], ['p'])
+        self.assertEqual(self.tool('task', board_id='b', task_id='p')['data']['project_id'], 'p')
+        self.assertTrue(self.tool('explain', deadline_id='due-p')['ok'])
+        self.assertTrue(self.tool('history', entity_type='project', entity_id='p')['ok'])
+        self.assertTrue(self.tool('watchdog_health')['ok'])
+        denied('status', project_id='q')
+        denied('task', board_id='b', task_id='q')
+        denied('explain', deadline_id='due-q')
+        denied('history', entity_type='project', entity_id='q')
+        denied('history', entity_type='task', entity_id='q')
+        denied('watchdog_incidents', project_id='q')
+        denied('kanban_tasks', project_id='q')
+        with patch.dict(os.environ, CLEAR):
+            result = json.loads(self.runtime.tool({'operation': 'status', 'arguments': {}}, session_id='s'))
+        self.assertEqual([item['project_id'] for item in result['data']['items']], ['p', 'q'])
+
 
 if __name__ == '__main__':
     unittest.main()
