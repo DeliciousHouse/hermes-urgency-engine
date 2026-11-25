@@ -109,9 +109,13 @@ allows the first detail read even if its ledger lookup uses the window. For
 later reads, it checks the deadline after the ledger lookup, just before
 starting the detail read. At or past the deadline, it flushes collected work
 and returns a partial result without starting that read. A durable ordered
-cursor continues on a later request and resets at the tail. Each native
-subprocess has a 20-second timeout and 16 MiB stdout cap. These are per-call
-bounds, not a 20-second scan guarantee. Inventories cap at 10000 tasks, each task
+cursor continues on a later request and resets at the tail. Board discovery and
+scoped inventory each keep their 20-second child timeout. For scan detail, the
+owned snapshot process gives startup, nested board validation, and public-tool
+detail (including output drain) up to 20 seconds each, plus bounded cleanup.
+This avoids charging two independent CLI startups to one deadline. The 16 MiB
+stdout cap still applies. The collection window gates the next detail launch;
+it does not cancel one already admitted. Inventories cap at 10000 tasks, each task
 at 1000 parents, and admitted graphs at 50000 edges. A partial traversal revokes
 previous complete graph coverage until the tail is read and every selected
 projection is within the configured freshness interval. A slow multi-page scan
@@ -173,9 +177,10 @@ Each task retains its own original arguments and replay identity before
 any Ledger or Monitor effect. Each accepted task then gets its own source-store
 commit publishing projection, acknowledgment and cursor together. An unchanged
 row flushes earlier collected changes before advancing the cursor. Pending page
-intents replay in cursor order after restart, not request-hash order. A source
-failure before the batch commits leaves those collected changes unapplied and
-its cursor unchanged, so they can be collected again.
+intents replay in cursor order after restart, not request-hash order. A detail
+timeout flushes earlier validated changes through the same intent protocol;
+it does not acknowledge the timed-out row or establish graph coverage. Other
+source failures before the batch commits leave the buffered changes unapplied.
 
 No source transaction spans native I/O or other stores' calls; journal and
 synchronous durability settings are unchanged. A failed final commit leaves the
@@ -197,9 +202,13 @@ missing or inconsistent data stays unknown.
 The adapter uses public native CLI inventory and its registered snapshot CLI
 for detail. The child initializes built-in tools and calls the documented
 `ctx.dispatch_tool` API for `kanban_show`; it never reads board SQL or invokes
-a private handler. Parent sync/tick retains the same interpreter, profile,
-20-second owned-child timeout and 16 MiB output bound. There is no weaker CLI
-show fallback on denial or missing capability. **Native `kanban list` recomputes
+a private handler. Parent sync/tick retains the same interpreter and profile.
+The scan's timeout cleanup terminates the owned snapshot tree, including its
+nested board-check process. On POSIX, the scan signals the owned process group
+before reaping its leader, including on macOS with Python 3.11 or 3.12.
+There is no weaker CLI `show` fallback on denial
+or missing capability. Standalone snapshot and priority intervention transport
+are unchanged. **Native `kanban list` recomputes
 dependency readiness**; opting in accepts that normal native effect. Collection
 is therefore not described as side-effect-free, even though this adapter never
 writes board rows directly or bypasses worker fences. Cached conversational
@@ -242,11 +251,16 @@ Pausing or disabling source sync leaves the standalone watchdog usable.
 Troubleshooting: `SOURCE_DENIED` includes nonzero native CLI exit or a missing
 board; verify public CLI access in the same profile. Snapshot also refuses
 disabled, unbound, ambiguous or cross-tenant requests before returning detail.
-`SOURCE_UNAVAILABLE` means no callable public dispatch API; worker facts stay
-unknown. A CLI serializer without a pointer does not imply that the public tool
-lacks it. Inspect `hermes urgency kanban snapshot --board synthetic --task ID`
-for the selected tool capability, not historical run ordering. `SOURCE_TIMEOUT` and
-`SOURCE_LIMIT` do not establish complete coverage. `SOURCE_MALFORMED` or
+`SOURCE_UNAVAILABLE` includes transport setup failure or a missing public
+dispatch API; worker facts stay unknown. A CLI serializer without a pointer
+does not imply that the public tool lacks it. Inspect
+`hermes urgency kanban snapshot --board synthetic --task ID`
+for the selected tool capability, not historical run ordering. `SOURCE_TIMEOUT`
+and `SOURCE_LIMIT` do not establish complete coverage. A snapshot timeout can
+name `startup`, `board`, or `detail` in `field`. Check sync `health` and `tasks`
+before retrying the failed request with the same ID and reason: a confirmed
+prefix may already be present. A normal `partial` page instead continues with
+a new request ID. `SOURCE_MALFORMED` or
 `SOURCE_UNSUPPORTED` require a compatible native response, not guessed fields.
 After changing a binding, retry once on `SCOPE_CONFLICT` to allow a scan after
 unapplied intent cancellation. A single `REVISION_CONFLICT` clears on the next

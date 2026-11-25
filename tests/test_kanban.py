@@ -292,6 +292,118 @@ class SyncTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def test_darwin_snapshot_without_os_waitid_observes_before_cleanup(self):
+        """Run the fallback and transport with synthetic libc and process boundaries."""
+        import ctypes
+        import io
+        import subprocess
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from urgency_engine import _snapshot_process
+
+        for exit_status in (0, 7):
+            with self.subTest(exit_status=exit_status):
+                events = []
+                pid = 12345
+                posix = SimpleNamespace(name='posix', P_PID=1, WEXITED=2, WNOWAIT=4, WNOHANG=8,
+                                        killpg=lambda group, sig: events.append(('killpg', group, sig)))
+
+                class Waitid:
+                    def __call__(self, idtype, child_pid, info, flags):
+                        events.append(('observe', idtype, child_pid, flags))
+                        status = ctypes.cast(info, getattr(self, 'argtypes')[2]).contents
+                        status.si_pid = child_pid
+                        status.si_status = exit_status
+                        return 0
+
+                class Child:
+                    def __init__(self):
+                        self.pid = pid
+                        self.args = ['synthetic']
+                        self.stdout = io.BytesIO(b'@urgency:board\n@urgency:detail\n[]\n')
+
+                    def wait(self, timeout):
+                        events.append(('reap', self.pid))
+                        return exit_status
+
+                child = Child()
+                def popen(argv, **kwargs):
+                    self.assertEqual(argv, ['synthetic'])
+                    self.assertTrue(kwargs['start_new_session'])
+                    return child
+
+                def load(name, **kwargs):
+                    self.assertIsNone(name)
+                    self.assertEqual(kwargs, {'use_errno': True})
+                    events.append(('load',))
+                    return SimpleNamespace(waitid=Waitid())
+
+                fake_subprocess = SimpleNamespace(Popen=popen, DEVNULL=subprocess.DEVNULL,
+                                                  PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired)
+                kill_signal = 9  # Darwin SIGKILL; Windows does not expose signal.SIGKILL.
+                with patch.object(_snapshot_process, 'sys', SimpleNamespace(platform='darwin')), \
+                     patch.object(_snapshot_process, 'signal', SimpleNamespace(SIGKILL=kill_signal)), \
+                     patch.object(_snapshot_process, 'os', posix), \
+                     patch.object(_snapshot_process, 'subprocess', fake_subprocess), \
+                     patch.object(_snapshot_process, '_waitid', None), \
+                     patch.object(_snapshot_process, '_darwin_waitid', _snapshot_process._darwin_waitid.__wrapped__), \
+                     patch.object(ctypes, 'CDLL', load):
+                    if exit_status:
+                        with self.assertRaises(LedgerError) as caught:
+                            kanban.read_process(['synthetic'], timeout=3, snapshot_phases=True)
+                        self.assertEqual((caught.exception.code, caught.exception.field),
+                                         ('SOURCE_DENIED', 'transport'))
+                    else:
+                        self.assertEqual(kanban.read_process(['synthetic'], timeout=3, snapshot_phases=True), [])
+                self.assertEqual(events, [('load',), ('observe', posix.P_PID, pid,
+                                                     posix.WEXITED | posix.WNOWAIT | posix.WNOHANG),
+                                          ('killpg', pid, kill_signal), ('reap', pid)])
+
+    def test_success_cleans_up_descendant_with_no_inherited_stdout(self):
+        import os
+        from pathlib import Path
+        import sys
+        import tempfile
+        import time
+        from unittest.mock import patch
+        from urgency_engine import _snapshot_process
+
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'escaped'
+            descendant = ('import time; from pathlib import Path; time.sleep(2.5); '
+                          f'Path({str(marker)!r}).touch()')
+            script = ('import subprocess, sys; '
+                      f'subprocess.Popen([sys.executable, "-c", {descendant!r}], '
+                      'stdout=subprocess.DEVNULL); '
+                      'print("@urgency:board\\n@urgency:detail\\n[]")')
+            original_reap = _snapshot_process._reap
+
+            def reap(child):
+                if os.name == 'posix':
+                    self.assertIsNone(child.returncode, 'POSIX leader reaped before group cleanup')
+                original_reap(child)
+
+            start = time.monotonic()
+            with patch.object(_snapshot_process, '_reap', reap):
+                self.assertEqual(kanban.read_process([sys.executable, '-c', script],
+                                                    timeout=3, snapshot_phases=True), [])
+            # gstack-timing-ok: allow a leaked child time to write its sentinel.
+            time.sleep(max(0, start + 3 - time.monotonic()))
+            self.assertFalse(marker.exists())
+
+    def test_stdout_eof_does_not_replace_exit_validation(self):
+        import sys
+
+        markers = 'print("@urgency:board\\n@urgency:detail\\n[]", flush=True); '
+        for tail, expected in (
+            ('raise SystemExit(7)', ('SOURCE_DENIED', 'transport')),
+            ('import os, time; os.close(1); time.sleep(10)', ('SOURCE_TIMEOUT', 'detail')),
+        ):
+            with self.subTest(tail=tail), self.assertRaises(kanban.LedgerError) as caught:
+                kanban.read_process([sys.executable, '-c', markers + tail],
+                                    timeout=1, snapshot_phases=True)
+            self.assertEqual((caught.exception.code, caught.exception.field), expected)
+
     def test_native_adapter_validates_board_before_scoped_inventory(self):
         """protects=explicit existing board; fails_when=unknown board initialized;
         why_new=public CLI selection; seam=transport receipt; no_claim=real host run.
@@ -302,9 +414,10 @@ class TransportTests(unittest.TestCase):
         context.start()
         self.addCleanup(context.stop)
         calls = []
-        def run(argv):
+        def run(argv, **options):
             calls.append(argv)
             if 'snapshot' in argv:
+                self.assertEqual(options, {'snapshot_phases': True} if '--transport-phases' in argv else {})
                 return dict(ok=True, data=dict(task=dict(id='task'), parents=[]))
             return [{'slug': 'demo'}] if 'boards' in argv else []
         adapter = kanban.NativeSource(run)
@@ -316,6 +429,8 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         adapter.detail(BINDING, 'task')
         self.assertEqual(calls[-1][-5:], ['snapshot', '--board', 'demo', '--task', 'task'])
+        kanban.NativeSource(run, snapshot_phases=True).detail(BINDING, 'task')
+        self.assertEqual(calls[-1][-6:], ['snapshot', '--board', 'demo', '--task', 'task', '--transport-phases'])
 
     def test_transport_enforces_timeout_output_limit_and_json(self):
         """protects=owned subprocess bounds; fails_when=hang or output accepted;
@@ -331,6 +446,59 @@ class TransportTests(unittest.TestCase):
             with self.subTest(code=code), self.assertRaises(LedgerError) as caught:
                 kanban.read_process([sys.executable, '-c', source], **options)
             self.assertEqual(caught.exception.code, code)
+
+    def test_snapshot_startup_and_board_validation_have_separate_deadlines(self):
+        """Two independently responsive phases must not share a child deadline."""
+        import inspect
+        import sys
+        child = ('import time; time.sleep(.65); print("@urgency:board", flush=True); '
+                 'time.sleep(.65); print("@urgency:detail", flush=True); print("[]")')
+        options = {'snapshot_phases': True} if 'snapshot_phases' in inspect.signature(kanban.read_process).parameters else {}
+        self.assertEqual(kanban.read_process([sys.executable, '-c', child], timeout=1.1,
+                                              **options), [])
+
+    def test_snapshot_phase_refusals_do_not_renew_deadlines_or_return_payload(self):
+        import sys
+        markers = 'print("@urgency:board", flush=True); print("@urgency:detail", flush=True); '
+        for script, code, field in (
+            ('import time; time.sleep(5)', 'SOURCE_TIMEOUT', 'startup'),
+            ('print("@urgency:board", flush=True); import time; time.sleep(5)', 'SOURCE_TIMEOUT', 'board'),
+            (markers + 'import time; time.sleep(5)', 'SOURCE_TIMEOUT', 'detail'),
+            ('print("@urgency:board\\n@urgency:board", flush=True)', 'SOURCE_MALFORMED', 'board'),
+            (markers + 'print("x"*4096)', 'SOURCE_LIMIT', 'output'),
+            (markers + 'print("[]"); raise SystemExit(1)', 'SOURCE_DENIED', 'transport'),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(LedgerError) as caught:
+                    kanban.read_process([sys.executable, '-c', script], timeout=1.0, limit=512,
+                                        snapshot_phases=True)
+                self.assertEqual((caught.exception.code, caught.exception.field), (code, field))
+
+    def test_snapshot_timeout_cleans_up_descendant_holding_stdout(self):
+        """An exited parent does not make an inherited pipe safe to close."""
+        import inspect
+        from pathlib import Path
+        import sys
+        import tempfile
+        import time
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'descendant'
+            code = ('import time; from pathlib import Path; time.sleep(2.5); '
+                    f'Path({str(marker)!r}).write_text("escaped")')
+            child = ('import subprocess, sys; '
+                     f'subprocess.Popen([sys.executable, "-c", {code!r}]); '
+                     'print("@urgency:board", flush=True)')
+            options = {'snapshot_phases': True} if 'snapshot_phases' in inspect.signature(kanban.read_process).parameters else {}
+            start = time.monotonic()
+            with self.assertRaises(LedgerError) as caught:
+                kanban.read_process([sys.executable, '-c', child], timeout=.5, **options)
+            self.assertEqual(caught.exception.code, 'SOURCE_TIMEOUT')
+            elapsed = time.monotonic() - start
+            time.sleep(max(0, start + 3 - time.monotonic()))
+            self.assertFalse(marker.exists())
+            self.assertEqual(caught.exception.field, 'board')
+            # gstack-timing-ok: bound the real inherited-pipe drain, not the child sleep.
+            self.assertLess(elapsed, 2)
 
 
 class ProjectionTests(unittest.TestCase):

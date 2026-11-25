@@ -57,6 +57,51 @@ class ReconciliationTests(unittest.TestCase):
         # 100 detail reads consume the scanner's 20-second collection window.
         return patch.object(kanban, 'monotonic', lambda: self.source.calls / 5)
 
+    def test_detail_timeout_retains_confirmed_prefix_for_same_request_restart(self):
+        self.source.rows = [dict(id=f'task-{index}', tenant='synthetic') for index in range(3)]
+        detail = self.source.detail
+
+        def stop_at_second(binding, task_id):
+            if task_id == 'task-1':
+                raise LedgerError('SOURCE_TIMEOUT', 'kanban', 'board')
+            return detail(binding, task_id)
+
+        with patch.object(self.source, 'detail', side_effect=stop_at_second):
+            with self.assertRaises(LedgerError) as caught:
+                self.scan()
+        self.assertEqual(caught.exception.code, 'SOURCE_TIMEOUT')
+        self.assertEqual(caught.exception.side_effects, 'unknown')
+        self.assertEqual(self.sync.meta('cursor'), ['demo', 'synthetic', 'task-0'])
+        first = self.ledger.get_task('demo', 'task-0')
+        self.assertEqual([item['task_id'] for item in self.sync.page('project')['items']], ['task-0'])
+        self.sync.db.close()
+        self.sync.db = sqlite3.connect(self.root / 'kanban.db')
+        self.addCleanup(self.sync.db.close)
+        self.sync.db.row_factory = sqlite3.Row
+        self.assertEqual(self.scan(), dict(state='complete', count=2))
+        self.assertIsNone(self.sync.meta('cursor'))
+        self.assertEqual(self.ledger.get_task('demo', 'task-0')['revision'], first['revision'])
+        self.assertEqual(self.source.calls, 3)
+
+    def test_incomplete_inventory_does_not_record_absence(self):
+        self.scan('seed')
+        self.ledger.create_project('other', 'Other', request_id='other', actor='test')
+        self.cfg['kanban_bindings'].append(dict(board='second', tenant='scope', project_id='other'))
+
+        def inventory(binding):
+            if binding['board'] == 'demo':
+                return []
+            raise LedgerError('SOURCE_TIMEOUT', 'kanban', 'transport')
+
+        with patch.object(self.source, 'inventory', side_effect=inventory), \
+             patch.object(self.sync, 'mark_unknown', wraps=self.sync.mark_unknown) as unknown:
+            with self.assertRaises(LedgerError) as caught:
+                self.scan('interrupted')
+        self.assertEqual(caught.exception.code, 'SOURCE_TIMEOUT')
+        unknown.assert_not_called()
+        self.assertIsNone(self.sync.meta('cursor'))
+        self.assertEqual([item['task_id'] for item in self.sync.page('project')['items']], ['task'])
+
     def test_dependency_changes_authoritative_milestone_forecast_only_with_parallel_capacity(self):
         """protects=authoritative ETA/slack/commitments; fails_when=edges affect only the bound;
         no_claim=live slots, native rendering or empirical calibration.
