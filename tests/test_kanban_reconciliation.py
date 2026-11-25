@@ -603,6 +603,21 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(self.ledger.connection.execute(audit).fetchone()[0], audits)
         self.assertEqual(self.sync.page('project')['items'][0]['worker']['heartbeat_at'], kanban.timestamp(210))
 
+    def test_finished_request_receipts_are_bounded_without_touching_pending_or_control(self):
+        """protects=unattended scans keep running; fails_when=finished scan IDs exhaust the request cap;
+        why_new=fresh background scan IDs; seam=real store with synthetic receipts; no_claim=disk quota.
+        """
+        self.sync.control('pause', 'original', 'Fixture')
+        self.sync.db.executemany('INSERT INTO sync_requests VALUES(?,?,?,?)',
+            [(f'done{i}', 'digest', 'scan_complete', '{}') for i in range(49990)]
+            + [(f'pending{i}', 'digest', 'pending', '{}') for i in range(10)])
+        self.sync.db.commit()
+        self.assertFalse(self.sync.control('resume', 'resume', 'Fixture')['paused'])
+        states = dict(self.sync.db.execute('SELECT state,count(*) FROM sync_requests GROUP BY state').fetchall())
+        self.assertEqual(states, dict(scan_complete=10000, pending=10, control=2))
+        self.assertTrue(self.sync.control('pause', 'original', 'Fixture')['paused'])
+        self.assertIsNotNone(self.sync.db.execute("SELECT 1 FROM sync_requests WHERE request_id='done49989'").fetchone())
+
     def test_replay_capacity_refuses_new_writes_without_pruning_old_requests(self):
         """protects=bounded durable replay; fails_when=capacity discards pending identities;
         why_new=protected storage ceiling; seam=real store; no_claim=unlimited operation history.

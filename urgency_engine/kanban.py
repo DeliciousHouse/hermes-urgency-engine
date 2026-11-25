@@ -315,7 +315,14 @@ class Sync:
             yield
             if write:
                 if self.db.execute('SELECT count(*) FROM sync_requests').fetchone()[0] > 50000:
-                    fail('requests_capacity', 'SOURCE_LIMIT')
+                    # Finished receipts are bounded replay history: keep the newest 10000.
+                    # Pending intents, control receipts and the current scan are never dropped.
+                    self.db.execute("DELETE FROM sync_requests WHERE rowid IN (SELECT rowid FROM sync_requests "
+                                    "WHERE state IN ('scan_complete','scan_pending','applied','cancelled') "
+                                    "AND request_id IS NOT ? ORDER BY rowid DESC LIMIT -1 OFFSET 10000)",
+                                    (self.meta('incomplete_scan'),))
+                    if self.db.execute('SELECT count(*) FROM sync_requests').fetchone()[0] > 50000:
+                        fail('requests_capacity', 'SOURCE_LIMIT')
                 self.db.execute('DELETE FROM sync_events WHERE occurred_at < ?',
                                 ((self.clock() - timedelta(days=30)).isoformat(),))
                 self.db.execute('DELETE FROM sync_events WHERE sequence IN '
