@@ -28,7 +28,9 @@ hermes urgency --help
 hermes urgency diagnose
 ```
 
-The plugin has no additional Python dependencies. The native plugin is installed
+The plugin has no additional Python dependencies, and its `pyproject.toml` builds
+nothing for Hermes, so installing or enabling it in any number of profiles adds
+nothing to the shared Hermes environment. The native plugin is installed
 from the Git repository or source archive, not by `pip install`. The wheel supplies
 the Python library. The source archive includes the manifest and entry point.
 The local CLI requires the default `plugins.isolation: in_process` mode;
@@ -54,12 +56,28 @@ Tool argument names are `project_id`, `board_id`, `task_id`, `deadline_id`,
 `entity_type`, `entity_id`, `limit` and `after`, as applicable. `after` is a string
 for project pages and an integer for history. Unknown fields and operations fail.
 Status and history return `items`, `has_more` and `next`; pass `next` as `after`.
+History items carry the audit snapshots as decoded `before` and `after` objects
+(the Ledger API's `before_json`/`after_json` strings), so each value is redacted on its own.
 Before the ledger is initialized, status without a project filter and history
 return empty pages; scoped status, task and explain return `NOT_FOUND`.
 `diagnose` reports `storage: uninitialized` and `schema: 0`. Use
 `hermes urgency apply` to start recording data.
 `/urgency` uses shell-like quoting, never shell execution. `focus clear` reserves
 `clear`; use `default_project` for a project with that ID.
+
+In a Kanban worker or delegated-child process (the markers listed under
+[operator writes](#operator-writes)), `urgency_query` reads only the project the
+pre-turn hook selects for that session: its focus or `default_project`. `status`,
+`watchdog_incidents` and `watchdog_plans` default to that project. `kanban_tasks`
+requires an explicit `project_id` matching the selection. `task` and `explain`
+must belong to it, and `history` is limited to that project's own entity. A
+project read outside the selection, or with no project selected, is
+`SOURCE_DENIED` (field `project_id`). `diagnose`, `watchdog_health` and
+`kanban_health` do not read session focus and still work when it cannot be loaded.
+Elsewhere the tool reads every project in the profile. In-process cron
+and delegated sessions that share the operator's process are not distinguished.
+This scopes the tool only: the `hermes urgency` read commands stay open to any
+local process, including a worker with a terminal tool.
 
 Success is `{"ok":true,"data":...}`. Failure is `{"ok":false,"error":{...}}` with
 `code`, `operation`, `field`, `retryable`, `side_effects` (`none` or `unknown`) and
@@ -83,6 +101,11 @@ at most 256 KiB. `--json-file -` reads stdin with the same limit. Duplicate keys
 NaN/infinity, invalid Unicode, unknown fields and non-objects fail. The CLI stamps
 `actor="local-operator"` and, for deadline revisions, `intent="operator"`. Callers
 cannot override actor, intent, surface, profile, database or artifact root.
+Because every write carries operator attribution, `apply` returns `SOURCE_DENIED`
+(field `context`) in a worker context: a process whose environment carries
+`HERMES_KANBAN_TASK`, `HERMES_KANBAN_DB` or `HERMES_DELEGATED_CHILD_CONTEXT`, or a
+truthy `HERMES_CRON_SESSION` (an LLM cron run's terminal). Run it from your own
+shell instead, without `HERMES_KANBAN_DB` exported.
 
 The following fields are required; optional fields are listed separately. See
 [ledger contracts](ledger.md) for field types, length limits, revision rules,
@@ -154,9 +177,15 @@ journal setup. SQLite can still maintain WAL coordination files for an existing
 WAL ledger. The hook never snapshots
 forecasts, moves targets, changes criteria or grants credit.
 
-The hook labels objective/task text as untrusted data. It includes up to five
+The hook places its quoted values, one label and JSON value per line, between
+`BEGIN URGENCY DATA` and `END URGENCY DATA` lines and labels them untrusted data.
+Truncation keeps both delimiter lines and drops any guidance lines that do not
+fit in full, so the data block can be empty. The hook includes up to five
 active deadlines ordered by urgency descending, target ascending and ID; up to
-five tasks with criteria; and the recorded byte-evidence limitation. Missing
+five tasks with criteria; and the recorded byte-evidence limitation. A task goal
+that Kanban sync ever wrote is a card title that other agents can edit, so the
+hook replaces it with `"goal_omitted":"kanban_card_title"`, even after the binding
+is removed or an operator edits the task; `urgency_query task` still returns it on request. Missing
 blocker information stays unknown. Long guidance is explicitly truncated. The
 hook reads one size-limited snapshot of the atomically replaced focus file
 without taking the writer lock. It applies a 750 ms cooperative work budget and
@@ -166,8 +195,10 @@ the host's storage opener and retain its safe journaling policy. Ordinary
 queries run the integrity checks; the hook checks the schema without a full scan.
 
 These bounds trade detail for low latency. They are not a hard OS execution
-budget: filesystem or hardware failures can still delay a call. Redaction runs
-before injection. An unavailable ledger produces a short diagnostic and permits
+budget: filesystem or hardware failures can still delay a call. Every quoted
+string is redacted on its own before JSON encoding, so a credential on its own
+line inside a goal or criterion is still matched; if redaction is unavailable
+the hook returns no context. An unavailable ledger produces a short diagnostic and permits
 other work to continue. Hermes inserts the context into the current user turn;
 this plugin does not rewrite the system prompt. Deterministic tests verify text
 and dispatch, not whether a model follows the advice or delivers better work.

@@ -15,6 +15,13 @@ Track whether a task has enough time left for work, verification, and deployment
 - [Desktop routes, controls and scope](docs/desktop.md) · [Canonical Kanban synchronization](docs/kanban.md)
 - [No-agent watchdog](docs/watchdog.md) · [Supervised interventions](docs/interventions.md) · [Troubleshooting and safe recovery](docs/troubleshooting.md)
 
+## What it does on your machine
+
+- **Files and host state:** plugin state lives in the profile's `plugin-data/hermes-urgency-engine/` SQLite stores. Outside plugin data, `hermes urgency watchdog install` writes `scripts/hermes-urgency-engine-watchdog.py` into the Hermes home, and supervised priority changes write the target task's priority in host Kanban state. The plugin also reads outside plugin data: it checks for the `ESTOP` file that `hermes pause` writes, and reads byte evidence from a configured `artifact_root` directory.
+- **Background job:** the opt-in watchdog install writes host cron state by registering one no-agent Hermes cron job that runs every minute. `hermes urgency watchdog uninstall` removes the owned cron job and launcher. Nothing runs in the background until you install it, and the plugin installs no OS service.
+- **Child processes:** the launcher runs same-interpreter `hermes_cli.main plugins list --json` and `urgency watchdog tick` children. Opt-in Kanban sync and supervised priority changes run same-interpreter `hermes_cli.main kanban ...` children with bounded time and output. None of these are agents.
+- **Model context and network:** pre-turn guidance, which can include task and Kanban card text, enters the conversation and reaches your inference provider on a normal model turn. The plugin makes no third-party network calls and sends no telemetry. Desktop, remote cron delivery and the optional `scripts/gateway_liveness.py` probe (one request to `127.0.0.1`) use connections you configure. Details: [process and network boundaries](docs/architecture.md#process-and-network-boundaries).
+
 ## Know the limits
 
 A matching artifact hash is evidence of bytes, not independent acceptance. Bound project and milestone forecasts use fresh canonical dependencies and [operator-declared execution capacity](docs/ledger.md#how-to-configure-a-synced-commitment-forecast); the dependency-only lower bound remains a separate diagnostic. The watchdog records incidents and recommends next steps; it does not perform autonomous recovery. Supported supervised actions are bounded to priority, remaining-work estimates, and soft-target revisions. External task-system integrations such as GitHub Issues and YouTrack are not included.

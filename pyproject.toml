@@ -1,7 +1,6 @@
-[build-system]
-requires = ["setuptools==82.0.1"]
-build-backend = "setuptools.build_meta"
-
+# No [build-system] table on purpose: Hermes treats a pyproject that builds and installs
+# nothing as no dependency declaration, so the native plugin never joins the shared
+# environment. `pip install .` still builds the library with the default setuptools backend.
 [project]
 name = "hermes-urgency-engine"
 version = "0.1.0"
@@ -12,4 +11,4 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 
 [tool.setuptools]
-packages = ["urgency_engine", "scripts"]
+packages = ["urgency_engine"]

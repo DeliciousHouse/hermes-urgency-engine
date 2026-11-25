@@ -4,7 +4,7 @@ Use the local Hermes CLI to act on an active watchdog plan. The watchdog still o
 
 ## Command and request reference
 
-Set `plugins.entries.hermes-urgency-engine.settings.intervention_mode` in Hermes settings. The default, `advisory`, refuses writes through this surface. `supervised` enables explicit local CLI requests; `autonomous` is recognized but does not authorize any write. Worker/delegated contexts cannot apply or control interventions. Set up an exact board, tenant and project [Kanban binding](kanban.md) and enable the [watchdog](watchdog.md) before applying an action.
+Set `plugins.entries.hermes-urgency-engine.settings.intervention_mode` in Hermes settings. The default, `advisory`, refuses writes through this surface. `supervised` enables explicit local CLI requests; `autonomous` is recognized but does not authorize any write. Worker, delegated and LLM cron contexts (see [operator writes](runtime.md#operator-writes)) cannot apply or control interventions. Set up an exact board, tenant and project [Kanban binding](kanban.md) and enable the [watchdog](watchdog.md) before applying an action.
 
 | `hermes urgency interventions …` | Result |
 | --- | --- |
@@ -41,6 +41,8 @@ Recovery creation needs more than a unique-looking title or a same-key retry. On
 1. Stop new effects with `hermes urgency interventions pause --request-id stop-1 --reason 'Inspect unknown priority'`. Switch mode back to `advisory` to stop applying through the surface independently of the pause flag.
 2. Run `hermes urgency interventions show ACTION_ID`. For an in-flight or unknown action, run `hermes urgency interventions reconcile ACTION_ID`, then inspect the result again. If it remains unknown, compare canonical state before deciding what action is still needed. Do not change the request ID to work around an uncertain write.
 3. Resume only by explicit operator choice: `hermes urgency interventions resume --request-id resume-1 --reason 'Inspection finished'`. Resume does not modify prior actions.
+
+At admission, intervention applies and Desktop management commands check the Hermes emergency stop (`hermes pause`) and refuse with `PAUSED` (operation `host`) if it is engaged. A supervised intervention checks again just before its effect; a Desktop management command does not recheck before invoking the Ledger writer. Hermes publishes no pause predicate for plugins, so the plugin looks for the `ESTOP` file in the active profile home and in both the host and active profile fleet roots, resolved with the public `hermes_constants` helpers. Any file there counts, including an empty one. If the home cannot be resolved or a sentinel path cannot be checked, the pause check refuses the operation.
 
 On `REVISION_CONFLICT`, reload the task and commitment before deciding whether to submit a fresh request. On `SOURCE_UNAVAILABLE` for stale coverage, check [Kanban health](kanban.md) and refresh the configured scan. On a storage error, preserve `interventions.db` in the plugin data directory; do not remove it to clear pending requests. The store retains at most 10,000 actions and 50,000 events. Source rollback must preserve those records and must not perform compensating native edits or deletions.
 
