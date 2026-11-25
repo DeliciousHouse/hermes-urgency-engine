@@ -903,10 +903,14 @@ class Runtime:
         if len(found) > 1 or (found and not exact(found[0])):
             conflict('job')
         def owned():
-            # The launcher this release ships, or the one the receipt says was installed.
             data = script.read_bytes()
-            return data == content or bool(receipt and receipt.get('sha256')
-                                           and receipt['sha256'] == hashlib.sha256(data).hexdigest())
+            if data == content:
+                return True
+            digest = hashlib.sha256(data).hexdigest()
+            return bool(receipt and (
+                receipt.get('sha256') == digest
+                or (receipt.get('state') == 'installing' and receipt.get('previous_sha256') == digest)
+            ))
         def refresh():
             if script.read_bytes() != content:
                 temporary = script.with_name(script.name + '.tmp')
@@ -954,7 +958,11 @@ class Runtime:
                     conflict('pending_install')
                 if script.exists() and not current:
                     conflict('launcher_owner')
-                monitor.put('install', dict(state='installing', home=str(home), sha256=sha))
+                reservation = dict(state='installing', home=str(home), sha256=sha)
+                # A failed atomic replacement can leave the old launcher in place.
+                if current and current.get('sha256'):
+                    reservation['previous_sha256'] = current['sha256']
+                monitor.put('install', reservation)
             script.parent.mkdir(parents=True, exist_ok=True)
             if not script.exists():
                 with script.open('xb') as stream:
