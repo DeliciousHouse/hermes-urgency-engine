@@ -191,8 +191,8 @@ show fallback on denial or missing capability. **Native `kanban list` recomputes
 dependency readiness**; opting in accepts that normal native effect. Collection
 is therefore not described as side-effect-free, even though this adapter never
 writes board rows directly or bypasses worker fences. Cached conversational
-reads do not invoke that CLI. A worker/delegate or database-pinned invocation
-must explicitly identify the same board in `HERMES_KANBAN_BOARD`; mismatched or
+reads do not invoke that CLI. A worker/delegate or database-pinned `snapshot`, or
+a due scan inside `watchdog tick` in such a process, must explicitly identify the same board in `HERMES_KANBAN_BOARD`; mismatched or
 unidentified bindings return `SOURCE_DENIED`. The adapter retains native pins
 and never relabels redirected board rows as a different configured board.
 

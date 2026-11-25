@@ -70,6 +70,8 @@ own entity. Anything else, or any project read when no project is selected, is
 `SOURCE_DENIED` (field `project_id`). `diagnose` and the health reads stay
 available. Elsewhere the tool reads every project in the profile. In-process cron
 and delegated sessions that share the operator's process are not distinguished.
+This scopes the tool only: the `hermes urgency` read commands stay open to any
+local process, including a worker with a terminal tool.
 
 Success is `{"ok":true,"data":...}`. Failure is `{"ok":false,"error":{...}}` with
 `code`, `operation`, `field`, `retryable`, `side_effects` (`none` or `unknown`) and
@@ -97,7 +99,7 @@ Because every write carries operator attribution, `apply` returns `SOURCE_DENIED
 (field `context`) in a worker context: a process whose environment carries
 `HERMES_KANBAN_TASK`, `HERMES_KANBAN_DB` or `HERMES_DELEGATED_CHILD_CONTEXT`, or a
 truthy `HERMES_CRON_SESSION` (an LLM cron run's terminal). Run it from your own
-shell instead.
+shell instead, without `HERMES_KANBAN_DB` exported.
 
 The following fields are required; optional fields are listed separately. See
 [ledger contracts](ledger.md) for field types, length limits, revision rules,

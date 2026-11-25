@@ -91,8 +91,13 @@ class WorkerFenceTests(unittest.TestCase):
                 code, result = self.cli(*argv)
                 self.assertEqual((code, result['error']['code']), (1, 'SOURCE_DENIED'), argv)
             self.assertEqual(opened, [])
-            self.assertEqual(self.cli('watchdog', 'tick')[0], 0)
-            self.assertEqual(self.cli('watchdog', 'health')[0], 0)
+        self.ctx.settings['watchdog_enabled'] = True
+        with patch.object(Monitor, 'host', side_effect=monitor):
+            for marker in WORKERS:
+                with patch.dict(os.environ, dict(CLEAR, **marker)):
+                    self.assertEqual(self.cli('watchdog', 'tick', '--force')[0], 0, marker)
+                    self.assertEqual(self.cli('watchdog', 'health')[0], 0, marker)
+        self.assertEqual(len(opened), len(WORKERS))
 
     def tool(self, operation, session_id='s', **arguments):
         with patch.dict(os.environ, dict(CLEAR, **WORKERS[0])):
