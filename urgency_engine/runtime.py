@@ -6,17 +6,19 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shlex
 import sqlite3
 import sys
+import tempfile
 import time
 import traceback
 from typing import NoReturn
 import uuid
 
-from .ledger import Ledger, LedgerError, open_hermes_ledger, open_readonly_ledger
+from .ledger import Ledger, LedgerError, _make_dirs, _readonly_uri, open_hermes_ledger, open_readonly_ledger
 from .watchdog import Monitor, DEFAULTS as WATCHDOG_DEFAULTS, LIMITATIONS, settings as monitor_settings
 from .kanban import Sync, NativeSource, DEFAULTS as KANBAN_DEFAULTS, settings as kanban_settings
 from . import interventions
@@ -234,7 +236,11 @@ class Runtime:
                                   next_action='Set artifact_root to an existing absolute directory, or empty for plugin-owned artifacts.')
         else:
             root = self.data_dir() / 'artifacts'
-            root.mkdir(parents=True, exist_ok=True)
+            try:
+                _make_dirs(root)
+            except OSError:
+                raise LedgerError('STORAGE_FAILURE', 'open',
+                                  next_action='Select an existing Hermes profile; a deleted or renamed profile is not recreated.') from None
         return self.opener(clock=self.clock, artifact_root=root)
 
     @staticmethod
@@ -547,7 +553,7 @@ class Runtime:
         path = self.data_dir() / 'kanban.db'
         if not path.exists():
             invalid('coverage', 'SOURCE_UNAVAILABLE')
-        db = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=.1)
+        db = sqlite3.connect(_readonly_uri(path), uri=True, timeout=.1)
         with Sync(db, clock=self.clock, redact=str, readonly=True) as sync:
             if not sync.action_scope(binding, key[1], source, cfg['kanban_sync_seconds']):
                 invalid('coverage', 'SOURCE_UNAVAILABLE')
@@ -652,7 +658,7 @@ class Runtime:
                 capacity = self.ctx.get_config('forecast_capacity', {})
                 path = self.data_dir() / 'kanban.db'
                 if path.exists():
-                    connection = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=.1)
+                    connection = sqlite3.connect(_readonly_uri(path), uri=True, timeout=.1)
                     if deadline is not None:
                         connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
                     sync = Sync(connection, clock=self.clock, redact=None, readonly=True)
@@ -796,7 +802,7 @@ class Runtime:
         if not path.exists():
             return (dict(storage='uninitialized', enabled=cfg['kanban_sync_enabled'], coverage='unknown')
                     if operation == 'health' else dict(items=[], next=None, has_more=False))
-        connection = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=.1)
+        connection = sqlite3.connect(_readonly_uri(path), uri=True, timeout=.1)
         if deadline is not None:
             connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
         with Sync(connection, clock=self.clock, redact=lambda text: self.ctx.redact_text(text, force=True), readonly=True) as sync:
@@ -913,7 +919,8 @@ class Runtime:
     def monitor_install(self, monitor, operation, deliver):
         from hermes_constants import get_hermes_home
         home = get_hermes_home().resolve()
-        script = home / 'scripts' / 'hermes-urgency-engine-watchdog.py'
+        # The host resolves a symlinked or junctioned scripts directory; compare like with like.
+        script = (home / 'scripts').resolve() / 'hermes-urgency-engine-watchdog.py'
         content = (Path(__file__).resolve().parent.parent / 'scripts' / 'watchdog.py').read_bytes()
         sha = hashlib.sha256(content).hexdigest()
         if not isinstance(deliver, str) or not deliver or len(deliver) > 256 or any(ord(c) < 32 for c in deliver):
@@ -933,7 +940,23 @@ class Runtime:
         receipt = monitor.meta('install')
         if len(found) > 1 or (found and not exact(found[0])):
             conflict('job')
-        if script.is_symlink() or (script.exists() and script.read_bytes() != content):
+        def owned():
+            data = script.read_bytes()
+            if data == content:
+                return True
+            digest = hashlib.sha256(data).hexdigest()
+            return bool(receipt and (
+                receipt.get('sha256') == digest
+                or (receipt.get('state') == 'installing' and receipt.get('previous_sha256') == digest)
+            ))
+        def refresh():
+            if script.read_bytes() != content:
+                with tempfile.TemporaryDirectory(dir=script.parent) as directory:
+                    temporary = Path(directory) / script.name
+                    with temporary.open('xb') as stream:
+                        stream.write(content)
+                    os.replace(temporary, script)
+        if script.is_symlink() or (script.exists() and not owned()):
             conflict('launcher')
         if receipt and receipt.get('home') != str(home):
             conflict('profile')
@@ -949,7 +972,7 @@ class Runtime:
                 if jobs():
                     conflict('remove_readback')
             if script.exists():
-                if script.read_bytes() != content:
+                if not owned():
                     conflict('launcher')
                 script.unlink()
             with monitor.transaction():
@@ -962,6 +985,7 @@ class Runtime:
                 conflict('ownership')
             if not script.exists():
                 conflict('launcher_missing')
+            refresh()
             job = found[0]
         else:
             # Reserve before external work. Unknown create outcomes are reconciled,
@@ -972,11 +996,17 @@ class Runtime:
                     conflict('pending_install')
                 if script.exists() and not current:
                     conflict('launcher_owner')
-                monitor.put('install', dict(state='installing', home=str(home), sha256=sha))
+                reservation = dict(state='installing', home=str(home), sha256=sha)
+                # A failed atomic replacement can leave the old launcher in place.
+                if current and current.get('sha256'):
+                    reservation['previous_sha256'] = current['sha256']
+                monitor.put('install', reservation)
             script.parent.mkdir(parents=True, exist_ok=True)
             if not script.exists():
                 with script.open('xb') as stream:
                     stream.write(content)
+            else:
+                refresh()
             result = self.cron('create', schedule='every 1m', name='hermes-urgency-engine-watchdog',
                                script=script.name, no_agent=True, deliver=deliver, enabled_toolsets=[])
             found = jobs()

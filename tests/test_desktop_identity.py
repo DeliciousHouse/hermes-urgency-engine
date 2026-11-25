@@ -26,6 +26,21 @@ class IdentityTests(unittest.TestCase):
             other = Path(directory) / 'other' / 'desktop.db'
             self.assertNotEqual(desktop.scope_identity(other, initialize=True), identities[0])
 
+    def test_initialize_does_not_recreate_a_deleted_profile(self):
+        import sys
+        import types
+        from unittest.mock import patch
+        constants = types.ModuleType('hermes_constants')
+        def refuse(path):
+            raise FileNotFoundError('Named profile home does not exist')
+        constants.mkdir_under_hermes_home = refuse
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'profiles' / 'gone' / 'plugin-data' / 'hermes-urgency-engine' / 'desktop.db'
+            with patch.dict(sys.modules, {'hermes_constants': constants}), self.assertRaises(LedgerError) as caught:
+                desktop.scope_identity(path, initialize=True)
+            self.assertEqual((caught.exception.code, caught.exception.side_effects), ('STORAGE_FAILURE', 'none'))
+            self.assertFalse((Path(directory) / 'profiles').exists())
+
     def test_invalid_identity_is_not_silently_replaced(self):
         import sqlite3
         with tempfile.TemporaryDirectory() as directory:
