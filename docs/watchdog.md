@@ -94,7 +94,41 @@ The native `post_tool_call` observer recognizes structured `ok`/`success` boolea
 and errors; ambiguous output is unknown. It never stores tool arguments, results,
 prompts or exception text. Host session identity is not a Kanban task ID.
 Optional [Kanban synchronization](kanban.md) admits canonical worker/dependency
-facts on the existing tick. Lifecycle hooks only mark dirty bindings; missing
+facts on the existing tick.
+
+Tick timing: the owned launcher allows `plugins list` 60 seconds and the tick
+180 seconds, because one Hermes CLI start can take 20 seconds on Windows. It
+passes the tick a wall-clock cutoff 40 seconds before its own timeout
+(`URGENCY_ENGINE_TICK_DEADLINE`). The tick caps native Kanban collection waits
+at 100 seconds or the time remaining to that cutoff, whichever is shorter.
+That limit is not a deadline for sync completion: child cleanup, flushing
+validated work and recording incomplete graph coverage can follow it. If the
+cutoff stops detail collection, the scan can return `partial` after that work. An
+inventory timeout is a `SOURCE_TIMEOUT` error, not a partial result. A
+`SOURCE_*` failure is recorded and does not stop the tick from calling the
+monitor's detector pass. The pass still observes its normal
+[scan limits](#storage-and-bounds): task detectors run first, so missed
+checkpoints and other task incidents can use up the shared 100-transition
+budget and leave project deadlines unprocessed in that tick. Other sync
+errors, such as `STORE_BUSY` while an operator sync holds the scan lock, still
+fail that tick.
+
+Without a deadline (a tick run by hand, or a launcher installed by an earlier
+release, which kills the tick after 35 seconds), native collection waits use
+an 8-second budget to leave time for cleanup, flushing and the detector pass.
+This is not a guarantee that the tick finishes in 35 seconds. On a
+slow host that is usually too short for inventory: the tick records
+`SOURCE_TIMEOUT` and calls the same bounded detector pass without sync progress.
+The earlier launcher also gives `plugins list` only 20 seconds. After upgrading,
+run `hermes urgency watchdog install` once: it keeps the existing job and
+replaces the launcher if its bytes still match the install receipt. An edited
+launcher is never replaced and returns `INSTALL_CONFLICT`.
+
+With a 20-second CLI start, the 100-second collection budget can cover inventory
+for one binding and at least one detail. With several bindings, inventory alone
+can exhaust it before the scan reaches detail collection.
+
+Lifecycle hooks only mark dirty bindings; missing
 worker/dependency telemetry stays unknown. Explicit availability/dependency
 facts retain their own observation time; unrelated telemetry does not refresh it.
 Compact admitted evidence watermarks survive raw-event pruning. Retention expiry
@@ -269,7 +303,8 @@ credentials. No delivery acknowledgement or exactly-once guarantee is claimed.
    a new `request_id` or `occurred_at`.
 4. Pause with `hermes urgency watchdog pause --request-id pause-1 --reason maintenance`.
    Resume with `hermes urgency watchdog resume --request-id resume-1 --reason ready`.
-5. Run `hermes urgency watchdog uninstall` before disabling/removing the plugin.
+5. Run `hermes urgency watchdog uninstall` before disabling or removing the plugin. After an upgrade,
+   run `hermes urgency watchdog install` to refresh the owned launcher.
    An already-installed launcher also exits quietly if the plugin is disabled/removed.
 
 Troubleshooting: `STORE_BUSY` permits a bounded retry after the other writer ends.

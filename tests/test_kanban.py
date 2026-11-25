@@ -500,6 +500,52 @@ class TransportTests(unittest.TestCase):
             # gstack-timing-ok: bound the real inherited-pipe drain, not the child sleep.
             self.assertLess(elapsed, 2)
 
+    def test_plain_transport_owns_descendant_holding_stdout(self):
+        """Inventory and edit reads must not wait on, or leak, a pipe-holding descendant."""
+        from pathlib import Path
+        import sys
+        import tempfile
+        import time
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'descendant'
+            code = ('import time; from pathlib import Path; time.sleep(2.5); '
+                    f'Path({str(marker)!r}).write_text("escaped")')
+            child = ('import subprocess, sys; '
+                     f'subprocess.Popen([sys.executable, "-c", {code!r}]); print("[]", flush=True)')
+            start = time.monotonic()
+            with self.assertRaises(LedgerError) as caught:
+                kanban.read_process([sys.executable, '-c', child], timeout=.5)
+            elapsed = time.monotonic() - start
+            time.sleep(max(0, start + 3 - time.monotonic()))
+            self.assertEqual((caught.exception.code, caught.exception.field), ('SOURCE_TIMEOUT', 'transport'))
+            self.assertFalse(marker.exists())
+            # gstack-timing-ok: bound the real inherited-pipe drain, not the child sleep.
+            self.assertLess(elapsed, 2)
+
+    def test_caller_deadline_caps_every_child_phase(self):
+        """A tick budget must end a read that per-phase timeouts would keep renewing."""
+        import sys
+        import time
+        board = 'print("@urgency:board", flush=True); '
+        for script, options, field in (
+            ('import time; time.sleep(5)', {}, 'transport'),
+            (board + 'import time; time.sleep(5)', {'snapshot_phases': True}, 'board'),
+        ):
+            with self.subTest(field=field):
+                start = time.monotonic()
+                with self.assertRaises(LedgerError) as caught:
+                    kanban.read_process([sys.executable, '-c', script], timeout=20,
+                                        deadline=start + 1, **options)
+                self.assertEqual((caught.exception.code, caught.exception.field), ('SOURCE_TIMEOUT', field))
+                # gstack-timing-ok: the deadline, not the 20 s timeout, ends the read.
+                self.assertLess(time.monotonic() - start, 4)
+        start = time.monotonic()
+        with self.assertRaises(LedgerError) as caught:
+            kanban.read_process([sys.executable, '-c', 'print("[]")'], deadline=start)
+        self.assertEqual(caught.exception.code, 'SOURCE_TIMEOUT')
+        # gstack-timing-ok: an expired deadline starts no child at all.
+        self.assertLess(time.monotonic() - start, .5)
+
 
 class ProjectionTests(unittest.TestCase):
     def test_configuration_is_explicit_bounded_and_disjoint(self):

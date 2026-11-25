@@ -119,7 +119,12 @@ owned snapshot process gives startup, nested board validation, and public-tool
 detail (including output drain) up to 20 seconds each, plus bounded cleanup.
 This avoids charging two independent CLI startups to one deadline. The 16 MiB
 stdout cap still applies. The collection window gates the next detail launch;
-it does not cancel one already admitted. Inventories cap at 10000 tasks, each task
+it does not cancel one already admitted. A watchdog tick adds a shared native
+collection cutoff (see [tick timing](watchdog.md)). It caps child and phase
+waits and prevents new detail reads, even the first one. If the cutoff stops
+detail collection, the scan can flush validated work and return `partial`
+after the cutoff. An inventory timeout is a `SOURCE_TIMEOUT` error.
+Operator `kanban sync` has no shared collection cutoff. Inventories cap at 10000 tasks, each task
 at 1000 parents, and admitted graphs at 50000 edges. A partial traversal revokes
 previous complete graph coverage until the tail is read and every selected
 projection is within the configured freshness interval. A slow multi-page scan
@@ -217,12 +222,16 @@ The adapter uses public native CLI inventory and its registered snapshot CLI
 for detail. The child initializes built-in tools and calls the documented
 `ctx.dispatch_tool` API for `kanban_show`; it never reads board SQL or invokes
 a private handler. Parent sync/tick retains the same interpreter and profile.
-The scan's timeout cleanup terminates the owned snapshot tree, including its
-nested board-check process. On POSIX, the scan signals the owned process group
+Every native CLI call (board discovery, inventory, snapshot detail and the
+priority intervention's `edit`) runs as an owned process tree: a Windows job
+object that kills on close, or a new POSIX session. When the call returns or
+times out, the whole tree is terminated, including the snapshot's nested
+board-check process and any descendant that inherited stdout. A descendant
+holding stdout open therefore ends in `SOURCE_TIMEOUT` within the call's
+timeout; it cannot stall the caller. On POSIX, the scan signals the owned process group
 before reaping its leader, including on macOS with Python 3.11 or 3.12.
 There is no weaker CLI `show` fallback on denial
-or missing capability. Standalone snapshot and priority intervention transport
-are unchanged. **Native `kanban list` recomputes
+or missing capability. **Native `kanban list` recomputes
 dependency readiness**; opting in accepts that normal native effect. Collection
 is therefore not described as side-effect-free, even though this adapter never
 writes board rows directly or bypasses worker fences. Cached conversational

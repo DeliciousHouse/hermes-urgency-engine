@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
@@ -20,12 +21,29 @@ import uuid
 
 from .ledger import Ledger, LedgerError, _make_dirs, _readonly_uri, open_hermes_ledger, open_readonly_ledger
 from .watchdog import Monitor, DEFAULTS as WATCHDOG_DEFAULTS, LIMITATIONS, settings as monitor_settings
-from .kanban import Sync, NativeSource, DEFAULTS as KANBAN_DEFAULTS, settings as kanban_settings
+from .kanban import Sync, NativeSource, read_process, DEFAULTS as KANBAN_DEFAULTS, settings as kanban_settings
 from . import interventions
 
 
 PLUGIN_ID = 'hermes-urgency-engine'
 MAX_INPUT_BYTES = 256 * 1024
+# Inventory and one detail are four cold CLI starts; 20 s each was measured on Windows.
+TICK_SOURCE_SECONDS = 100
+# Without a launcher deadline (a launcher from an earlier release, which kills the
+# tick at 35 s, or a hand run): 20 s tick start + 8 s sync + 4 s child reaping
+# leaves time to flush and evaluate deadlines.
+LEGACY_TICK_SOURCE_SECONDS = 8
+
+
+def tick_source_budget():
+    """Seconds a tick's source sync may use, cut to the launcher's wall-clock deadline."""
+    import math
+    import os
+    try:
+        left = float(os.environ['URGENCY_ENGINE_TICK_DEADLINE']) - time.time()
+    except (KeyError, ValueError):
+        return LEGACY_TICK_SOURCE_SECONDS
+    return max(0.0, min(TICK_SOURCE_SECONDS, left)) if math.isfinite(left) else LEGACY_TICK_SOURCE_SECONDS
 EVIDENCE = {'evidence_kind': 'artifact_byte_identity',
             'limitation': 'Matching bytes is not independent semantic quality acceptance.',
             'confidence': 'insufficient_evidence'}
@@ -883,6 +901,9 @@ class Runtime:
         return 0 if ok else 1
 
     def due_source_sync(self, monitor):
+        # One budget for the whole sync, so the tick flushes and still evaluates
+        # deadlines before the launcher's timeout kills it.
+        deadline = time.monotonic() + tick_source_budget()
         cfg = self.kanban_config()
         if not cfg['kanban_sync_enabled'] or (not cfg['kanban_bindings'] and not (self.data_dir() / 'kanban.db').exists()):
             return None
@@ -897,8 +918,9 @@ class Runtime:
                 sync.put('last_attempt', self.clock().isoformat())
             with self.open(self.settings()) as ledger:
                 try:
-                    sync.scan(cfg, ledger, monitor, self.data_dir() / 'data.db', NativeSource(snapshot_phases=True),
-                              request_id=uuid.uuid4().hex, reason='Existing watchdog tick')
+                    source = NativeSource(functools.partial(read_process, deadline=deadline), snapshot_phases=True)
+                    sync.scan(cfg, ledger, monitor, self.data_dir() / 'data.db', source,
+                              request_id=uuid.uuid4().hex, reason='Existing watchdog tick', deadline=deadline)
                 except LedgerError as exc:
                     if (exc.code not in ('SCOPE_CONFLICT', 'REVISION_CONFLICT', 'CAPACITY_EXCEEDED')
                             and not exc.code.startswith('SOURCE_') and exc.field != 'tasks_capacity'):
@@ -941,6 +963,7 @@ class Runtime:
                     and (home / 'scripts' / job['script']).resolve() == script and job.get('name') == 'hermes-urgency-engine-watchdog')
         found = jobs()
         receipt = monitor.meta('install')
+
         if len(found) > 1 or (found and not exact(found[0])):
             conflict('job')
         def owned():
@@ -983,6 +1006,7 @@ class Runtime:
                 monitor.put('paused', True)
                 monitor.audit(uuid.uuid4().hex, 'uninstall', ['uninstall'], {'state': 'uninstalled'})
             return {'state': 'uninstalled', 'retained_data': True}
+
         if found:
             if not receipt or (receipt.get('job_id') and receipt['job_id'] != found[0]['job_id']):
                 conflict('ownership')
@@ -993,6 +1017,9 @@ class Runtime:
         else:
             # Reserve before external work. Unknown create outcomes are reconciled,
             # never blindly repeated; no external call runs under a DB write lock.
+            # A stale owned launcher is refreshed while the receipt still names it.
+            if script.exists() and receipt and receipt.get('state') != 'installing':
+                refresh()
             with monitor.transaction():
                 current = monitor.meta('install')
                 if current and current.get('state') == 'installing':

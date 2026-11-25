@@ -675,6 +675,174 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(health['last_result']['state'], 'partial')
         self.assertIsNone(health['last_success'])
 
+    def test_tick_stops_source_sync_at_launcher_deadline_and_still_evaluates(self):
+        """protects=launcher budget; fails_when=a slow sync outlives the launcher timeout;
+        why_new=tick wall-clock deadline; seam=real stores/faulted native boundary;
+        no_claim=real Hermes cold starts.
+        """
+        import os
+        import time
+        from datetime import timedelta
+        from unittest.mock import patch
+        from urgency_engine import runtime as runtime_module
+        from urgency_engine.kanban import Sync, NativeSource
+        from urgency_engine.ledger import LedgerError
+        from urgency_engine.watchdog import Monitor
+        from test_kanban_reconciliation import Source
+        self.project()
+        self.ctx.settings.update(watchdog_enabled=True, kanban_sync_enabled=True,
+            kanban_bindings=[dict(board='demo', tenant='synthetic', project_id='p')])
+        with self.runtime.open(self.runtime.settings()) as ledger:
+            ledger.set_deadline('due', project_id='p', kind='hard', at=self.now.isoformat(),
+                timezone='UTC', owner='fixture', source='fixture', request_id='due', actor='test')
+        self.now += timedelta(seconds=1)
+        source = Source()
+        stores = (patch.object(Sync, 'host', side_effect=lambda **kw: Sync(sqlite3.connect(self.root / 'kanban.db'), **kw)),
+                  patch.object(Monitor, 'host', side_effect=lambda **kw: Monitor.open(self.root / 'watchdog.db', **kw)))
+
+        def tick():
+            with stores[0], stores[1], redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                return self.runtime.cli(setup_parser(Parser()).parse_args(['watchdog', 'tick', '--force']))
+
+        def incidents():
+            with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now, readonly=True) as monitor:
+                return [item['detector'] for item in monitor.page('incidents')['items']]
+
+        with patch.dict(os.environ, {'URGENCY_ENGINE_TICK_DEADLINE': repr(time.time() - 1)}):
+            with patch.object(NativeSource, 'inventory', side_effect=source.inventory), \
+                 patch.object(NativeSource, 'detail', side_effect=source.detail):
+                self.assertEqual((tick(), source.calls), (0, 0))
+            self.assertEqual(runtime_module.tick_source_budget(), 0)
+        self.assertIn('expired_deadline', incidents())
+        self.assertEqual(self.runtime.kanban_read('health', {})['last_result']['state'], 'partial')
+
+        # The production transport receives the same deadline; never launch the real CLI here.
+        seen = []
+
+        def transport(argv, **options):
+            seen.append(options)
+            raise LedgerError('SOURCE_TIMEOUT', 'kanban', 'transport')
+
+        self.now += timedelta(seconds=61)
+        with patch.object(runtime_module, 'read_process', side_effect=transport):
+            self.assertEqual(tick(), 0)
+        self.assertEqual(len(seen), 1)
+        self.assertIsInstance(seen[0]['deadline'], float)
+        self.assertEqual(self.runtime.kanban_read('health', {})['last_error'], 'SOURCE_TIMEOUT')
+        self.assertIn('expired_deadline', incidents())
+        legacy = runtime_module.LEGACY_TICK_SOURCE_SECONDS
+        for value, budget in (('nan', legacy), ('junk', legacy), ('1e400', legacy),
+                              (repr(time.time() + 10 ** 6), runtime_module.TICK_SOURCE_SECONDS)):
+            with patch.dict(os.environ, {'URGENCY_ENGINE_TICK_DEADLINE': value}):
+                self.assertEqual(runtime_module.tick_source_budget(), budget)
+
+    def test_tick_without_launcher_deadline_fits_the_previous_launcher_timeout(self):
+        """A launcher from an earlier release kills the tick at 35 s and passes no deadline."""
+        import os
+        from unittest.mock import patch
+        from urgency_engine import runtime as runtime_module
+        from urgency_engine import _snapshot_process
+        env = {k: v for k, v in os.environ.items() if k != 'URGENCY_ENGINE_TICK_DEADLINE'}
+        with patch.dict(os.environ, env, clear=True):
+            budget = runtime_module.tick_source_budget()
+        cold_start, reaping, flush_and_evaluate = 20, _snapshot_process._REAP_TIMEOUT + 2, 3
+        self.assertLessEqual(cold_start + budget + reaping + flush_and_evaluate, 35)
+        self.assertGreater(budget, 0)
+
+    def test_launcher_timeout_covers_cold_start_budget_and_reserve(self):
+        """The launcher must outlast tick startup plus the sync budget and its flush."""
+        import importlib.util
+        import time
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from urgency_engine.runtime import TICK_SOURCE_SECONDS
+        path = Path(__file__).resolve().parents[1] / 'scripts' / 'watchdog.py'
+        spec = importlib.util.spec_from_file_location('urgency_launcher_fixture', path)
+        launcher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(launcher)
+        calls = []
+
+        def run(argv, **options):
+            calls.append((argv, options, time.time()))
+            if 'plugins' in argv:
+                return SimpleNamespace(returncode=0, stdout=json.dumps(
+                    [{'name': 'hermes-urgency-engine', 'status': 'enabled'}]))
+            return SimpleNamespace(returncode=0)
+
+        with patch.object(launcher.subprocess, 'run', side_effect=run):
+            self.assertEqual(launcher.main(), 0)
+        (listing, list_options, _), (tick, options, started) = calls
+        cold_start = 20  # measured worst Hermes CLI start on Windows
+        self.assertGreaterEqual(list_options['timeout'], 2 * cold_start)
+        self.assertEqual(tick[-3:], ['urgency', 'watchdog', 'tick'])
+        sync_until = float(options['env']['URGENCY_ENGINE_TICK_DEADLINE']) - started
+        self.assertGreaterEqual(sync_until, cold_start + TICK_SOURCE_SECONDS)
+        self.assertGreaterEqual(options['timeout'] - sync_until, 30)
+
+    def test_install_and_uninstall_take_over_a_launcher_from_an_earlier_release(self):
+        """protects=upgrade path; fails_when=a changed launcher locks out install/uninstall;
+        why_new=receipt hash ownership; seam=temp home, fake public cron; no_claim=real Hermes cron.
+        """
+        import hashlib
+        import sys
+        import types
+        from unittest.mock import patch
+        from urgency_engine.ledger import LedgerError
+        from urgency_engine.watchdog import Monitor
+        home = (self.root / 'home').resolve()
+        script = home / 'scripts' / 'hermes-urgency-engine-watchdog.py'
+        packaged = (Path(__file__).resolve().parents[1] / 'scripts' / 'watchdog.py').read_bytes()
+        previous = b'# launcher written by an earlier release\nraise SystemExit(0)\n'
+        jobs, calls = [], []
+
+        def cron(action, **arguments):
+            calls.append(action)
+            if action == 'create':
+                jobs.append(dict(arguments, job_id='job-%d' % len(calls)))
+                return {'success': True, 'job_id': jobs[-1]['job_id']}
+            if action == 'remove':
+                jobs[:] = [job for job in jobs if job['job_id'] != arguments['job_id']]
+            return {'success': True, 'jobs': [dict(job) for job in jobs]}
+
+        def earlier_release_install(monitor, launcher=previous):
+            script.parent.mkdir(parents=True, exist_ok=True)
+            script.write_bytes(launcher)
+            jobs[:] = [dict(job_id='job-old', name='hermes-urgency-engine-watchdog', script=script.name, no_agent=True)]
+            with monitor.transaction():
+                monitor.put('install', dict(state='installed', job_id='job-old', home=str(home),
+                                            sha256=hashlib.sha256(launcher).hexdigest(), script=str(script),
+                                            no_agent=True, deliver='local'))
+
+        fake_home = types.SimpleNamespace(get_hermes_home=lambda: home)
+        with patch.dict(sys.modules, {'hermes_constants': fake_home}), patch.object(self.runtime, 'cron', side_effect=cron), \
+             Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
+            earlier_release_install(monitor)
+            receipt = self.runtime.monitor_install(monitor, 'install', 'local')
+            self.assertEqual(script.read_bytes(), packaged)
+            self.assertEqual((receipt['job_id'], receipt['sha256']), ('job-old', hashlib.sha256(packaged).hexdigest()))
+            self.assertNotIn('create', calls)
+            self.assertEqual(sorted(p.name for p in script.parent.iterdir()), [script.name])
+
+            # The job is gone but the earlier launcher and receipt remain: refresh, then recreate.
+            earlier_release_install(monitor)
+            jobs.clear()
+            receipt = self.runtime.monitor_install(monitor, 'install', 'local')
+            self.assertEqual((script.read_bytes(), calls.count('create')), (packaged, 1))
+            self.assertEqual(receipt['sha256'], hashlib.sha256(packaged).hexdigest())
+
+            earlier_release_install(monitor)
+            self.assertEqual(self.runtime.monitor_install(monitor, 'uninstall', 'local')['state'], 'uninstalled')
+            self.assertEqual((jobs, script.exists()), ([], False))
+
+            # An operator-edited launcher is still not ours to replace or delete.
+            earlier_release_install(monitor)
+            script.write_bytes(previous + b'# operator edit\n')
+            for operation in ('install', 'uninstall'):
+                with self.assertRaises(LedgerError) as caught:
+                    self.runtime.monitor_install(monitor, operation, 'local')
+                self.assertEqual((caught.exception.code, script.read_bytes()), ('INSTALL_CONFLICT', previous + b'# operator edit\n'))
+            self.assertEqual(len(jobs), 1)
+
     def test_diagnose_reports_actual_schema_after_unknown_work_write(self):
         """protects=upgrade diagnostics; fails_when=outdated schema reported;
         why_new=migration; seam=real Runtime; no_claim=installed upgrade.

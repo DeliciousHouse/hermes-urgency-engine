@@ -42,60 +42,14 @@ def fail(field, code='SOURCE_MALFORMED') -> NoReturn:
 
 
 def read_process(argv, *, timeout: float = 20, limit=16 * 1024 * 1024, receipt=None,
-                 snapshot_phases=False):
-    """Bound stdout in memory; retain no stderr or native private task bodies."""
-    if snapshot_phases:
-        return read_snapshot_process(argv, timeout, limit)
-    output = bytearray()
-    overflow = threading.Event()
-    try:
-        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                 stderr=subprocess.DEVNULL)
-    except OSError:
-        fail('transport', 'SOURCE_UNAVAILABLE')
+                 snapshot_phases=False, deadline=None):
+    """Bound stdout in memory; retain no stderr or native private task bodies.
 
-    def drain():
-        while True:
-            chunk = child.stdout.read(65536)
-            if not chunk:
-                return
-            if len(output) + len(chunk) > limit:
-                overflow.set()
-                return
-            output.extend(chunk)
-
-    reader = threading.Thread(target=drain, daemon=True)
-    try:
-        reader.start()
-        end = time.monotonic() + timeout
-        while child.poll() is None and not overflow.is_set() and time.monotonic() < end:
-            overflow.wait(.01)
-        if overflow.is_set():
-            fail('output', 'SOURCE_LIMIT')
-        if child.poll() is None:
-            fail('transport', 'SOURCE_TIMEOUT')
-        reader.join(timeout)
-        if overflow.is_set():
-            fail('output', 'SOURCE_LIMIT')
-        if reader.is_alive():
-            fail('transport', 'SOURCE_TIMEOUT')
-        if child.returncode:
-            if receipt is not None:
-                # The edit CLI has no structured no-effect refusal receipt.
-                raise LedgerError('NATIVE_EDIT_FAILED', 'kanban', side_effects='unknown')
-            fail('transport', 'SOURCE_DENIED')
-    finally:
-        if child.poll() is None:
-            child.kill()
-        child.wait()
-        if reader.ident is not None:
-            reader.join(timeout)
-        child.stdout.close()
-    if receipt is not None:
-        if output.strip() != receipt:
-            raise LedgerError('SOURCE_MALFORMED', 'kanban', side_effects='unknown')
-        return True
-    return decode_source(output)
+    Every read owns its process tree, which is killed when the read returns.
+    An optional ``deadline`` (``time.monotonic()``) caps every phase budget.
+    """
+    return read_snapshot_process(argv, timeout, limit, SNAPSHOT_PHASES if snapshot_phases else (),
+                                 receipt=receipt, deadline=deadline)
 
 
 def decode_source(output):
@@ -113,7 +67,7 @@ def decode_source(output):
         fail('json')
 
 
-def read_snapshot_process(argv, timeout, limit):
+def read_snapshot_process(argv, timeout, limit, phases=SNAPSHOT_PHASES, *, receipt=None, deadline=None):
     """Each ordered phase gets one budget, including output drain in the last phase."""
     signals = queue.SimpleQueue()
     output = bytearray()
@@ -122,7 +76,7 @@ def read_snapshot_process(argv, timeout, limit):
 
     def drain(stream):
         try:
-            for phase in SNAPSHOT_PHASES:
+            for phase in phases:
                 marker = f'@urgency:{phase}'.encode('ascii')
                 if stream.readline(len(marker) + 2) not in (marker + b'\n', marker + bytes((13, 10))):
                     signals.put((time.monotonic(), 'SOURCE_MALFORMED'))
@@ -142,26 +96,34 @@ def read_snapshot_process(argv, timeout, limit):
         finally:
             stream.close()
 
-    phase = 'startup'
-    end = time.monotonic() + timeout
+    def until(start):
+        return start + timeout if deadline is None else min(start + timeout, deadline)
+
+    phase = 'startup' if phases else 'transport'
+    end = until(time.monotonic())
+    if end <= time.monotonic():
+        fail(phase, 'SOURCE_TIMEOUT')
     try:
         with snapshot_process(argv) as child:
             reader = threading.Thread(target=drain, args=(child.stdout,), daemon=True)
             reader.start()
-            for next_phase in (*SNAPSHOT_PHASES, None):
+            for next_phase in (*phases, None):
                 arrived, error = signals.get(timeout=max(0, end - time.monotonic()))
                 if arrived >= end:
                     fail(phase, 'SOURCE_TIMEOUT')
                 if error == 'SOURCE_LIMIT':
                     fail('output', error)
                 if error or next_phase is None:
-                    # A nonzero child has no valid snapshot; never read its stderr.
+                    # A nonzero child has no valid output; never read its stderr.
                     if snapshot_exit_status(child, max(0, end - time.monotonic())):
+                        if receipt is not None:
+                            # The edit CLI has no structured no-effect refusal receipt.
+                            raise LedgerError('NATIVE_EDIT_FAILED', 'kanban', side_effects='unknown')
                         fail('transport', 'SOURCE_DENIED')
                     if error:
                         fail(phase, error)
                     break
-                phase, end = next_phase, arrived + timeout
+                phase, end = next_phase, until(arrived)
     except (queue.Empty, subprocess.TimeoutExpired):
         fail(phase, 'SOURCE_TIMEOUT')
     except OSError:
@@ -171,6 +133,10 @@ def read_snapshot_process(argv, timeout, limit):
             reader.join(2)
         elif child is not None and child.stdout is not None:
             child.stdout.close()
+    if receipt is not None:
+        if output.strip() != receipt:
+            raise LedgerError('SOURCE_MALFORMED', 'kanban', side_effects='unknown')
+        return True
     return decode_source(output)
 
 
@@ -564,7 +530,8 @@ class Sync:
                 else:
                     fcntl.flock(lock, fcntl.LOCK_UN)
 
-    def scan(self, cfg, ledger, monitor, ledger_path, source, *, request_id, reason):
+    def scan(self, cfg, ledger, monitor, ledger_path, source, *, request_id, reason, deadline=None):
+        """``deadline`` (``time.monotonic()``) stops detail reads and returns partial."""
         cfg = settings(cfg)
         if not cfg['kanban_sync_enabled']:
             return dict(state='disabled', count=0)
@@ -591,7 +558,7 @@ class Sync:
                 self.put('dirty_bindings', [])
             try:
                 result = self._scan(cfg, ledger, monitor, ledger_path, source,
-                                    request_id=request_id, reason=reason)
+                                    request_id=request_id, reason=reason, deadline=deadline)
             except Exception as exc:
                 code = exc.code if isinstance(exc, LedgerError) else 'SOURCE_ERROR'
                 with self.transaction():
@@ -617,7 +584,7 @@ class Sync:
                 self.db.execute("UPDATE sync_requests SET state='scan_complete',result_json=? WHERE request_id=?", (_json(result), request_id))
             return result
 
-    def _scan(self, cfg, ledger, monitor, ledger_path, source, *, request_id, reason):
+    def _scan(self, cfg, ledger, monitor, ledger_path, source, *, request_id, reason, deadline=None):
         _id(request_id, 'request_id')
         _text(reason, 'reason', 1024)
         cfg = settings(cfg)
@@ -701,6 +668,16 @@ class Sync:
             plans.clear()
             batch_bytes = 0
 
+        def expired():
+            # Real time: the caller's deadline also caps the native child it starts.
+            return deadline is not None and time.monotonic() >= deadline
+
+        def partial():
+            apply_collected()
+            monitor_refusals.extend(self.admit_graph(cfg, monitor, set(), ledger_path))
+            self.raise_refused(monitor_refusals)
+            return dict(state='partial', count=count, cursor=self.meta('cursor'))
+
         for binding, rows in inventories:
             for row in sorted(rows, key=lambda r: r['id']):
                 task_id = _id(row.get('id'), 'task_id')
@@ -719,14 +696,14 @@ class Sync:
                     if exc.code != 'NOT_FOUND':
                         raise
                     task = None
-                if processed and monotonic() >= detail_deadline:
-                    apply_collected()
-                    monitor_refusals.extend(self.admit_graph(cfg, monitor, set(), ledger_path))
-                    self.raise_refused(monitor_refusals)
-                    return dict(state='partial', count=count, cursor=self.meta('cursor'))
+                if (processed and monotonic() >= detail_deadline) or expired():
+                    return partial()
                 try:
                     document = source.detail(binding, task_id)
                 except LedgerError as exc:
+                    if exc.code == 'SOURCE_TIMEOUT' and expired():
+                        # The caller's budget, not the source, cut this read short.
+                        return partial()
                     if exc.code == 'SOURCE_TIMEOUT' and count:
                         # Retain only the validated prefix, not the timed-out row.
                         # The failed request stays pending and retains unknown coverage.
