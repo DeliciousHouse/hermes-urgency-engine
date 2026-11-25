@@ -678,6 +678,10 @@ class Sync:
                               and projection['status'] not in ('done', 'archived') and task)
                 plan = dict(binding=fingerprint, projection=projection, arguments=arguments,
                             reopen=reopen, cursor=position)
+                if task and existing and (existing['title'], existing['assignee'], existing['source_status']) == (
+                        projection['title'], projection['assignee'], projection['status']):
+                    # Worker liveness, parents or priority only: Monitor facts, no Ledger rewrite.
+                    plan['facts_only'] = True
                 if reopen:
                     plan['reopen_revision'] = arguments['expected_revision']
                     arguments['expected_revision'] += 1
@@ -851,13 +855,14 @@ class Sync:
         if (not existing
                 and self.db.execute('SELECT count(*) FROM sources').fetchone()[0] >= 20000):
             fail('sources_capacity', 'SOURCE_LIMIT')
-        if plan.get('reopen'):
-            ledger.reopen_task(*key, expected_revision=plan['reopen_revision'],
-                request_id=identity + ':reopen', reason='Canonical task reopened', actor='kanban-sync')
-        task = ledger.upsert_task(**plan['arguments'])
-        if projection['status'] == 'done':
-            ledger.claim_complete(*key, expected_revision=task['revision'],
-                request_id=identity + ':claim', reason='Canonical completion claim', actor='kanban-sync')
+        if not plan.get('facts_only'):
+            if plan.get('reopen'):
+                ledger.reopen_task(*key, expected_revision=plan['reopen_revision'],
+                    request_id=identity + ':reopen', reason='Canonical task reopened', actor='kanban-sync')
+            task = ledger.upsert_task(**plan['arguments'])
+            if projection['status'] == 'done':
+                ledger.claim_complete(*key, expected_revision=task['revision'],
+                    request_id=identity + ':claim', reason='Canonical completion claim', actor='kanban-sync')
         self.admit_facts(ledger, monitor, projection, identity)
         # Keep the intent pending through both stores. Publish the projection,
         # acknowledgment and cursor together only after their replay-safe calls.

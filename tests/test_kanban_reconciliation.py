@@ -574,6 +574,35 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(self.scan('after')['state'], 'complete')
         self.assertEqual(self.sync.db.execute("SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 0)
 
+    def test_heartbeat_only_change_skips_ledger_rewrite_but_reaches_monitor(self):
+        """protects=stable Ledger revisions; fails_when=each heartbeat rewrites the task and bumps revisions;
+        why_new=60 s worker heartbeats; seam=real stores; no_claim=monitor row coalescing.
+        """
+        from urgency_engine.watchdog import Monitor
+        original, beat = self.source.detail, [150]
+        def detail(binding, task_id):
+            document = original(binding, task_id)
+            document['task'].update(current_run_id=4, started_at=100)
+            document.update(runs=[dict(id=4, status='running', started_at=100)],
+                            events=[dict(kind='heartbeat', run_id=4, created_at=beat[0])])
+            return document
+        self.source.detail = detail
+        audit = 'SELECT count(*) FROM audit'
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
+            self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db', self.source,
+                           request_id='first', reason='Fixture')
+            task, project = self.ledger.get_task('demo', 'task'), self.ledger.get_project('project')
+            audits = self.ledger.connection.execute(audit).fetchone()[0]
+            beat[0], self.now = 210, self.now + timedelta(seconds=60)
+            self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db', self.source,
+                           request_id='second', reason='Fixture')
+            heartbeat = monitor.db.execute('SELECT heartbeat_at FROM task_signals').fetchone()[0]
+        self.assertEqual(heartbeat, kanban.timestamp(210))
+        self.assertEqual(self.ledger.get_task('demo', 'task')['revision'], task['revision'])
+        self.assertEqual(self.ledger.get_project('project')['revision'], project['revision'])
+        self.assertEqual(self.ledger.connection.execute(audit).fetchone()[0], audits)
+        self.assertEqual(self.sync.page('project')['items'][0]['worker']['heartbeat_at'], kanban.timestamp(210))
+
     def test_replay_capacity_refuses_new_writes_without_pruning_old_requests(self):
         """protects=bounded durable replay; fails_when=capacity discards pending identities;
         why_new=protected storage ceiling; seam=real store; no_claim=unlimited operation history.
