@@ -49,7 +49,12 @@ stable code. An unexpected failure is 500 carrying a `diagnostic_id` and no trac
 
 `POST /identity` explicitly initializes an opaque profile namespace in the plugin's
 `desktop.db` metadata store and returns the same identity on later calls. It uses
-the host authentication, operator-only and stop fences; no worker gains permission.
+the host authentication, operator-only and stop fences. The operator-only fence
+inspects the backend's own environment, so it only refuses a backend that a
+worker launched. It cannot tell which process sent an HTTP request. Keeping
+workers away from REST writes rests on the host session credential, and a process
+running as the same OS user can read that credential; see
+[Security](../SECURITY.md).
 It accepts no domain arguments and changes no Ledger data.
 
 `POST /commands` takes `{"request_id", "operation", "arguments"}` with an optional

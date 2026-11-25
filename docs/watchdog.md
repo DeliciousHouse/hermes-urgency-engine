@@ -26,6 +26,16 @@ All commands below start with `hermes urgency watchdog`.
 | `observe` | `--json-file FILE`: explicit typed local observation, at most 16 KiB after JSON parsing. No conversational mutation equivalent. |
 | `uninstall` | Removes only the owned cron and a launcher whose bytes match this release or the SHA-256 in the install receipt. Retains ledger, monitor and audit data. Edited or ambiguous assets return `INSTALL_CONFLICT`. |
 
+`install`, `uninstall`, `pause`, `resume`, `observe` and `tick` return
+`SOURCE_DENIED` (field `context`) in a worker context, as
+[operator writes](runtime.md#operator-writes) do, so a monitored worker cannot
+pause, remove or feed its own watchdog, or spend its notice budget with a tick of
+its own. The reads stay available. The owned no-agent cron job's launcher runs
+`tick` without worker markers: the host does not bind its cron session marker for
+no-agent script jobs. The launcher inherits the scheduler's environment, so do not
+export `HERMES_KANBAN_DB` (or another marker) in the process that runs the Hermes
+scheduler; if you do, every scheduled tick fails with `SOURCE_DENIED`.
+
 Reads return `{"ok":true,"data":...}`; pages include `schema_version: 1`,
 `items`, `has_more`, `next`. Pass `next` as `--after` while `has_more` is true.
 Before initialization, reads return uninitialized health or empty pages without
