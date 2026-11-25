@@ -721,6 +721,21 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(task['status'], 'planned')
         self.assertEqual(task['criteria'][0]['description'], 'login with\ntoken: [REDACTED]')
 
+    def test_history_snapshots_are_objects_redacted_by_leaf(self):
+        """protects=history reconciliation and redaction; fails_when=snapshot stays a serialized string
+        that the redactor cannot read line by line; seam=urgency_query tool and fake redactor."""
+        self.seed_multiline_secret()
+        self.ctx.redact_text = line_anchored
+        text = self.runtime.tool({'operation': 'history', 'arguments': {'entity_type': 'task', 'entity_id': '["b","t"]'}})
+        self.assertNotIn('correcthorsebattery', text)
+        self.assertNotIn('abcdefabcdef1234', text)
+        items = json.loads(text)['data']['items']
+        self.assertEqual([item['action'] for item in items], ['upsert_task', 'set_criteria'])
+        self.assertIsNone(items[0]['before'])
+        self.assertEqual(items[0]['after']['goal'], 'Rotate creds\npassword: [REDACTED]\nthen redeploy')
+        self.assertEqual(items[1]['before']['revision'], 1)
+        self.assertEqual(items[1]['after']['criteria'][0]['description'], 'login with\ntoken: [REDACTED]')
+
     def test_invalid_json_cli_channels_and_help(self):
         """protects=bounded input; fails_when=invalid JSON reaches writes; seam=local file."""
         parser = argparse.ArgumentParser()

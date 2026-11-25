@@ -336,6 +336,9 @@ class Runtime:
                 elif operation == 'history':
                     items = ledger.history(**arguments)
                     has_more = bool(items and ledger.history(arguments['entity_type'], arguments['entity_id'], 1, items[-1]['sequence']))
+                    # Decode snapshots so redaction sees string leaves, not one serialized blob.
+                    for item in items:
+                        item['before'], item['after'] = json.loads(item.pop('before_json')), json.loads(item.pop('after_json'))
                     data = dict(items=items, has_more=has_more, next=items[-1]['sequence'] if has_more else None)
                 else:
                     data = dict(storage='available', schema=ledger.schema_version, context_enabled=settings['context_enabled'], **EVIDENCE)

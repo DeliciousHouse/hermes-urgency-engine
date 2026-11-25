@@ -54,6 +54,8 @@ Tool argument names are `project_id`, `board_id`, `task_id`, `deadline_id`,
 `entity_type`, `entity_id`, `limit` and `after`, as applicable. `after` is a string
 for project pages and an integer for history. Unknown fields and operations fail.
 Status and history return `items`, `has_more` and `next`; pass `next` as `after`.
+History items carry the audit snapshots as decoded `before` and `after` objects
+(the Ledger API's `before_json`/`after_json` strings), so each value is redacted on its own.
 Before the ledger is initialized, status without a project filter and history
 return empty pages; scoped status, task and explain return `NOT_FOUND`.
 `diagnose` reports `storage: uninitialized` and `schema: 0`. Use
