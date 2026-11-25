@@ -127,8 +127,8 @@ At most 20000 distinct source rows are retained across bindings; new rows beyond
 that are refused before ledger mutation. Event writes prune entries older than
 30 days and keep at most the newest 10000. Once request records exceed 50000,
 a write first drops the oldest finished receipts (completed or abandoned scans,
-applied or cancelled intents), keeping the newest 10000 of them; replaying a
-dropped request ID starts a new request. Pending intents, pause/resume receipts
+applied, cancelled or Monitor-refused intents), keeping the newest 10000 of
+them; replaying a dropped request ID starts a new request. Pending intents, pause/resume receipts
 and the current scan are never dropped. If more than 50000 remain, the write
 fails with `SOURCE_LIMIT`. Ledger and monitor retain their own capacity rules;
 sync admits monitor facts under the configured `watchdog_*` settings. Absent
@@ -137,9 +137,18 @@ toward the 20000-row and the Ledger's 10000-task limits. A card refused for
 capacity is cancelled with no Ledger effect and reported (`SOURCE_LIMIT`
 `sources_capacity` or `INVALID_INPUT` `tasks_capacity`) after the rest of its
 batch is applied; the cursor passes it, so later cards keep syncing and the card
-is retried on the next cycle. A Ledger task-capacity refusal makes cached graph
-coverage `unknown` in both the source projection and Monitor. These are row/input
+is retried on the next cycle. A Ledger task-capacity refusal marks cached graph
+coverage `unknown` and requests the same withdrawal from Monitor. These are row/input
 safeguards, not a disk quota or native CLI throughput guarantee.
+
+If Monitor refuses admission with `CAPACITY_EXCEEDED` (`watchdog_max_rows`),
+the scan still applies Ledger changes for other cards within the normal page
+budget. It keeps any committed Ledger change, records the refused intent with
+unknown coverage, and collects fresh facts from cards still in scope on a
+later traversal. The scan reports the refusal and does not advance
+`last_success`. A refused graph withdrawal is retried without blocking
+collection or claiming that Monitor accepted `unknown`; until then, Monitor
+can retain its last accepted state, while source-driven actions remain denied.
 
 ## Why collection, application and verification are separate
 
@@ -263,6 +272,10 @@ before retrying the failed request with the same ID and reason: a confirmed
 prefix may already be present. A normal `partial` page instead continues with
 a new request ID. `SOURCE_MALFORMED` or
 `SOURCE_UNSUPPORTED` require a compatible native response, not guessed fields.
+For `CAPACITY_EXCEEDED` on `watchdog_max_rows`, inspect both sync health and
+the [Monitor capacity guidance](watchdog.md#how-to-operate-pause-and-remove-the-monitor).
+Read the Ledger before retrying: a source edit can already be committed even
+though the scan did not refresh Monitor coverage.
 After changing a binding, retry once on `SCOPE_CONFLICT` to allow a scan after
 unapplied intent cancellation. A single `REVISION_CONFLICT` clears on the next
 scan. Persistent `SCOPE_CONFLICT`, `REVISION_CONFLICT`
