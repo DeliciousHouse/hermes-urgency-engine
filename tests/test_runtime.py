@@ -931,5 +931,29 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn('CORRUPT_STATE', self.runtime.pre_llm_call(session_id='other')['context'])
 
 
+class GuidanceTruncationTest(unittest.TestCase):
+    def test_truncation_preserves_complete_json_lines(self):
+        fixture = RuntimeTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        response = fixture.request('create_project', project_id='p', title='A' * 250, request_id='seed')
+        self.assertTrue(response['ok'])
+        fixture.ctx.settings['default_project'] = 'p'
+        for cap in (512, 600):
+            with self.subTest(cap=cap):
+                fixture.ctx.settings['context_max_chars'] = cap
+                text = fixture.runtime.pre_llm_call()['context']
+                self.assertLessEqual(len(text), cap)
+                lines = text.splitlines()
+                self.assertIn('BEGIN URGENCY DATA', lines)
+                self.assertIn('END URGENCY DATA', lines)
+                begin, end = lines.index('BEGIN URGENCY DATA'), lines.index('END URGENCY DATA')
+                self.assertLess(begin, end)
+                for i, line in enumerate(lines):
+                    if line.startswith(('Objective: ', 'Progress: ', 'Task: ')):
+                        self.assertTrue(begin < i < end)
+                        json.loads(line.split(': ', 1)[1])
+
+
 if __name__ == '__main__':
     unittest.main()
