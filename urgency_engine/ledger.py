@@ -51,6 +51,34 @@ def _id(value, field):
     return value
 
 
+def _path_id(value, field):
+    # Desktop REST puts project and milestone IDs in URL path segments, where a
+    # dot-only segment (even percent-encoded) is normalized away. Checked at creation only,
+    # so existing records stay readable.
+    _id(value, field)
+    if not value.strip('.'):
+        _invalid(field)
+    return value
+
+
+def _readonly_uri(path):
+    """SQLite read-only URI with an empty authority, so a UNC path keeps its server."""
+    from urllib.parse import quote
+    text = Path(path).absolute().as_posix()
+    return 'file://' + ('' if text.startswith('/') else '/') + quote(text, safe='/:') + '?mode=ro'
+
+
+def _make_dirs(path):
+    """Create plugin directories without recreating a deleted or renamed named profile."""
+    try:
+        from hermes_constants import mkdir_under_hermes_home
+    except ImportError:
+        # Offline library use has no Hermes home or profile to protect.
+        Path(path).mkdir(parents=True, exist_ok=True)
+    else:
+        mkdir_under_hermes_home(path)
+
+
 def _integer(value, field, minimum=0, maximum=2**63 - 1):
     if type(value) is not int or not minimum <= value <= maximum:
         _invalid(field)
@@ -374,7 +402,7 @@ class Ledger:
 
     @_command
     def create_project(self, project_id, title, *, request_id, actor):
-        _id(project_id, 'project_id')
+        _path_id(project_id, 'project_id')
         _text(title, 'title')
         if self.connection.execute('SELECT 1 FROM projects WHERE project_id=?', (project_id,)).fetchone():
             raise LedgerError('REVISION_CONFLICT', 'create_project', 'project_id')
@@ -707,7 +735,7 @@ class Ledger:
 
     @_command
     def create_milestone(self, milestone_id, *, project_id, title, request_id, actor):
-        _id(milestone_id, 'milestone_id')
+        _path_id(milestone_id, 'milestone_id')
         _text(title, 'title')
         self._project(project_id)
         if self.connection.execute('SELECT 1 FROM milestones WHERE milestone_id=?', (milestone_id,)).fetchone():
@@ -957,7 +985,7 @@ def open_readonly_ledger(path, *, clock, deadline=None, busy_timeout_ms=100, che
     try:
         if not stat.S_ISREG(path.stat().st_mode):
             raise LedgerError('STORAGE_FAILURE', 'open')
-        connection = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=busy_timeout_ms / 1000)
+        connection = sqlite3.connect(_readonly_uri(path), uri=True, timeout=busy_timeout_ms / 1000)
     except FileNotFoundError:
         raise LedgerError('NOT_FOUND', 'open', next_action='Initialize the ledger with hermes urgency apply.') from None
     except (OSError, sqlite3.Error):
@@ -986,6 +1014,33 @@ def open_hermes_ledger(*, clock, artifact_root, busy_timeout_ms=5000):
 
 
 def _date(value, zone_name):
+    try:
+        return _parse_date(value, zone_name)
+    except LedgerError as exc:
+        if exc.field != 'at':
+            raise
+        raise LedgerError('INVALID_INPUT', 'validate', 'at', next_action=_date_hint(value, zone_name)) from None
+
+
+def _date_hint(value, zone_name):
+    """Restate the rule; add an example only when one can be built from parsed values."""
+    from zoneinfo import ZoneInfo
+    rule = ('Give at as RFC3339 with seconds and an explicit offset (Z or +HH:MM/-HH:MM) that equals '
+            'the offset of the timezone at that wall time')
+    try:
+        zone = ZoneInfo(zone_name)
+        moment = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if moment.tzinfo is None:
+            # A naive value is read as wall time in the zone; a gap time moves to a real instant.
+            moment = moment.replace(tzinfo=zone).astimezone(timezone.utc)
+        example = moment.astimezone(zone).isoformat(timespec='seconds')
+        _parse_date(example, zone_name)
+    except Exception:
+        return rule + '.'
+    return f'{rule}, for example {example} for {zone.key}.'
+
+
+def _parse_date(value, zone_name):
     import re
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
     _text(value, 'at', 64)

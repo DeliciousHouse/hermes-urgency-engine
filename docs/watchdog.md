@@ -17,14 +17,14 @@ All commands below start with `hermes urgency watchdog`.
 
 | Command | Arguments and effect |
 | --- | --- |
-| `install` | `--deliver local` by default, or an existing Hermes delivery target. Explicitly writes one owned launcher and registers one no-agent job every minute. Existing owned installation is reconciled. |
+| `install` | `--deliver local` by default, or an existing Hermes delivery target. Explicitly writes one owned launcher and registers one no-agent job every minute. Existing owned installation is reconciled; an owned launcher from an earlier release is replaced with this release's launcher. |
 | `tick` | `--force` skips next-due throttling, not pause, deduplication or notice limits. Exit 0 with empty stdout when quiet; fresh notices are one JSON summary; failures exit 1 on stderr. |
 | `health` | Read-only schema version, install receipt, pause, last successful evaluation, last complete scan, cursor, lag, next due, coverage and limitations. A stored install receipt is not a live scheduler-health probe. |
 | `pause`, `resume` | Require `--request-id ID --reason TEXT`. Persist audited control; resume makes the next tick due. Same request and payload replay; different payload conflicts. |
 | `incidents`, `plans` | Read-only pages, `--project ID` optional, `--limit N` default 100 (1–500), `--after ID` continuation. Includes historical resolved records. |
 | `export` | `--table incidents` by default; also `plans`, `observations`, `monitor_audit`. Same paging flags; audit continuation is an integer and does not support project filtering. Writes JSON to stdout, never an arbitrary destination path. |
 | `observe` | `--json-file FILE`: explicit typed local observation, at most 16 KiB after JSON parsing. No conversational mutation equivalent. |
-| `uninstall` | Removes only the owned cron and unchanged launcher. Retains ledger, monitor and audit data. Edited or ambiguous assets return `INSTALL_CONFLICT`. |
+| `uninstall` | Removes only the owned cron and a launcher whose bytes match this release or the SHA-256 in the install receipt. Retains ledger, monitor and audit data. Edited or ambiguous assets return `INSTALL_CONFLICT`. |
 
 `install`, `uninstall`, `pause`, `resume`, `observe` and `tick` return
 `SOURCE_DENIED` (field `context`) in a worker context, as
@@ -277,8 +277,12 @@ Troubleshooting: `STORE_BUSY` permits a bounded retry after the other writer end
 not deletion of active incidents. `CLOCK_ROLLBACK` waits for clock correction.
 `UNSUPPORTED_SCHEMA`/`CORRUPT_STATE` require backup and diagnosis, not automatic repair.
 `INSTALL_CONFLICT` requires inspecting `hermes cron list` and the owned launcher:
-preserve edited/unrelated assets. An interrupted create may have succeeded; read
-public cron state before retrying. Never blindly add a duplicate job.
+preserve edited/unrelated assets. Refreshing an owned launcher leaves unrelated
+files in the scripts directory untouched. An interrupted create may have
+succeeded; read public cron state before retrying. Never blindly add a duplicate job.
+If the cron job is missing and launcher replacement fails, the install receipt
+still recognizes the unchanged launcher. Once the file is accessible, uninstall
+can remove it without discarding watchdog data.
 
 Rollback: pause, uninstall the owned job, stop writes, and use SQLite's backup API for
 ledger and monitor databases, plus `kanban.db` when canonical sync is configured.

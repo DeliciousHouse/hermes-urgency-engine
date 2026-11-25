@@ -11,7 +11,7 @@ import sqlite3
 import time
 from typing import Any, NoReturn, TypedDict
 
-from .ledger import LedgerError, _id, _integer, _json, _number, _text, open_readonly_ledger
+from .ledger import LedgerError, _id, _integer, _json, _number, _readonly_uri, _text, open_readonly_ledger
 from .forecast import ForecastInput, UrgencyLevel, UrgencyState, calculate_forecast
 
 DEFAULTS = dict(watchdog_enabled=False, watchdog_normal_seconds=300, watchdog_risk_seconds=60,
@@ -261,7 +261,7 @@ class Monitor:
         if readonly:
             if not path.exists():
                 return None
-            db = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=.1)
+            db = sqlite3.connect(_readonly_uri(path), uri=True, timeout=.1)
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
             db = sqlite3.connect(path, timeout=.1)

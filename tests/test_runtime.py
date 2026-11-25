@@ -903,6 +903,13 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(before, self.request('history', entity_type='deadline', entity_id='soon'))
         self.assertEqual(self.request('explain', deadline_id='soon')['data']['target_at'], '2030-01-01T00:01:00+00:00')
 
+    def test_refused_deadline_time_reaches_apply_envelope_with_example(self):
+        self.project()
+        result = self.request('set_deadline', deadline_id='d', project_id='p', kind='hard', at='2030-01-01T05:00:00Z',
+                              timezone='Synthetic', owner='operator', source='fixture', request_id='d')
+        self.assertEqual((result['ok'], result['error']['code'], result['error']['field']), (False, 'INVALID_INPUT', 'at'))
+        self.assertIn('for example 2030-01-01T00:00:00-05:00 for Synthetic.', result['error']['next_action'])
+
     def test_failures_remain_safe_and_diagnostics_rotate(self):
         """protects=failure isolation; fails_when=trace/input leaks; seam=failing opener."""
         self.ctx.settings.update(default_project='p', diagnostic_log_bytes=65536)
@@ -1027,6 +1034,156 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn('Urgency planning guidance', self.runtime.pre_llm_call(session_id='other')['context'])
         state.path.write_bytes(raw + b' ')
         self.assertIn('CORRUPT_STATE', self.runtime.pre_llm_call(session_id='other')['context'])
+
+
+class WatchdogInstallTests(unittest.TestCase):
+    """Owned-launcher and cron reconciliation against a fake public cron surface."""
+
+    def setUp(self):
+        import sys
+        import types
+        from unittest.mock import patch
+        from urgency_engine.watchdog import Monitor
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.home = self.root / 'home'
+        self.home.mkdir()
+        constants = types.ModuleType('hermes_constants')
+        constants.get_hermes_home = lambda: self.home
+        modules = patch.dict(sys.modules, {'hermes_constants': constants})
+        modules.start()
+        self.addCleanup(modules.stop)
+        self.runtime = Runtime(Context(self.root / 'state.json'), data_dir=lambda: self.root)
+        self.jobs = []
+        def cron(action, **arguments):
+            if action == 'list':
+                return {'jobs': [dict(job) for job in self.jobs]}
+            if action == 'create':
+                self.jobs.append(dict(job_id='job-1', name=arguments['name'], script=arguments['script'],
+                                      no_agent=arguments['no_agent']))
+                return {'job_id': 'job-1'}
+            self.jobs[:] = [job for job in self.jobs if job['job_id'] != arguments['job_id']]
+            return {}
+        self.runtime.cron = cron
+        self.monitor = Monitor.open(self.root / 'watchdog.db', clock=lambda: datetime(2030, 1, 1, tzinfo=timezone.utc))
+        self.addCleanup(self.monitor.db.close)
+        self.content = (Path(__file__).resolve().parents[1] / 'scripts' / 'watchdog.py').read_bytes()
+
+    def receipt(self, value):
+        with self.monitor.transaction():
+            self.monitor.put('install', value)
+
+    def install(self, operation='install'):
+        return self.runtime.monitor_install(self.monitor, operation, 'local')
+
+    def conflict(self, operation):
+        from urgency_engine.ledger import LedgerError
+        with self.assertRaises(LedgerError) as caught:
+            self.install(operation)
+        self.assertEqual(caught.exception.code, 'INSTALL_CONFLICT')
+        return caught.exception.field
+
+    def test_linked_scripts_directory_installs_and_uninstalls(self):
+        import os
+        target = self.root / 'dotfiles-scripts'
+        target.mkdir()
+        if os.name == 'nt':
+            import _winapi
+            _winapi.CreateJunction(str(target), str(self.home / 'scripts'))
+        else:
+            os.symlink(target, self.home / 'scripts')
+        receipt = self.install()
+        self.assertEqual((receipt['state'], receipt['job_id']), ('installed', 'job-1'))
+        self.assertEqual((target / 'hermes-urgency-engine-watchdog.py').read_bytes(), self.content)
+        self.assertEqual(self.install()['job_id'], 'job-1')
+        self.assertEqual(self.install('uninstall')['state'], 'uninstalled')
+        self.assertEqual((self.jobs, list(target.iterdir())), ([], []))
+
+    def test_launcher_from_installed_receipt_is_owned_and_replaced(self):
+        import hashlib
+        receipt = self.install()
+        script = Path(receipt['script'])
+        old = b'# launcher shipped by an earlier release' + bytes(self.content)
+        script.write_bytes(old)
+        self.receipt({**receipt, 'sha256': hashlib.sha256(old).hexdigest()})
+        refreshed = self.install()
+        self.assertEqual((refreshed['job_id'], refreshed['sha256']), ('job-1', hashlib.sha256(self.content).hexdigest()))
+        self.assertEqual(script.read_bytes(), self.content)
+        self.assertEqual([path.name for path in script.parent.iterdir()], [script.name])
+        script.write_bytes(old)
+        self.receipt({**refreshed, 'sha256': hashlib.sha256(old).hexdigest()})
+        self.assertEqual(self.install('uninstall')['state'], 'uninstalled')
+        self.assertEqual((self.jobs, script.exists()), ([], False))
+
+    def test_refresh_preserves_unowned_sibling(self):
+        import hashlib
+        receipt = self.install()
+        launcher = Path(receipt['script'])
+        old = b'# previous release\n'
+        launcher.write_bytes(old)
+        self.receipt({**receipt, 'sha256': hashlib.sha256(old).hexdigest()})
+        sibling = launcher.with_name(launcher.name + '.tmp')
+        sibling.write_bytes(b'operator backup\n')
+
+        self.install()
+
+        self.assertTrue(sibling.exists(), 'refresh deleted an unrelated sibling file')
+        self.assertEqual(sibling.read_bytes(), b'operator backup\n')
+        self.assertEqual(launcher.read_bytes(), self.content)
+
+    def test_owned_stale_launcher_stays_removable_after_replace_failure(self):
+        import hashlib
+        from unittest.mock import patch
+        receipt = self.install()
+        launcher = Path(receipt['script'])
+        old = b'# previous release\n'
+        launcher.write_bytes(old)
+        self.receipt({**receipt, 'sha256': hashlib.sha256(old).hexdigest()})
+        self.jobs.clear()  # The scheduler no longer has the job, but the receipt owns the file.
+        sibling = launcher.with_name(launcher.name + '.tmp')
+        sibling.write_bytes(b'operator backup\n')
+
+        with patch('urgency_engine.runtime.os.replace', side_effect=PermissionError('transient file sharing refusal')):
+            with self.assertRaises(PermissionError):
+                self.install()
+        self.assertEqual(launcher.read_bytes(), old)
+        self.assertEqual(set(launcher.parent.iterdir()), {launcher, sibling})
+        self.assertEqual(sibling.read_bytes(), b'operator backup\n')
+
+        self.assertEqual(self.install('uninstall')['state'], 'uninstalled')
+        self.assertFalse(launcher.exists())
+
+    def test_edited_launcher_still_conflicts(self):
+        receipt = self.install()
+        script = Path(receipt['script'])
+        script.write_bytes(b'# edited by hand')
+        self.assertEqual(self.conflict('install'), 'launcher')
+        self.assertEqual(self.conflict('uninstall'), 'launcher')
+        self.receipt({**receipt, 'sha256': None})
+        self.assertEqual(self.conflict('uninstall'), 'launcher')
+        self.assertEqual((script.read_bytes(), len(self.jobs)), (b'# edited by hand', 1))
+
+
+class ProfileGuardTests(unittest.TestCase):
+    def test_deleted_profile_home_is_not_recreated_for_artifacts(self):
+        """protects=deleted/renamed profiles stay gone; fails_when=raw mkdir(parents=True) recreates them."""
+        import sys
+        import types
+        from unittest.mock import patch
+        from urgency_engine.ledger import LedgerError
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory) / 'profiles' / 'gone' / 'plugin-data' / 'hermes-urgency-engine'
+            constants = types.ModuleType('hermes_constants')
+            def refuse(path):
+                raise FileNotFoundError('Named profile home does not exist')
+            constants.mkdir_under_hermes_home = refuse
+            runtime = Runtime(Context(Path(directory) / 'state.json'), opener=lambda **kwargs: self.fail('opened'),
+                              data_dir=lambda: data)
+            with patch.dict(sys.modules, {'hermes_constants': constants}), self.assertRaises(LedgerError) as caught:
+                runtime.open(runtime.settings())
+            self.assertEqual((caught.exception.code, caught.exception.side_effects), ('STORAGE_FAILURE', 'none'))
+            self.assertFalse((Path(directory) / 'profiles').exists())
 
 
 class GuidanceTruncationTest(unittest.TestCase):

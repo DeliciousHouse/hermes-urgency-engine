@@ -6,7 +6,7 @@ import os
 import sqlite3
 from typing import NoReturn
 
-from .ledger import LedgerError, _date, _id, _integer, _invalid, _json, _number, _text
+from .ledger import LedgerError, _date, _id, _integer, _invalid, _json, _number, _readonly_uri, _text
 
 PARAMETERS = {
     'set_priority': {'priority'},
@@ -120,7 +120,7 @@ class Actions:
 
     @classmethod
     def read(cls, path, clock):
-        return cls(sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=.1), clock, True) if path.exists() else None
+        return cls(sqlite3.connect(_readonly_uri(path), uri=True, timeout=.1), clock, True) if path.exists() else None
 
     def __enter__(self):
         return self
