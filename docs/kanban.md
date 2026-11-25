@@ -188,7 +188,9 @@ for detail. The child initializes built-in tools and calls the documented
 `ctx.dispatch_tool` API for `kanban_show`; it never reads board SQL or invokes
 a private handler. Parent sync/tick retains the same interpreter and profile.
 The scan's timeout cleanup terminates the owned snapshot tree, including its
-nested board-check process. There is no weaker CLI `show` fallback on denial
+nested board-check process. On POSIX, the scan signals the owned process group
+before reaping its leader, including on macOS with Python 3.11 or 3.12.
+There is no weaker CLI `show` fallback on denial
 or missing capability. Standalone snapshot and priority intervention transport
 are unchanged. **Native `kanban list` recomputes
 dependency readiness**; opting in accepts that normal native effect. Collection

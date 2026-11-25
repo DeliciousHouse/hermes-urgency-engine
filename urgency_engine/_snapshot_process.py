@@ -1,22 +1,62 @@
 """Own the process tree used by the public Kanban snapshot transport."""
 
 from contextlib import contextmanager
+from functools import cache
 import os
 import signal
 import subprocess
+import sys
 import time
 
 
 _REAP_TIMEOUT = 2
+_waitid = getattr(os, 'waitid', None)
+
+
+@cache
+def _darwin_waitid():
+    # CPython <3.13 omits os.waitid on macOS, but Darwin provides waitid(2).
+    # Use its siginfo_t layout (sys/signal.h) so WNOWAIT keeps the PID owned.
+    import ctypes as c
+
+    class Siginfo(c.Structure):
+        _fields_ = [('si_signo', c.c_int), ('si_errno', c.c_int), ('si_code', c.c_int),
+                    ('si_pid', c.c_int), ('si_uid', c.c_uint), ('si_status', c.c_int),
+                    ('si_addr', c.c_void_p), ('si_value', c.c_void_p),
+                    ('si_band', c.c_long), ('reserved', c.c_ulong * 7)]
+
+    try:
+        waitid = c.CDLL(None, use_errno=True).waitid
+    except AttributeError as exc:
+        raise OSError('Darwin waitid is unavailable') from exc
+    waitid.argtypes = (c.c_int, c.c_uint, c.POINTER(Siginfo), c.c_int)
+    waitid.restype = c.c_int
+
+    def observe(idtype, pid, options):
+        status = Siginfo()
+        if waitid(idtype, pid, c.byref(status), options) == -1:
+            error = c.get_errno()
+            raise OSError(error, os.strerror(error))
+        return status
+
+    return observe
 
 
 def snapshot_exit_status(child, timeout):
     """Observe exit without freeing the POSIX group leader PID before cleanup."""
-    if os.name == 'nt':
+    if sys.platform == 'win32':
         return child.wait(timeout=timeout)
     end = time.monotonic() + timeout
+    waitid = _waitid
+    if waitid is None:
+        if sys.platform != 'darwin':
+            raise OSError('snapshot exit observation requires waitid')
+        waitid = _darwin_waitid()
     while True:
-        status = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+        try:
+            status = waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+        except InterruptedError:
+            status = None
         if status is not None and status.si_pid:
             return status.si_status
         remaining = end - time.monotonic()
