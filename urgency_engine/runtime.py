@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -17,7 +18,7 @@ import traceback
 from typing import NoReturn
 import uuid
 
-from .ledger import Ledger, LedgerError, open_hermes_ledger, open_readonly_ledger
+from .ledger import Ledger, LedgerError, _make_dirs, _readonly_uri, open_hermes_ledger, open_readonly_ledger
 from .watchdog import Monitor, DEFAULTS as WATCHDOG_DEFAULTS, LIMITATIONS, settings as monitor_settings
 from .kanban import Sync, NativeSource, read_process, DEFAULTS as KANBAN_DEFAULTS, settings as kanban_settings
 from . import interventions
@@ -249,7 +250,11 @@ class Runtime:
                                   next_action='Set artifact_root to an existing absolute directory, or empty for plugin-owned artifacts.')
         else:
             root = self.data_dir() / 'artifacts'
-            root.mkdir(parents=True, exist_ok=True)
+            try:
+                _make_dirs(root)
+            except OSError:
+                raise LedgerError('STORAGE_FAILURE', 'open',
+                                  next_action='Select an existing Hermes profile; a deleted or renamed profile is not recreated.') from None
         return self.opener(clock=self.clock, artifact_root=root)
 
     @staticmethod
@@ -535,7 +540,7 @@ class Runtime:
         path = self.data_dir() / 'kanban.db'
         if not path.exists():
             invalid('coverage', 'SOURCE_UNAVAILABLE')
-        db = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=.1)
+        db = sqlite3.connect(_readonly_uri(path), uri=True, timeout=.1)
         with Sync(db, clock=self.clock, redact=str, readonly=True) as sync:
             if not sync.action_scope(binding, key[1], source, cfg['kanban_sync_seconds']):
                 invalid('coverage', 'SOURCE_UNAVAILABLE')
@@ -637,7 +642,7 @@ class Runtime:
                 capacity = self.ctx.get_config('forecast_capacity', {})
                 path = self.data_dir() / 'kanban.db'
                 if path.exists():
-                    connection = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=.1)
+                    connection = sqlite3.connect(_readonly_uri(path), uri=True, timeout=.1)
                     if deadline is not None:
                         connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
                     sync = Sync(connection, clock=self.clock, redact=None, readonly=True)
@@ -780,7 +785,7 @@ class Runtime:
         if not path.exists():
             return (dict(storage='uninitialized', enabled=cfg['kanban_sync_enabled'], coverage='unknown')
                     if operation == 'health' else dict(items=[], next=None, has_more=False))
-        connection = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=.1)
+        connection = sqlite3.connect(_readonly_uri(path), uri=True, timeout=.1)
         if deadline is not None:
             connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
         with Sync(connection, clock=self.clock, redact=lambda text: self.ctx.redact_text(text, force=True), readonly=True) as sync:
@@ -898,7 +903,8 @@ class Runtime:
     def monitor_install(self, monitor, operation, deliver):
         from hermes_constants import get_hermes_home
         home = get_hermes_home().resolve()
-        script = home / 'scripts' / 'hermes-urgency-engine-watchdog.py'
+        # The host resolves a symlinked or junctioned scripts directory; compare like with like.
+        script = (home / 'scripts').resolve() / 'hermes-urgency-engine-watchdog.py'
         content = (Path(__file__).resolve().parent.parent / 'scripts' / 'watchdog.py').read_bytes()
         sha = hashlib.sha256(content).hexdigest()
         if not isinstance(deliver, str) or not deliver or len(deliver) > 256 or any(ord(c) < 32 for c in deliver):
@@ -957,7 +963,6 @@ class Runtime:
             try:
                 with temporary.open('xb') as stream:
                     stream.write(content)
-                import os
                 os.replace(temporary, script)
             except OSError:
                 temporary.unlink(missing_ok=True)
@@ -986,6 +991,8 @@ class Runtime:
             if not script.exists():
                 with script.open('xb') as stream:
                     stream.write(content)
+            else:
+                refresh()
             result = self.cron('create', schedule='every 1m', name='hermes-urgency-engine-watchdog',
                                script=script.name, no_agent=True, deliver=deliver, enabled_toolsets=[])
             found = jobs()

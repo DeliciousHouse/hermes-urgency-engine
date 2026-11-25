@@ -4,7 +4,7 @@ from graphlib import CycleError, TopologicalSorter
 import json
 import re
 
-from .ledger import LedgerError
+from .ledger import LedgerError, _make_dirs, _readonly_uri
 from .runtime import EVIDENCE, MUTATIONS
 
 
@@ -27,10 +27,14 @@ def scope_identity(path, *, initialize=False):
     if not initialize and not path.exists():
         return None
     if initialize:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            _make_dirs(path.parent)
+        except OSError:
+            raise LedgerError('STORAGE_FAILURE', 'desktop_identity',
+                              next_action='Select an existing Hermes profile; a deleted or renamed profile is not recreated.') from None
     connection = None
     try:
-        connection = sqlite3.connect(path if initialize else path.resolve().as_uri() + '?mode=ro',
+        connection = sqlite3.connect(path if initialize else _readonly_uri(path),
                                      uri=not initialize, timeout=5)
         connection.execute('BEGIN IMMEDIATE' if initialize else 'BEGIN')
         if initialize:

@@ -475,6 +475,78 @@ class LedgerTests(unittest.TestCase):
                 self.assertIn('tzdata', caught.exception.next_action)
             self.assertEqual(ledger.connection.execute('SELECT count(*) FROM deadlines').fetchone()[0], 2)
 
+    def test_invalid_deadline_time_restates_rule_with_zone_example(self):
+        """protects=operator can correct a refused deadline; fails_when=only the generic next_action;
+        why_new=naive and Z inputs refused for a non-UTC zone; seam=synthetic TZif; no_claim=rule loosened.
+        """
+        import re
+        from urgency_engine.ledger import LedgerError, _date
+        cases = {'2030-01-01T00:00:00': '2030-01-01T00:00:00-05:00', '2030-01-01T05:00:00Z': '2030-01-01T00:00:00-05:00',
+                 '2030-07-01T12:00:00-05:00': '2030-07-01T13:00:00-04:00', '2030-03-10T02:30:00': '2030-03-10T03:30:00-04:00',
+                 '2030-01-01T00:00': '2030-01-01T00:00:00-05:00', 'tomorrow': None}
+        for at, example in cases.items():
+            with self.subTest(at=at), self.assertRaises(LedgerError) as caught:
+                _date(at, 'Synthetic')
+            error = caught.exception
+            self.assertEqual((error.code, error.field, error.side_effects), ('INVALID_INPUT', 'at', 'none'))
+            self.assertIn('RFC3339 with seconds and an explicit offset', error.next_action)
+            self.assertIn('equals the offset of the timezone at that wall time', error.next_action)
+            found = re.search(r'for example (\S+) for Synthetic\.$', error.next_action)
+            self.assertEqual(found and found.group(1), example)
+            if example:
+                self.assertTrue(_date(example, 'Synthetic'))
+        with self.assertRaises(LedgerError) as caught:
+            _date('2030-01-01T00:00:00Z', 'No/Such_Zone')
+        self.assertEqual(caught.exception.field, 'timezone')
+        with self.open() as ledger:
+            ledger.create_project('p', 'Project', request_id='p', actor='operator')
+            with self.assertRaises(LedgerError) as caught:
+                ledger.set_deadline('d', project_id='p', kind='hard', at='2030-01-01T05:00:00Z', timezone='Synthetic',
+                    owner='operator', source='Plan', request_id='d', actor='operator')
+        self.assertIn('for example 2030-01-01T00:00:00-05:00 for Synthetic.', caught.exception.next_action)
+
+    def test_dot_only_project_and_milestone_ids_are_refused_at_creation(self):
+        """protects=Desktop REST routing; fails_when='.' or '..' becomes a path segment;
+        why_new=URL dot-segment normalization; seam=Ledger API; no_claim=existing dot IDs repaired.
+        """
+        from urgency_engine.ledger import LedgerError
+        with self.open() as ledger:
+            for value in ('.', '..', '...'):
+                with self.subTest(project=value), self.assertRaises(LedgerError) as caught:
+                    ledger.create_project(value, 'Project', request_id='p' + str(len(value)), actor='operator')
+                self.assertEqual((caught.exception.code, caught.exception.field), ('INVALID_INPUT', 'project_id'))
+            ledger.create_project('p.1', 'Project', request_id='p', actor='operator')
+            for value in ('.', '..'):
+                with self.subTest(milestone=value), self.assertRaises(LedgerError) as caught:
+                    ledger.create_milestone(value, project_id='p.1', title='M', request_id='m' + str(len(value)), actor='operator')
+                self.assertEqual((caught.exception.code, caught.exception.field), ('INVALID_INPUT', 'milestone_id'))
+            ledger.create_milestone('.m', project_id='p.1', title='M', request_id='m', actor='operator')
+
+    def test_readonly_uri_keeps_unc_server_and_escapes_names(self):
+        """protects=reads on a network-share home; fails_when=UNC server parsed as URI authority;
+        why_new=as_uri() form; seam=URI text plus a real read-only open; no_claim=a live SMB share.
+        """
+        import os
+        from urgency_engine.ledger import _readonly_uri, open_readonly_ledger
+        if os.name == 'nt':
+            self.assertEqual(_readonly_uri(Path('\\\\server\\share\\a b#%.db')), 'file:////server/share/a%20b%23%25.db?mode=ro')
+            self.assertEqual(_readonly_uri(Path('C:\\x\\y.db')), 'file:///C:/x/y.db?mode=ro')
+        else:
+            self.assertEqual(_readonly_uri(Path('//server/share/a b#%.db')), 'file:////server/share/a%20b%23%25.db?mode=ro')
+            self.assertEqual(_readonly_uri(Path('/x/y.db')), 'file:///x/y.db?mode=ro')
+        folder = self.root / 'odd #%? name' if os.name != 'nt' else self.root / 'odd #% name'
+        folder.mkdir()
+        self.db = folder / 'ledger.db'
+        with self.open() as ledger:
+            ledger.create_project('p', 'Project', request_id='p', actor='operator')
+        with open_readonly_ledger(self.db, clock=lambda: NOW) as ledger:
+            self.assertEqual(ledger.get_project('p')['project_id'], 'p')
+        # Where the local administrative share exists, read the same file through a real UNC path.
+        unc = Path('\\\\localhost\\' + str(self.db)[0] + '$' + str(self.db)[2:]) if os.name == 'nt' else None
+        if unc is not None and unc.exists():
+            with open_readonly_ledger(unc, clock=lambda: NOW) as ledger:
+                self.assertEqual(ledger.get_project('p')['project_id'], 'p')
+
     def test_concurrent_initialization_and_corrupt_preservation(self):
         """protects=non-destructive schema; fails_when=init races/drops state;
         why_new=migrations; seam=process gate; no_claim=future schema migration.
