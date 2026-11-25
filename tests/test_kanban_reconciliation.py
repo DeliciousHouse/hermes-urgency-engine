@@ -83,6 +83,35 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(self.ledger.get_task('demo', 'task-0')['revision'], first['revision'])
         self.assertEqual(self.source.calls, 3)
 
+    def test_caller_deadline_flushes_partial_instead_of_failing(self):
+        """A tick budget ends collection on the partial path, keeping validated work."""
+        import time
+        from types import SimpleNamespace
+        self.source.rows = [dict(id=f'task-{index}', tenant='synthetic') for index in range(3)]
+        result = self.sync.scan(self.cfg, self.ledger, None, self.root / 'data.db', self.source,
+                                request_id='expired', reason='Fixture', deadline=time.monotonic() - 1)
+        self.assertEqual((result['state'], self.source.calls), ('partial', 0))
+        self.assertIsNone(self.sync.meta('last_error'))
+
+        detail = self.source.detail
+        budget = {}
+
+        def cut_by_deadline(binding, task_id):
+            if task_id == 'task-1':
+                budget['end'] = 0  # the caller's deadline passes during this read
+                raise LedgerError('SOURCE_TIMEOUT', 'kanban', 'board')
+            return detail(binding, task_id)
+
+        with patch.object(self.source, 'detail', side_effect=cut_by_deadline), \
+             patch.object(kanban, 'time', SimpleNamespace(monotonic=lambda: 10 if 'end' in budget else 0)):
+            result = self.sync.scan(self.cfg, self.ledger, None, self.root / 'data.db', self.source,
+                                    request_id='cut', reason='Fixture', deadline=5)
+        self.assertEqual(result['state'], 'partial')
+        self.assertIsNone(self.sync.meta('last_error'))
+        self.assertEqual(self.sync.meta('cursor'), ['demo', 'synthetic', 'task-0'])
+        self.assertEqual(self.ledger.get_task('demo', 'task-0')['goal'], 'Deliver')
+        self.assertEqual(self.scan(), dict(state='complete', count=2))
+
     def test_incomplete_inventory_does_not_record_absence(self):
         self.scan('seed')
         self.ledger.create_project('other', 'Other', request_id='other', actor='test')

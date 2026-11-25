@@ -569,6 +569,74 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(health['last_result']['state'], 'partial')
         self.assertIsNone(health['last_success'])
 
+    def test_tick_stops_source_sync_at_launcher_deadline_and_still_evaluates(self):
+        """protects=launcher budget; fails_when=a slow sync outlives the launcher timeout;
+        why_new=tick wall-clock deadline; seam=real stores/faulted native boundary;
+        no_claim=real Hermes cold starts.
+        """
+        import os
+        import time
+        from datetime import timedelta
+        from unittest.mock import patch
+        from urgency_engine import runtime as runtime_module
+        from urgency_engine.kanban import Sync, NativeSource
+        from urgency_engine.watchdog import Monitor
+        from test_kanban_reconciliation import Source
+        self.project()
+        self.ctx.settings.update(watchdog_enabled=True, kanban_sync_enabled=True,
+            kanban_bindings=[dict(board='demo', tenant='synthetic', project_id='p')])
+        with self.runtime.open(self.runtime.settings()) as ledger:
+            ledger.set_deadline('due', project_id='p', kind='hard', at=self.now.isoformat(),
+                timezone='UTC', owner='fixture', source='fixture', request_id='due', actor='test')
+        self.now += timedelta(seconds=1)
+        source = Source()
+        with patch.dict(os.environ, {'URGENCY_ENGINE_TICK_DEADLINE': repr(time.time() - 1)}):
+            self.assertEqual(runtime_module.tick_source_budget(), 0)
+            with patch.object(Sync, 'host', side_effect=lambda **kw: Sync(sqlite3.connect(self.root / 'kanban.db'), **kw)), \
+                 patch.object(Monitor, 'host', side_effect=lambda **kw: Monitor.open(self.root / 'watchdog.db', **kw)), \
+                 patch.object(NativeSource, 'inventory', side_effect=source.inventory), \
+                 patch.object(NativeSource, 'detail', side_effect=source.detail), \
+                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                code = self.runtime.cli(setup_parser(Parser()).parse_args(['watchdog', 'tick', '--force']))
+        self.assertEqual((code, source.calls), (0, 0))
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now, readonly=True) as monitor:
+            self.assertIn('expired_deadline', [item['detector'] for item in monitor.page('incidents')['items']])
+        self.assertEqual(self.runtime.kanban_read('health', {})['last_result']['state'], 'partial')
+        for value, budget in (('nan', runtime_module.TICK_SOURCE_SECONDS), ('junk', runtime_module.TICK_SOURCE_SECONDS),
+                              (repr(time.time() + 10 ** 6), runtime_module.TICK_SOURCE_SECONDS)):
+            with patch.dict(os.environ, {'URGENCY_ENGINE_TICK_DEADLINE': value}):
+                self.assertEqual(runtime_module.tick_source_budget(), budget)
+
+    def test_launcher_timeout_covers_cold_start_budget_and_reserve(self):
+        """The launcher must outlast tick startup plus the sync budget and its flush."""
+        import importlib.util
+        import time
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from urgency_engine.runtime import TICK_SOURCE_SECONDS
+        path = Path(__file__).resolve().parents[1] / 'scripts' / 'watchdog.py'
+        spec = importlib.util.spec_from_file_location('urgency_launcher_fixture', path)
+        launcher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(launcher)
+        calls = []
+
+        def run(argv, **options):
+            calls.append((argv, options, time.time()))
+            if 'plugins' in argv:
+                return SimpleNamespace(returncode=0, stdout=json.dumps(
+                    [{'name': 'hermes-urgency-engine', 'status': 'enabled'}]))
+            return SimpleNamespace(returncode=0)
+
+        with patch.object(launcher.subprocess, 'run', side_effect=run):
+            self.assertEqual(launcher.main(), 0)
+        (listing, list_options, _), (tick, options, started) = calls
+        cold_start = 20  # measured worst Hermes CLI start on Windows
+        self.assertGreaterEqual(list_options['timeout'], 2 * cold_start)
+        self.assertEqual(tick[-3:], ['urgency', 'watchdog', 'tick'])
+        sync_until = float(options['env']['URGENCY_ENGINE_TICK_DEADLINE']) - started
+        self.assertGreaterEqual(sync_until, cold_start + TICK_SOURCE_SECONDS)
+        self.assertGreaterEqual(options['timeout'] - sync_until, 30)
+
     def test_diagnose_reports_actual_schema_after_unknown_work_write(self):
         """protects=upgrade diagnostics; fails_when=outdated schema reported;
         why_new=migration; seam=real Runtime; no_claim=installed upgrade.

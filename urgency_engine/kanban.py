@@ -42,13 +42,14 @@ def fail(field, code='SOURCE_MALFORMED') -> NoReturn:
 
 
 def read_process(argv, *, timeout: float = 20, limit=16 * 1024 * 1024, receipt=None,
-                 snapshot_phases=False):
+                 snapshot_phases=False, deadline=None):
     """Bound stdout in memory; retain no stderr or native private task bodies.
 
     Every read owns its process tree, which is killed when the read returns.
+    An optional ``deadline`` (``time.monotonic()``) caps every phase budget.
     """
     return read_snapshot_process(argv, timeout, limit, SNAPSHOT_PHASES if snapshot_phases else (),
-                                 receipt=receipt)
+                                 receipt=receipt, deadline=deadline)
 
 
 def decode_source(output):
@@ -66,7 +67,7 @@ def decode_source(output):
         fail('json')
 
 
-def read_snapshot_process(argv, timeout, limit, phases=SNAPSHOT_PHASES, *, receipt=None):
+def read_snapshot_process(argv, timeout, limit, phases=SNAPSHOT_PHASES, *, receipt=None, deadline=None):
     """Each ordered phase gets one budget, including output drain in the last phase."""
     signals = queue.SimpleQueue()
     output = bytearray()
@@ -95,8 +96,13 @@ def read_snapshot_process(argv, timeout, limit, phases=SNAPSHOT_PHASES, *, recei
         finally:
             stream.close()
 
+    def until(start):
+        return start + timeout if deadline is None else min(start + timeout, deadline)
+
     phase = 'startup' if phases else 'transport'
-    end = time.monotonic() + timeout
+    end = until(time.monotonic())
+    if end <= time.monotonic():
+        fail(phase, 'SOURCE_TIMEOUT')
     try:
         with snapshot_process(argv) as child:
             reader = threading.Thread(target=drain, args=(child.stdout,), daemon=True)
@@ -117,7 +123,7 @@ def read_snapshot_process(argv, timeout, limit, phases=SNAPSHOT_PHASES, *, recei
                     if error:
                         fail(phase, error)
                     break
-                phase, end = next_phase, arrived + timeout
+                phase, end = next_phase, until(arrived)
     except (queue.Empty, subprocess.TimeoutExpired):
         fail(phase, 'SOURCE_TIMEOUT')
     except OSError:
@@ -515,7 +521,8 @@ class Sync:
                 else:
                     fcntl.flock(lock, fcntl.LOCK_UN)
 
-    def scan(self, cfg, ledger, monitor, ledger_path, source, *, request_id, reason):
+    def scan(self, cfg, ledger, monitor, ledger_path, source, *, request_id, reason, deadline=None):
+        """``deadline`` (``time.monotonic()``) stops detail reads and returns partial."""
         cfg = settings(cfg)
         if not cfg['kanban_sync_enabled']:
             return dict(state='disabled', count=0)
@@ -543,7 +550,7 @@ class Sync:
             try:
                 self.withdraw_graph(cfg, monitor, ledger_path)
                 result = self._scan(cfg, ledger, monitor, ledger_path, source,
-                                    request_id=request_id, reason=reason)
+                                    request_id=request_id, reason=reason, deadline=deadline)
             except Exception as exc:
                 code = exc.code if isinstance(exc, LedgerError) else 'SOURCE_ERROR'
                 with self.transaction():
@@ -566,7 +573,7 @@ class Sync:
                 self.db.execute("UPDATE sync_requests SET state='scan_complete',result_json=? WHERE request_id=?", (_json(result), request_id))
             return result
 
-    def _scan(self, cfg, ledger, monitor, ledger_path, source, *, request_id, reason):
+    def _scan(self, cfg, ledger, monitor, ledger_path, source, *, request_id, reason, deadline=None):
         _id(request_id, 'request_id')
         _text(reason, 'reason', 1024)
         cfg = settings(cfg)
@@ -642,6 +649,15 @@ class Sync:
             plans.clear()
             batch_bytes = 0
 
+        def expired():
+            # Real time: the caller's deadline also caps the native child it starts.
+            return deadline is not None and time.monotonic() >= deadline
+
+        def partial():
+            apply_collected()
+            self.admit_graph(cfg, monitor, set(), ledger_path)
+            return dict(state='partial', count=count, cursor=self.meta('cursor'))
+
         for binding, rows in inventories:
             for row in sorted(rows, key=lambda r: r['id']):
                 task_id = _id(row.get('id'), 'task_id')
@@ -658,13 +674,14 @@ class Sync:
                     if exc.code != 'NOT_FOUND':
                         raise
                     task = None
-                if processed and monotonic() >= detail_deadline:
-                    apply_collected()
-                    self.admit_graph(cfg, monitor, set(), ledger_path)
-                    return dict(state='partial', count=count, cursor=self.meta('cursor'))
+                if (processed and monotonic() >= detail_deadline) or expired():
+                    return partial()
                 try:
                     document = source.detail(binding, task_id)
                 except LedgerError as exc:
+                    if exc.code == 'SOURCE_TIMEOUT' and expired():
+                        # The caller's budget, not the source, cut this read short.
+                        return partial()
                     if exc.code == 'SOURCE_TIMEOUT' and count:
                         # Retain only the validated prefix, not the timed-out row.
                         # The failed request stays pending and retains unknown coverage.

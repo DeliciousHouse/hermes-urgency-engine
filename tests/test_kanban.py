@@ -522,6 +522,30 @@ class TransportTests(unittest.TestCase):
             # gstack-timing-ok: bound the real inherited-pipe drain, not the child sleep.
             self.assertLess(elapsed, 2)
 
+    def test_caller_deadline_caps_every_child_phase(self):
+        """A tick budget must end a read that per-phase timeouts would keep renewing."""
+        import sys
+        import time
+        board = 'print("@urgency:board", flush=True); '
+        for script, options, field in (
+            ('import time; time.sleep(5)', {}, 'transport'),
+            (board + 'import time; time.sleep(5)', {'snapshot_phases': True}, 'board'),
+        ):
+            with self.subTest(field=field):
+                start = time.monotonic()
+                with self.assertRaises(LedgerError) as caught:
+                    kanban.read_process([sys.executable, '-c', script], timeout=20,
+                                        deadline=start + 1, **options)
+                self.assertEqual((caught.exception.code, caught.exception.field), ('SOURCE_TIMEOUT', field))
+                # gstack-timing-ok: the deadline, not the 20 s timeout, ends the read.
+                self.assertLess(time.monotonic() - start, 4)
+        start = time.monotonic()
+        with self.assertRaises(LedgerError) as caught:
+            kanban.read_process([sys.executable, '-c', 'print("[]")'], deadline=start)
+        self.assertEqual(caught.exception.code, 'SOURCE_TIMEOUT')
+        # gstack-timing-ok: an expired deadline starts no child at all.
+        self.assertLess(time.monotonic() - start, .5)
+
 
 class ProjectionTests(unittest.TestCase):
     def test_configuration_is_explicit_bounded_and_disjoint(self):

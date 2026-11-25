@@ -81,7 +81,21 @@ The native `post_tool_call` observer recognizes structured `ok`/`success` boolea
 and errors; ambiguous output is unknown. It never stores tool arguments, results,
 prompts or exception text. Host session identity is not a Kanban task ID.
 Optional [Kanban synchronization](kanban.md) admits canonical worker/dependency
-facts on the existing tick. Lifecycle hooks only mark dirty bindings; missing
+facts on the existing tick.
+
+Tick timing: the owned launcher allows `plugins list` 60 seconds and the tick
+180 seconds, because one Hermes CLI start can take 20 seconds on Windows. It
+passes the tick a wall-clock sync deadline 40 seconds before its own timeout
+(`URGENCY_ENGINE_TICK_DEADLINE`). The tick's Kanban sync uses at most 100
+seconds and never runs past that deadline. Every native child is cut off at the
+deadline, and collection returns `partial` with validated work flushed, so the
+deadline and checkpoint evaluation always runs in the same tick. A tick run by
+hand uses the 100-second default. A launcher installed by an earlier release
+keeps its old bytes. Ownership is checked against the packaged launcher, so
+reinstall then reports `INSTALL_CONFLICT` on `launcher`. Upgrading an existing
+installation therefore needs the owned job and launcher replaced deliberately.
+
+Lifecycle hooks only mark dirty bindings; missing
 worker/dependency telemetry stays unknown. Explicit availability/dependency
 facts retain their own observation time; unrelated telemetry does not refresh it.
 Compact admitted evidence watermarks survive raw-event pruning. Retention expiry
