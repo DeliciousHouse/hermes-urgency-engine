@@ -818,9 +818,9 @@ class Runtime:
                 if operation == 'export':
                     data.update(table=table, retention_days=cfg['watchdog_retention_days'], limitations=LIMITATIONS)
             else:
-                if operation != 'tick':
-                    # The owned no-agent cron launcher runs tick; controls and observations are operator-only.
-                    interventions.operator_only()
+                # A tick spends notice budget and stamps source attempts, so a worker could
+                # absorb its own notices. The owned no-agent cron launcher carries no worker marker.
+                interventions.operator_only()
                 if operation == 'observe':
                     with Path(args.json_file).open('rb') as stream:
                         event = read_json(stream)

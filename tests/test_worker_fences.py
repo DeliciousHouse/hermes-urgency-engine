@@ -75,9 +75,10 @@ class WorkerFenceTests(unittest.TestCase):
             code, result = self.cli('apply', 'revise_deadline', '--json-file', str(path))
         self.assertEqual(code, 0, result)
 
-    def test_watchdog_and_kanban_controls_refused_but_tick_runs(self):
-        """protects=monitor integrity; fails_when=worker pauses, removes or feeds its own watchdog."""
-        commands = [('watchdog', 'pause', '--request-id', 'x', '--reason', 'ok'),
+    def test_watchdog_and_kanban_controls_refused_but_reads_run(self):
+        """protects=monitor integrity; fails_when=worker pauses, removes, feeds or ticks its own watchdog."""
+        commands = [('watchdog', 'tick', '--force'), ('watchdog', 'tick'),
+                    ('watchdog', 'pause', '--request-id', 'x', '--reason', 'ok'),
                     ('watchdog', 'resume', '--request-id', 'x', '--reason', 'ok'),
                     ('watchdog', 'install'), ('watchdog', 'uninstall'),
                     ('watchdog', 'observe', '--json-file', str(self.root / 'missing.json')),
@@ -91,13 +92,35 @@ class WorkerFenceTests(unittest.TestCase):
                 code, result = self.cli(*argv)
                 self.assertEqual((code, result['error']['code']), (1, 'SOURCE_DENIED'), argv)
             self.assertEqual(opened, [])
+        for marker in WORKERS:
+            with patch.dict(os.environ, dict(CLEAR, **marker)):
+                self.assertEqual(self.cli('watchdog', 'health')[0], 0, marker)
+
+    def test_worker_tick_cannot_spend_operator_notices(self):
+        """protects=operator notices; fails_when=worker tick absorbs its own watchdog notice budget."""
         self.ctx.settings['watchdog_enabled'] = True
-        with patch.object(Monitor, 'host', side_effect=monitor):
+        with self.runtime.open(self.runtime.settings()) as ledger:
+            ledger.upsert_task('b', 'run', project_id='p', goal='work', status='running', remaining_seconds=600,
+                               expected_revision=0, request_id='run', actor='test', reason='plan')
+        host = lambda **kw: Monitor.open(self.root / 'watchdog.db', **kw)
+        with host(clock=self.runtime.clock) as monitor:
+            monitor.observe(dict(request_id='gone', reason='fixture', project_id='p', board_id='b', task_id='run',
+                                 kind='task_signal', occurred_at=self.now.isoformat(),
+                                 data={'agent_available': False}), self.root / 'data.db')
+
+        def counts():
+            with host(clock=self.runtime.clock, readonly=True) as monitor:
+                return [row['notice_count'] for row in monitor.page('incidents')['items']]
+        with patch.object(Monitor, 'host', side_effect=host):
             for marker in WORKERS:
                 with patch.dict(os.environ, dict(CLEAR, **marker)):
-                    self.assertEqual(self.cli('watchdog', 'tick', '--force')[0], 0, marker)
-                    self.assertEqual(self.cli('watchdog', 'health')[0], 0, marker)
-        self.assertEqual(len(opened), len(WORKERS))
+                    code, result = self.cli('watchdog', 'tick', '--force')
+                self.assertEqual((code, result['error']['code']), (1, 'SOURCE_DENIED'), marker)
+            self.assertFalse(any(counts()))
+            with patch.dict(os.environ, CLEAR):
+                code, result = self.cli('watchdog', 'tick', '--force')
+        self.assertEqual((code, len(result['data']['notices'])), (0, 1), result)
+        self.assertEqual(counts(), [1])
 
     def tool(self, operation, session_id='s', **arguments):
         with patch.dict(os.environ, dict(CLEAR, **WORKERS[0])):

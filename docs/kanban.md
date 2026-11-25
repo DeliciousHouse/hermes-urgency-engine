@@ -35,8 +35,8 @@ All CLI rows begin with `hermes urgency kanban`.
 | `pause`, `resume` | Required `--request-id ID --reason TEXT`; persisted source control, not watchdog control |
 
 `sync`, `pause` and `resume` return `SOURCE_DENIED` (field `context`) in a worker
-context, as [operator writes](runtime.md#operator-writes) do. The due scan inside
-`watchdog tick` is not affected.
+context, as [operator writes](runtime.md#operator-writes) do. So does `watchdog
+tick`, which runs the due scan.
 
 Request IDs use the [ledger identifier rules](ledger.md#mutation-signatures).
 Reasons are nonempty and at most 1024 characters. Exact request replay returns
@@ -191,8 +191,8 @@ show fallback on denial or missing capability. **Native `kanban list` recomputes
 dependency readiness**; opting in accepts that normal native effect. Collection
 is therefore not described as side-effect-free, even though this adapter never
 writes board rows directly or bypasses worker fences. Cached conversational
-reads do not invoke that CLI. A worker/delegate or database-pinned `snapshot`, or
-a due scan inside `watchdog tick` in such a process, must explicitly identify the same board in `HERMES_KANBAN_BOARD`; mismatched or
+reads do not invoke that CLI. A worker/delegate or database-pinned `snapshot`
+must explicitly identify the same board in `HERMES_KANBAN_BOARD`; mismatched or
 unidentified bindings return `SOURCE_DENIED`. The adapter retains native pins
 and never relabels redirected board rows as a different configured board.
 
