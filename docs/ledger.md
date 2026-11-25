@@ -166,7 +166,7 @@ Criteria are lists of **exactly** these keys:
  required: bool, expected_sha256: lowercase 64-character hex string | None}
 ```
 
-Weights must be positive; numeric durations must be nonnegative. Numbers are finite int/float, not bool, and at most `1e12`. Identifiers are 1–128 characters, with no path separators or control characters. Ordinary text is nonempty, at most 4096 characters, with no NUL or unpaired Unicode surrogate. Assignee uses identifier limits. Commands, after canonical JSON serialization, are capped at 256 KiB. Supported capacity is 10,000 tasks per project and 100 active criteria per task; excess produces `INVALID_INPUT` (task capacity field `tasks_capacity`). Queries use project, active-criterion, evidence and audit indexes. The ledger imposes no automatic audit retention; disk use grows with history.
+Weights must be positive; numeric durations must be nonnegative. Numbers are finite int/float, not bool, and at most `1e12`. Identifiers are 1–128 characters, with no path separators or control characters. A new project or milestone ID must also contain a character other than `.`, because Desktop puts those IDs in URL path segments, where `.` and `..` are normalized away. Ordinary text is nonempty, at most 4096 characters, with no NUL or unpaired Unicode surrogate. Assignee uses identifier limits. Commands, after canonical JSON serialization, are capped at 256 KiB. Supported capacity is 10,000 tasks per project and 100 active criteria per task; excess produces `INVALID_INPUT` (task capacity field `tasks_capacity`). Queries use project, active-criterion, evidence and audit indexes. The ledger imposes no automatic audit retention; disk use grows with history.
 
 ### Unknown remaining work and incomplete scope
 

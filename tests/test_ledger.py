@@ -475,6 +475,23 @@ class LedgerTests(unittest.TestCase):
                 self.assertIn('tzdata', caught.exception.next_action)
             self.assertEqual(ledger.connection.execute('SELECT count(*) FROM deadlines').fetchone()[0], 2)
 
+    def test_dot_only_project_and_milestone_ids_are_refused_at_creation(self):
+        """protects=Desktop REST routing; fails_when='.' or '..' becomes a path segment;
+        why_new=URL dot-segment normalization; seam=Ledger API; no_claim=existing dot IDs repaired.
+        """
+        from urgency_engine.ledger import LedgerError
+        with self.open() as ledger:
+            for value in ('.', '..', '...'):
+                with self.subTest(project=value), self.assertRaises(LedgerError) as caught:
+                    ledger.create_project(value, 'Project', request_id='p' + str(len(value)), actor='operator')
+                self.assertEqual((caught.exception.code, caught.exception.field), ('INVALID_INPUT', 'project_id'))
+            ledger.create_project('p.1', 'Project', request_id='p', actor='operator')
+            for value in ('.', '..'):
+                with self.subTest(milestone=value), self.assertRaises(LedgerError) as caught:
+                    ledger.create_milestone(value, project_id='p.1', title='M', request_id='m' + str(len(value)), actor='operator')
+                self.assertEqual((caught.exception.code, caught.exception.field), ('INVALID_INPUT', 'milestone_id'))
+            ledger.create_milestone('.m', project_id='p.1', title='M', request_id='m', actor='operator')
+
     def test_readonly_uri_keeps_unc_server_and_escapes_names(self):
         """protects=reads on a network-share home; fails_when=UNC server parsed as URI authority;
         why_new=as_uri() form; seam=URI text plus a real read-only open; no_claim=a live SMB share.

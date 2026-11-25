@@ -51,6 +51,16 @@ def _id(value, field):
     return value
 
 
+def _path_id(value, field):
+    # Desktop REST puts project and milestone IDs in URL path segments, where a
+    # dot-only segment (even percent-encoded) is normalized away. Checked at creation only,
+    # so existing records stay readable.
+    _id(value, field)
+    if not value.strip('.'):
+        _invalid(field)
+    return value
+
+
 def _readonly_uri(path):
     """SQLite read-only URI with an empty authority, so a UNC path keeps its server."""
     from urllib.parse import quote
@@ -392,7 +402,7 @@ class Ledger:
 
     @_command
     def create_project(self, project_id, title, *, request_id, actor):
-        _id(project_id, 'project_id')
+        _path_id(project_id, 'project_id')
         _text(title, 'title')
         if self.connection.execute('SELECT 1 FROM projects WHERE project_id=?', (project_id,)).fetchone():
             raise LedgerError('REVISION_CONFLICT', 'create_project', 'project_id')
@@ -725,7 +735,7 @@ class Ledger:
 
     @_command
     def create_milestone(self, milestone_id, *, project_id, title, request_id, actor):
-        _id(milestone_id, 'milestone_id')
+        _path_id(milestone_id, 'milestone_id')
         _text(title, 'title')
         self._project(project_id)
         if self.connection.execute('SELECT 1 FROM milestones WHERE milestone_id=?', (milestone_id,)).fetchone():
