@@ -796,7 +796,8 @@ class Runtime:
                 if not cfg['kanban_sync_enabled'] or (not cfg['kanban_bindings'] and not (self.data_dir() / 'kanban.db').exists()):
                     data = dict(state='disabled')
                 else:
-                    with Sync.host(clock=self.clock, redact=lambda text: self.ctx.redact_text(text, force=True)) as sync:
+                    with Sync.host(clock=self.clock, redact=lambda text: self.ctx.redact_text(text, force=True),
+                                   monitor_cfg=self.monitor_config()) as sync:
                         if operation in ('pause', 'resume'):
                             data = sync.control(operation, args.request_id, args.reason)
                         else:
@@ -906,7 +907,8 @@ class Runtime:
         cfg = self.kanban_config()
         if not cfg['kanban_sync_enabled'] or (not cfg['kanban_bindings'] and not (self.data_dir() / 'kanban.db').exists()):
             return None
-        with Sync.host(clock=self.clock, redact=lambda text: self.ctx.redact_text(text, force=True)) as sync:
+        with Sync.host(clock=self.clock, redact=lambda text: self.ctx.redact_text(text, force=True),
+                       monitor_cfg=self.monitor_config()) as sync:
             if sync.meta('paused', False):
                 return None
             last = sync.meta('last_attempt')
@@ -920,7 +922,8 @@ class Runtime:
                     sync.scan(cfg, ledger, monitor, self.data_dir() / 'data.db', source,
                               request_id=uuid.uuid4().hex, reason='Existing watchdog tick', deadline=deadline)
                 except LedgerError as exc:
-                    if exc.code not in ('SCOPE_CONFLICT', 'REVISION_CONFLICT') and not exc.code.startswith('SOURCE_'):
+                    if (exc.code not in ('SCOPE_CONFLICT', 'REVISION_CONFLICT', 'CAPACITY_EXCEEDED')
+                            and not exc.code.startswith('SOURCE_') and exc.field != 'tasks_capacity'):
                         raise
                     # scan persists the source error and revokes graph coverage.
                     # A failed source refresh must not disable unrelated monitoring.

@@ -18,6 +18,10 @@ DEFAULTS = dict(watchdog_enabled=False, watchdog_normal_seconds=300, watchdog_ri
                 watchdog_stall_seconds=1800, watchdog_claim_seconds=900, watchdog_notice_limit=3,
                 watchdog_retention_days=30, watchdog_max_rows=10000)
 TICK_NOTICE_LIMIT = 40
+# Raw observations no detector reads again: unassigned, or behind the task's evidence watermark.
+CONSUMED = '''(o.task_id IS NULL OR EXISTS (SELECT 1 FROM monitor_meta m JOIN monitor_audit a
+    ON a.request_id=o.event_id WHERE m.key='evidence:' || json_array(o.board_id,o.task_id)
+    AND json_extract(m.value_json,'$.sequence')>=a.sequence))'''
 CLAIM_SOURCES = ('heartbeat_at', 'claim_at')
 LIMITATIONS = ['Plans are recommendations, not authorization or executed recovery.',
                'Byte identity is not semantic acceptance. Missing telemetry is unknown.',
@@ -326,12 +330,29 @@ class Monitor:
                 self.put('next_due', None)
             return self.audit(request_id, action, payload, {'paused': action == 'pause'})
 
+    def rows(self):
+        return sum(self.db.execute('SELECT count(*) FROM ' + table).fetchone()[0]
+                   for table in ('observations', 'task_signals', 'incidents', 'plans', 'monitor_audit', 'monitor_meta', 'dependencies'))
+
     def capacity(self, cfg, added=1):
-        # Audit replay is protected; a full store refuses writes rather than evicting safety.
-        count = sum(self.db.execute('SELECT count(*) FROM ' + table).fetchone()[0]
-                    for table in ('observations', 'task_signals', 'incidents', 'plans', 'monitor_audit', 'monitor_meta', 'dependencies'))
-        if count + added > cfg['watchdog_max_rows']:
-            fail('watchdog_max_rows', 'CAPACITY_EXCEEDED')
+        # Safety state is never evicted. Raw telemetry that no detector still needs
+        # (unassigned, or already folded into its task's evidence) is reclaimed
+        # oldest first, with its observe receipt, before a write is refused.
+        excess = self.rows() + added - cfg['watchdog_max_rows']
+        if excess > 0:
+            # ponytail: a full store rescans observations per write; add headroom if that shows up in ticks.
+            self.db.execute('DELETE FROM observations WHERE event_id IN (SELECT event_id FROM observations AS o WHERE '
+                            + CONSUMED + ' ORDER BY received_at, event_id LIMIT ?)', (excess,))
+            self.drop_orphan_receipts()
+            if self.rows() + added > cfg['watchdog_max_rows']:
+                fail('watchdog_max_rows', 'CAPACITY_EXCEEDED')
+
+    def drop_orphan_receipts(self):
+        # An observe receipt only guards replay of its retained observation. The
+        # newest sequence stays so SQLite cannot reuse evidence watermarks.
+        self.db.execute("""DELETE FROM monitor_audit WHERE action='observe'
+            AND sequence<(SELECT max(sequence) FROM monitor_audit)
+            AND NOT EXISTS (SELECT 1 FROM observations WHERE event_id=monitor_audit.request_id)""")
 
     def observe(self, event, ledger_path, cfg=None, *, source='local-operator'):
         cfg = settings(cfg or DEFAULTS)
@@ -390,10 +411,9 @@ class Monitor:
 
     def prune(self, cfg):
         cutoff = stamp(self.clock() - timedelta(days=cfg['watchdog_retention_days']))
-        self.db.execute('''DELETE FROM observations AS o WHERE received_at<? AND
-            (task_id IS NULL OR EXISTS (SELECT 1 FROM monitor_meta m JOIN monitor_audit a
-             ON a.request_id=o.event_id WHERE m.key='evidence:' || json_array(o.board_id,o.task_id)
-             AND json_extract(m.value_json,'$.sequence')>=a.sequence))''', (cutoff,))
+        # The receipt scan runs only when retention removed something; capacity() always runs it.
+        if self.db.execute('DELETE FROM observations AS o WHERE received_at<? AND ' + CONSUMED, (cutoff,)).rowcount:
+            self.drop_orphan_receipts()
         # Keep one episode high-water mark per fingerprint, not the expired rows.
         self.db.execute('''INSERT INTO monitor_meta(key,value_json)
             SELECT 'episode:' || fingerprint, CAST(MAX(episode) AS TEXT)
@@ -618,6 +638,8 @@ class Monitor:
                      evaluations=evaluation_counts, unknown_policy='retain_episode_no_reminder',
                      missing_signals='insufficient_evidence', source_consistency='two snapshots; subsequent changes observed next tick'))
             self.put('next_due', stamp(now + timedelta(seconds=cfg['watchdog_risk_seconds'] if high else cfg['watchdog_normal_seconds'])))
+            # Final cursor and health keys also count, including the first deadline cursor.
+            self.capacity(cfg, 0)
             return dict(notices=notices, omitted=omitted, evaluated=True, transitions=transitions, scan_complete=complete)
 
     @staticmethod

@@ -524,29 +524,89 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(dependencies, ['available', 'available'])
             last_success = self.runtime.kanban_read('health', {})['last_success']
             title = 'Refresh'
-            for _ in range(3):
-                self.now += timedelta(seconds=301)
-                code, err = command('watchdog', 'tick')
-                health = self.runtime.kanban_read('health', {})
-                self.assertTrue(raced)
-                self.assertEqual(health['last_error'], 'REVISION_CONFLICT')
-                self.assertEqual(health['last_success'], last_success)
-                self.assertEqual(health['last_attempt'], self.now.isoformat())
-                self.assertIsNotNone(health['incomplete_scan'])
-                evaluated, detectors, dependencies = monitor_state()
-                self.assertIn('expired_deadline', detectors, err)
-                self.assertEqual(code, 0, err)
-                assert evaluated is not None
-                self.assertEqual(datetime.fromisoformat(evaluated), self.now)
-                self.assertEqual(dependencies, ['unknown', 'unknown'])
-                self.assertEqual([item['coverage'] for item in self.runtime.kanban_read('tasks', dict(project_id='p'))['items']],
-                                 ['unknown', 'unknown'])
+            self.now += timedelta(seconds=301)
+            code, err = command('watchdog', 'tick')
+            health = self.runtime.kanban_read('health', {})
+            self.assertTrue(raced)
+            self.assertEqual(health['last_error'], 'REVISION_CONFLICT')
+            self.assertEqual(health['last_success'], last_success)
+            self.assertEqual(health['last_attempt'], self.now.isoformat())
+            self.assertIsNotNone(health['incomplete_scan'])
+            evaluated, detectors, dependencies = monitor_state()
+            self.assertIn('expired_deadline', detectors, err)
+            self.assertEqual(code, 0, err)
+            assert evaluated is not None
+            self.assertEqual(datetime.fromisoformat(evaluated), self.now)
+            self.assertEqual(dependencies, ['unknown', 'unknown'])
+            self.assertEqual([item['coverage'] for item in self.runtime.kanban_read('tasks', dict(project_id='p'))['items']],
+                             ['unknown', 'unknown'])
+            # The stale intent is cancelled on the next scan and its card is
+            # collected again from the current revision: no permanent wedge.
+            self.now += timedelta(seconds=301)
+            code, err = command('watchdog', 'tick')
+            health = self.runtime.kanban_read('health', {})
+            self.assertEqual(code, 0, err)
+            self.assertIsNone(health['last_error'])
+            self.assertIsNone(health['incomplete_scan'])
+            self.assertEqual(health['last_success'], self.now.isoformat())
             code, err = command('kanban', 'sync', '--request-id', 'explicit', '--reason', 'Fixture')
-            self.assertEqual(code, 1)
-            self.assertEqual(json.loads(err)['error']['code'], 'REVISION_CONFLICT')
+            self.assertEqual(code, 0, err)
         with self.runtime.open(self.runtime.settings()) as ledger:
             self.assertEqual(ledger.get_task('demo', 't0')['remaining_seconds'], 7)
-            self.assertEqual(ledger.get_task('demo', 't1')['goal'], 'Initial')
+            self.assertEqual(ledger.get_task('demo', 't0')['goal'], 'Refresh')
+            self.assertEqual(ledger.get_task('demo', 't1')['goal'], 'Refresh')
+
+    def kanban_stores(self, rows, **settings):
+        from unittest.mock import patch
+        from urgency_engine.kanban import Sync, NativeSource
+        from urgency_engine.watchdog import Monitor
+        self.project()
+        self.ctx.settings.update(watchdog_enabled=True, kanban_sync_enabled=True,
+            kanban_bindings=[dict(board='demo', tenant='synthetic', project_id='p')], **settings)
+        for target, value in ((Sync, lambda **kw: Sync(sqlite3.connect(self.root / 'kanban.db'), **kw)),
+                              (Monitor, lambda **kw: Monitor.open(self.root / 'watchdog.db', **kw))):
+            self.enterContext(patch.object(target, 'host', side_effect=value))
+        self.enterContext(patch.object(NativeSource, 'inventory', return_value=rows))
+        self.enterContext(patch.object(NativeSource, 'detail', side_effect=lambda binding, task_id: dict(
+            task=dict(id=task_id, tenant='synthetic', title='Work', status='ready'), parents=[])))
+        parser = setup_parser(Parser())
+        def command(*args):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                return self.runtime.cli(parser.parse_args(args))
+        return command
+
+    def test_kanban_sync_admits_monitor_facts_under_the_configured_row_cap(self):
+        """protects=operator watchdog limits; fails_when=sync falls back to default monitor settings;
+        why_new=sync is a second Monitor writer; seam=real stores, synthetic source; no_claim=disk quota.
+        """
+        from urgency_engine.watchdog import Monitor
+        command = self.kanban_stores([dict(id=f't{n:02d}', tenant='synthetic') for n in range(30)],
+                                     watchdog_max_rows=100)
+        self.assertEqual(command('kanban', 'sync', '--request-id', 'capped', '--reason', 'Fixture'), 0)
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now, readonly=True) as monitor:
+            tables = ('observations', 'task_signals', 'incidents', 'plans', 'monitor_audit', 'monitor_meta', 'dependencies')
+            rows = sum(monitor.db.execute(f'SELECT count(*) FROM {table}').fetchone()[0] for table in tables)
+            self.assertLessEqual(rows, 100)
+            self.assertEqual(monitor.db.execute('SELECT count(*) FROM task_signals').fetchone()[0], 30)
+
+    def test_capacity_refusals_during_due_sync_do_not_skip_the_tick(self):
+        """protects=deadline evaluation; fails_when=a source capacity refusal aborts the watchdog tick;
+        why_new=lifetime capacity caps; seam=real monitor store; no_claim=source coverage.
+        """
+        from datetime import timedelta
+        from unittest.mock import patch
+        from urgency_engine.kanban import Sync
+        from urgency_engine.ledger import LedgerError
+        from urgency_engine.watchdog import Monitor
+        command = self.kanban_stores([])
+        for error in (LedgerError('CAPACITY_EXCEEDED', 'watchdog', 'watchdog_max_rows'),
+                      LedgerError('INVALID_INPUT', 'validate', 'tasks_capacity')):
+            with self.subTest(code=error.code):
+                self.now += timedelta(seconds=301)
+                with patch.object(Sync, 'scan', side_effect=error):
+                    self.assertEqual(command('watchdog', 'tick'), 0)
+                with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now, readonly=True) as monitor:
+                    self.assertEqual(monitor.meta('last_success'), self.now.isoformat())
 
     def test_empty_bindings_revoke_on_cli_and_due_tick(self):
         """protects=last binding withdrawal; fails_when=runtime bypasses reconciliation;

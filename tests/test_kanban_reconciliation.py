@@ -603,6 +603,244 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(self.ledger.get_task('demo', 't1')['revision'], 1)
         self.assertEqual(self.sync.db.execute("SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 2)
 
+    def test_stale_intent_after_local_edit_is_cancelled_and_recollected(self):
+        """protects=sync recovers after a local estimate race; fails_when=stale intent fails every scan;
+        why_new=bounded collection window; seam=two real connections; no_claim=distributed transaction.
+        """
+        self.source.rows = [dict(id=f't{i}', tenant='synthetic') for i in range(2)]
+        self.scan()
+        original, raced = self.source.detail, []
+        self.source.title = 'New source'
+        def detail(binding, task_id):
+            if task_id == 't1' and not raced:
+                raced.append(True)
+                with Ledger(sqlite3.connect(self.root / 'data.db'), clock=lambda: self.now, artifact_root=self.root) as local:
+                    local.upsert_task('demo', 't0', project_id='project', goal='Local edit', remaining_seconds=7,
+                        expected_revision=1, request_id='local', reason='Concurrent', actor='test')
+            return original(binding, task_id)
+        self.source.detail = detail
+        with self.assertRaises(LedgerError):
+            self.scan('race')
+        self.assertEqual(self.scan('next')['state'], 'complete')
+        t0 = self.ledger.get_task('demo', 't0')
+        self.assertEqual((t0['goal'], t0['remaining_seconds']), ('New source', 7))
+        self.assertEqual(self.ledger.get_task('demo', 't1')['goal'], 'New source')
+        self.assertEqual(self.sync.db.execute("SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 0)
+
+    def test_task_capacity_revokes_prior_monitor_graph(self):
+        from urgency_engine.watchdog import Monitor
+        self.source.rows = [dict(id='z', tenant='synthetic')]
+        path = self.root / 'data.db'
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
+            def scan(identity):
+                return self.sync.scan(self.cfg, self.ledger, monitor, path, self.source,
+                                      request_id=identity, reason='Fixture')
+
+            def dependency_state():
+                return monitor.db.execute(
+                    'SELECT dependency_state FROM task_signals WHERE task_id=?', ('z',)
+                ).fetchone()[0]
+
+            self.assertEqual(scan('before')['state'], 'complete')
+            self.assertEqual(dependency_state(), 'available')
+            db = self.ledger.connection
+            columns = [row[1] for row in db.execute('PRAGMA table_info(tasks)')]
+            index = columns.index('task_id')
+            template = list(db.execute('SELECT * FROM tasks WHERE task_id=?', ('z',)).fetchone())
+            marks = ','.join('?' for _ in columns)
+            db.executemany(f'INSERT INTO tasks VALUES({marks})',
+                           (template[:index] + [f'gone{i:04d}'] + template[index + 1:]
+                            for i in range(9999)))
+            db.commit()
+            self.source.rows.insert(0, dict(id='a', tenant='synthetic'))
+            with self.assertRaises(LedgerError) as caught:
+                scan('refusal')
+            self.assertEqual((caught.exception.code, caught.exception.field),
+                             ('INVALID_INPUT', 'tasks_capacity'))
+            self.assertEqual(self.sync.meta('last_error'), 'INVALID_INPUT')
+            self.assertEqual(self.sync.db.execute(
+                'SELECT coverage FROM sources WHERE task_id=?', ('z',)
+            ).fetchone()[0], 'unknown')
+            self.assertEqual(dependency_state(), 'unknown')
+
+    def test_task_capacity_refusal_cannot_block_later_cards(self):
+        """protects=one refused card is a bounded skip; fails_when=its pending intent blocks every scan;
+        why_new=deleted cards keep Ledger capacity; seam=real stores with synthetic rows; no_claim=task retirement.
+        """
+        self.source.rows = [dict(id='z', tenant='synthetic')]
+        self.scan()
+        columns = [row[1] for row in self.ledger.connection.execute('PRAGMA table_info(tasks)')]
+        template = list(self.ledger.connection.execute("SELECT * FROM tasks WHERE task_id='z'").fetchone())
+        index = columns.index('task_id')
+        self.ledger.connection.executemany(f'INSERT INTO tasks VALUES({",".join("?" * len(columns))})',
+            [template[:index] + [f'gone{n:04d}'] + template[index + 1:] for n in range(9999)])
+        self.ledger.connection.commit()
+        self.source.rows = [dict(id='a', tenant='synthetic'), dict(id='z', tenant='synthetic')]
+        self.source.title = 'Renamed'
+        with self.assertRaises(LedgerError) as caught:
+            self.scan('full')
+        self.assertEqual(caught.exception.field, 'tasks_capacity')
+        self.assertEqual(self.ledger.get_task('demo', 'z')['goal'], 'Renamed')
+        self.assertEqual(self.scan('after')['state'], 'complete')
+        self.assertEqual(self.sync.db.execute("SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 0)
+
+    def test_monitor_capacity_does_not_pin_pending_sync(self):
+        from urgency_engine.watchdog import DEFAULTS, Monitor
+
+        self.sync.monitor_cfg = {**DEFAULTS, 'watchdog_max_rows': 100}
+        path = self.root / 'data.db'
+        row = dict(id='existing', tenant='synthetic')
+        self.source.rows = [row]
+        store = Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now)
+        self.assertIsNotNone(store)
+        with store as monitor:
+            def scan(identity):
+                return self.sync.scan(self.cfg, self.ledger, monitor, path, self.source,
+                                      request_id=identity, reason='Fixture')
+
+            self.source.title = 'Before'
+            self.assertEqual(scan('initial')['state'], 'complete')
+            self.source.rows += [dict(id=f't{n:02d}', tenant='synthetic') for n in range(60)]
+            with self.assertRaises(LedgerError) as refused:
+                scan('fill')
+            self.assertEqual((refused.exception.code, refused.exception.field),
+                             ('CAPACITY_EXCEEDED', 'watchdog_max_rows'))
+            self.assertLessEqual(monitor.rows(), self.sync.monitor_cfg['watchdog_max_rows'])
+            self.assertEqual(self.sync.meta('last_error'), 'CAPACITY_EXCEEDED')
+            self.assertEqual(self.sync.page('project', cfg=self.cfg, with_graph=True)['graph']['reason'],
+                             'source_incomplete')
+            self.source.rows = [row]
+            self.source.title = 'After'
+            retries = []
+            for cycle in range(2):
+                self.now += timedelta(days=31)
+                try:
+                    scan(f'retry{cycle}')
+                except LedgerError as exc:
+                    retries.append((exc.code, exc.field))
+                    self.assertEqual(self.sync.page('project', cfg=self.cfg, with_graph=True)['graph']['reason'],
+                                     'source_incomplete')
+                self.assertLessEqual(monitor.rows(), self.sync.monitor_cfg['watchdog_max_rows'])
+            goal = self.ledger.get_task('demo', 'existing')['goal']
+            self.assertEqual(goal, 'After', f'later source edit not applied; retries={retries}')
+            deferred = self.sync.db.execute(
+                "SELECT task_id FROM sources WHERE task_id <> 'existing' AND applied_digest IS NULL "
+                "AND coverage='unknown' LIMIT 1"
+            ).fetchone()[0]
+            self.assertEqual(self.ledger.get_task('demo', deferred)['goal'], 'Before')
+            self.assertEqual(self.sync.db.execute(
+                "SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 0)
+            revision = self.ledger.get_task('demo', 'existing')['revision']
+            self.sync.monitor_cfg['watchdog_max_rows'] = 1000
+            self.now += timedelta(seconds=1)
+            self.assertEqual(scan('retry1')['state'], 'complete')
+            self.assertEqual(self.ledger.get_task('demo', 'existing')['revision'], revision)
+            self.assertEqual(self.sync.page('project')['items'][0]['observed_at'], self.now.isoformat())
+            self.assertEqual(monitor.db.execute(
+                "SELECT observed_at FROM task_signals WHERE board_id='demo' AND task_id='existing'"
+            ).fetchone()[0], self.now.isoformat())
+            # Retained absent sources are still unknown, even after fresh facts for the survivor.
+            self.assertEqual(self.sync.page('project', cfg=self.cfg, with_graph=True)['graph']['reason'],
+                             'source_incomplete')
+
+    def test_monitor_capacity_graph_withdrawal_does_not_starve_other_binding(self):
+        from urgency_engine.watchdog import DEFAULTS, Monitor
+
+        self.sync.monitor_cfg = {**DEFAULTS, 'watchdog_max_rows': 100}
+        other = dict(board='other', tenant='synthetic', project_id='project')
+        self.cfg['kanban_bindings'].append(other)
+        self.source.inventory = lambda binding: [dict(id='old' if binding['board'] == 'demo' else 'survivor',
+                                                     tenant='synthetic')]
+        path = self.root / 'data.db'
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
+            def scan(identity):
+                return self.sync.scan(self.cfg, self.ledger, monitor, path, self.source,
+                                      request_id=identity, reason='Fixture')
+
+            self.assertEqual(scan('seed')['state'], 'complete')
+            self.assertEqual(monitor.db.execute(
+                "SELECT dependency_state FROM task_signals WHERE board_id='demo' AND task_id='old'"
+            ).fetchone()[0], 'available')
+            for index in range(100):
+                task_id = f'fill{index}'
+                self.ledger.upsert_task('fill', task_id, project_id='project', goal='Fill',
+                    remaining_seconds=None, expected_revision=0, request_id=task_id, reason='Fixture', actor='test')
+                try:
+                    monitor.observe(dict(request_id=task_id, project_id='project', board_id='fill', task_id=task_id,
+                        kind='task_signal', occurred_at=self.now.isoformat(), reason='Fixture',
+                        data=dict(dependency_state='available', dependencies=[])), path, self.sync.monitor_cfg)
+                except LedgerError as exc:
+                    self.assertEqual((exc.code, exc.field), ('CAPACITY_EXCEEDED', 'watchdog_max_rows'))
+                    break
+            else:
+                self.fail('Monitor did not reach real capacity')
+            self.assertLessEqual(monitor.rows(), self.sync.monitor_cfg['watchdog_max_rows'])
+            self.cfg['kanban_bindings'] = [other]
+            self.source.title = 'After'
+            for attempt in range(2):
+                with self.assertRaises(LedgerError) as refused:
+                    scan(f'withdraw{attempt}')
+                self.assertEqual((refused.exception.code, refused.exception.field),
+                                 ('CAPACITY_EXCEEDED', 'watchdog_max_rows'))
+                self.assertEqual(self.sync.page('project', cfg=self.cfg, with_graph=True)['graph']['reason'],
+                                 'source_incomplete')
+            self.assertEqual(self.ledger.get_task('other', 'survivor')['goal'], 'After')
+            self.assertEqual(self.sync.db.execute(
+                "SELECT count(*) FROM sync_requests WHERE state='pending'").fetchone()[0], 0)
+            self.assertEqual(monitor.db.execute(
+                "SELECT dependency_state FROM task_signals WHERE board_id='demo' AND task_id='old'"
+            ).fetchone()[0], 'available')  # The refused withdrawal was not acknowledged.
+            self.sync.monitor_cfg['watchdog_max_rows'] = 1000
+            self.now += timedelta(seconds=1)
+            self.assertEqual(scan('withdraw1')['state'], 'complete')
+            self.assertEqual(monitor.db.execute(
+                "SELECT dependency_state FROM task_signals WHERE board_id='demo' AND task_id='old'"
+            ).fetchone()[0], 'unknown')
+
+    def test_heartbeat_only_change_skips_ledger_rewrite_but_reaches_monitor(self):
+        """protects=stable Ledger revisions; fails_when=each heartbeat rewrites the task and bumps revisions;
+        why_new=60 s worker heartbeats; seam=real stores; no_claim=monitor row coalescing.
+        """
+        from urgency_engine.watchdog import Monitor
+        original, beat = self.source.detail, [150]
+        def detail(binding, task_id):
+            document = original(binding, task_id)
+            document['task'].update(current_run_id=4, started_at=100)
+            document.update(runs=[dict(id=4, status='running', started_at=100)],
+                            events=[dict(kind='heartbeat', run_id=4, created_at=beat[0])])
+            return document
+        self.source.detail = detail
+        audit = 'SELECT count(*) FROM audit'
+        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
+            self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db', self.source,
+                           request_id='first', reason='Fixture')
+            task, project = self.ledger.get_task('demo', 'task'), self.ledger.get_project('project')
+            audits = self.ledger.connection.execute(audit).fetchone()[0]
+            beat[0], self.now = 210, self.now + timedelta(seconds=60)
+            self.sync.scan(self.cfg, self.ledger, monitor, self.root / 'data.db', self.source,
+                           request_id='second', reason='Fixture')
+            heartbeat = monitor.db.execute('SELECT heartbeat_at FROM task_signals').fetchone()[0]
+        self.assertEqual(heartbeat, kanban.timestamp(210))
+        self.assertEqual(self.ledger.get_task('demo', 'task')['revision'], task['revision'])
+        self.assertEqual(self.ledger.get_project('project')['revision'], project['revision'])
+        self.assertEqual(self.ledger.connection.execute(audit).fetchone()[0], audits)
+        self.assertEqual(self.sync.page('project')['items'][0]['worker']['heartbeat_at'], kanban.timestamp(210))
+
+    def test_finished_request_receipts_are_bounded_without_touching_pending_or_control(self):
+        """protects=unattended scans keep running; fails_when=finished scan IDs exhaust the request cap;
+        why_new=fresh background scan IDs; seam=real store with synthetic receipts; no_claim=disk quota.
+        """
+        self.sync.control('pause', 'original', 'Fixture')
+        self.sync.db.executemany('INSERT INTO sync_requests VALUES(?,?,?,?)',
+            [(f'done{i}', 'digest', 'scan_complete', '{}') for i in range(49990)]
+            + [(f'pending{i}', 'digest', 'pending', '{}') for i in range(10)])
+        self.sync.db.commit()
+        self.assertFalse(self.sync.control('resume', 'resume', 'Fixture')['paused'])
+        states = dict(self.sync.db.execute('SELECT state,count(*) FROM sync_requests GROUP BY state').fetchall())
+        self.assertEqual(states, dict(scan_complete=10000, pending=10, control=2))
+        self.assertTrue(self.sync.control('pause', 'original', 'Fixture')['paused'])
+        self.assertIsNotNone(self.sync.db.execute("SELECT 1 FROM sync_requests WHERE request_id='done49989'").fetchone())
+
     def test_replay_capacity_refuses_new_writes_without_pruning_old_requests(self):
         """protects=bounded durable replay; fails_when=capacity discards pending identities;
         why_new=protected storage ceiling; seam=real store; no_claim=unlimited operation history.

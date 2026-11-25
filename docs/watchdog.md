@@ -252,8 +252,15 @@ are not a hard real-time guarantee. Selection is capped at 40 before notice
 accounting, inside the tick transaction. Incidents beyond that cap keep their next
 reminder due instead of consuming it.
 A 10000-task board needs a larger row cap than the default because each task also
-has retained monitor metadata. Exceeding capacity rolls back the transaction.
-Old observations and resolved episodes expire by retention time. One counter per
+has retained monitor metadata. The row cap includes the cursor and health rows
+written at the end of a tick. If reclaimable telemetry cannot make room, the
+transaction rolls back.
+Old observations and resolved episodes expire by retention time. An observation's
+`observe` receipt in `monitor_audit` expires with it, so replaying its request ID
+afterwards records a new event; the newest receipt is always kept. Before a write
+is refused, the oldest raw observations that no detector reads again (unassigned
+tool outcomes, or task events already folded into retained evidence) are
+reclaimed early, so telemetry volume alone cannot fill the cap. One counter per
 entity and detector with pruned history counts toward the row cap and prevents
 ID reuse. It cannot recover episode numbers already pruned by earlier code.
 Active records, control replay and ledger audit are not silently evicted.
