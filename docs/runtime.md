@@ -155,8 +155,9 @@ WAL ledger. The hook never snapshots
 forecasts, moves targets, changes criteria or grants credit.
 
 The hook places its quoted values, one label and JSON value per line, between
-`BEGIN URGENCY DATA` and `END URGENCY DATA` lines and labels them untrusted data;
-truncation keeps the end line. It includes up to five
+`BEGIN URGENCY DATA` and `END URGENCY DATA` lines and labels them untrusted data.
+Truncation keeps both delimiter lines and drops any guidance lines that do not
+fit in full, so the data block can be empty. The hook includes up to five
 active deadlines ordered by urgency descending, target ascending and ID; up to
 five tasks with criteria; and the recorded byte-evidence limitation. A task goal
 that Kanban sync ever wrote is a card title that other agents can edit, so the

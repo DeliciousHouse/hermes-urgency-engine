@@ -1199,9 +1199,22 @@ class Runtime:
                 text = self.clean(text)
             if len(text) > maximum:
                 suffix = '\n[Guidance truncated; query status/explain/task for details.]'
-                text = text[:maximum - len(suffix) - len(DATA_END) - 1]
-                if quoted and DATA_END not in text.split('\n'):
-                    text += '\n' + DATA_END
+                if quoted:
+                    kept = []
+                    markers = [DATA_BEGIN, DATA_END]
+                    # Charge one newline per line, then return the first line's newline.
+                    remaining = maximum - len(suffix) + 1 - sum(len(marker) + 1 for marker in markers)
+                    for line in lines:
+                        if markers and line == markers[0]:
+                            markers.pop(0)
+                        else:
+                            remaining -= len(line) + 1
+                            if remaining < 0:
+                                break
+                        kept.append(line)
+                    text = '\n'.join(kept + markers)
+                else:
+                    text = text[:maximum - len(suffix)]
                 text += suffix
             return {'context': text}
         except ValueError:

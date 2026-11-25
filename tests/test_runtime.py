@@ -902,6 +902,19 @@ class RuntimeTests(unittest.TestCase):
         self.ctx.settings['context_enabled'] = 'false'
         self.assertFalse(self.request('status')['ok'])
 
+    def test_hook_respects_complete_data_line_cutoff(self):
+        self.project()
+        self.ctx.settings['default_project'] = 'p'
+        full = self.runtime.pre_llm_call()['context']
+        prefix = full.split('\nProgress: ', 1)[0]
+        tail = '\nEND URGENCY DATA\n[Guidance truncated; query status/explain/task for details.]'
+        cap = len(prefix + tail)
+        self.assertGreater(len(full), cap)
+        for maximum, expected_prefix in ((cap, prefix), (cap - 1, prefix.rsplit('\n', 1)[0])):
+            with self.subTest(maximum=maximum):
+                self.ctx.settings['context_max_chars'] = maximum
+                self.assertEqual(self.runtime.pre_llm_call()['context'], expected_prefix + tail)
+
     def test_hook_leaves_missing_and_empty_storage_untouched(self):
         self.ctx.settings['default_project'] = 'p'
         db = self.root / 'data.db'
