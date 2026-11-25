@@ -32,7 +32,9 @@ All commands below start with `hermes urgency watchdog`.
 pause, remove or feed its own watchdog, or spend its notice budget with a tick of
 its own. The reads stay available. The owned no-agent cron job's launcher runs
 `tick` without worker markers: the host does not bind its cron session marker for
-no-agent script jobs.
+no-agent script jobs. The launcher inherits the scheduler's environment, so do not
+export `HERMES_KANBAN_DB` (or another marker) in the process that runs the Hermes
+scheduler; if you do, every scheduled tick fails with `SOURCE_DENIED`.
 
 Reads return `{"ok":true,"data":...}`; pages include `schema_version: 1`,
 `items`, `has_more`, `next`. Pass `next` as `--after` while `has_more` is true.
