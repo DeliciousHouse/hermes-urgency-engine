@@ -919,5 +919,26 @@ class WatchdogInstallTests(unittest.TestCase):
         self.assertEqual((script.read_bytes(), len(self.jobs)), (b'# edited by hand', 1))
 
 
+class ProfileGuardTests(unittest.TestCase):
+    def test_deleted_profile_home_is_not_recreated_for_artifacts(self):
+        """protects=deleted/renamed profiles stay gone; fails_when=raw mkdir(parents=True) recreates them."""
+        import sys
+        import types
+        from unittest.mock import patch
+        from urgency_engine.ledger import LedgerError
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory) / 'profiles' / 'gone' / 'plugin-data' / 'hermes-urgency-engine'
+            constants = types.ModuleType('hermes_constants')
+            def refuse(path):
+                raise FileNotFoundError('Named profile home does not exist')
+            constants.mkdir_under_hermes_home = refuse
+            runtime = Runtime(Context(Path(directory) / 'state.json'), opener=lambda **kwargs: self.fail('opened'),
+                              data_dir=lambda: data)
+            with patch.dict(sys.modules, {'hermes_constants': constants}), self.assertRaises(LedgerError) as caught:
+                runtime.open(runtime.settings())
+            self.assertEqual((caught.exception.code, caught.exception.side_effects), ('STORAGE_FAILURE', 'none'))
+            self.assertFalse((Path(directory) / 'profiles').exists())
+
+
 if __name__ == '__main__':
     unittest.main()

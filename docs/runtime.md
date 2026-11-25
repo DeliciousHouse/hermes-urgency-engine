@@ -123,7 +123,9 @@ Hermes profile's config. They are read each operation, not cached at registratio
 | `diagnostic_log_bytes` | int, `1048576` | 65536–4194304; current log plus one rotated backup |
 
 Operator writes create the default artifact directory under
-`<active Hermes home>/plugin-data/hermes-urgency-engine/artifacts/`. Configured
+`<active Hermes home>/plugin-data/hermes-urgency-engine/artifacts/` through the host's
+profile guard, so a deleted or renamed named profile is refused with `STORAGE_FAILURE`
+rather than recreated. Configured
 artifact directories are never created automatically. Artifact paths in requests
 are relative; the ledger rejects escapes and symlinks. SQLite `data.db`, focus
 `state.json`, and diagnostic logs are plugin-owned persistent data, not files in

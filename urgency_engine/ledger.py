@@ -51,6 +51,24 @@ def _id(value, field):
     return value
 
 
+def _readonly_uri(path):
+    """SQLite read-only URI with an empty authority, so a UNC path keeps its server."""
+    from urllib.parse import quote
+    text = Path(path).absolute().as_posix()
+    return 'file://' + ('' if text.startswith('/') else '/') + quote(text, safe='/:') + '?mode=ro'
+
+
+def _make_dirs(path):
+    """Create plugin directories without recreating a deleted or renamed named profile."""
+    try:
+        from hermes_constants import mkdir_under_hermes_home
+    except ImportError:
+        # Offline library use has no Hermes home or profile to protect.
+        Path(path).mkdir(parents=True, exist_ok=True)
+    else:
+        mkdir_under_hermes_home(path)
+
+
 def _integer(value, field, minimum=0, maximum=2**63 - 1):
     if type(value) is not int or not minimum <= value <= maximum:
         _invalid(field)
@@ -957,7 +975,7 @@ def open_readonly_ledger(path, *, clock, deadline=None, busy_timeout_ms=100, che
     try:
         if not stat.S_ISREG(path.stat().st_mode):
             raise LedgerError('STORAGE_FAILURE', 'open')
-        connection = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=busy_timeout_ms / 1000)
+        connection = sqlite3.connect(_readonly_uri(path), uri=True, timeout=busy_timeout_ms / 1000)
     except FileNotFoundError:
         raise LedgerError('NOT_FOUND', 'open', next_action='Initialize the ledger with hermes urgency apply.') from None
     except (OSError, sqlite3.Error):

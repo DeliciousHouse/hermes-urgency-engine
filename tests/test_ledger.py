@@ -475,6 +475,31 @@ class LedgerTests(unittest.TestCase):
                 self.assertIn('tzdata', caught.exception.next_action)
             self.assertEqual(ledger.connection.execute('SELECT count(*) FROM deadlines').fetchone()[0], 2)
 
+    def test_readonly_uri_keeps_unc_server_and_escapes_names(self):
+        """protects=reads on a network-share home; fails_when=UNC server parsed as URI authority;
+        why_new=as_uri() form; seam=URI text plus a real read-only open; no_claim=a live SMB share.
+        """
+        import os
+        from urgency_engine.ledger import _readonly_uri, open_readonly_ledger
+        if os.name == 'nt':
+            self.assertEqual(_readonly_uri(Path('\\\\server\\share\\a b#%.db')), 'file:////server/share/a%20b%23%25.db?mode=ro')
+            self.assertEqual(_readonly_uri(Path('C:\\x\\y.db')), 'file:///C:/x/y.db?mode=ro')
+        else:
+            self.assertEqual(_readonly_uri(Path('//server/share/a b#%.db')), 'file:////server/share/a%20b%23%25.db?mode=ro')
+            self.assertEqual(_readonly_uri(Path('/x/y.db')), 'file:///x/y.db?mode=ro')
+        folder = self.root / 'odd #%? name' if os.name != 'nt' else self.root / 'odd #% name'
+        folder.mkdir()
+        self.db = folder / 'ledger.db'
+        with self.open() as ledger:
+            ledger.create_project('p', 'Project', request_id='p', actor='operator')
+        with open_readonly_ledger(self.db, clock=lambda: NOW) as ledger:
+            self.assertEqual(ledger.get_project('p')['project_id'], 'p')
+        # Where the local administrative share exists, read the same file through a real UNC path.
+        unc = Path('\\\\localhost\\' + str(self.db)[0] + '$' + str(self.db)[2:]) if os.name == 'nt' else None
+        if unc is not None and unc.exists():
+            with open_readonly_ledger(unc, clock=lambda: NOW) as ledger:
+                self.assertEqual(ledger.get_project('p')['project_id'], 'p')
+
     def test_concurrent_initialization_and_corrupt_preservation(self):
         """protects=non-destructive schema; fails_when=init races/drops state;
         why_new=migrations; seam=process gate; no_claim=future schema migration.
