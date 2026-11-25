@@ -1056,6 +1056,22 @@ class WatchdogInstallTests(unittest.TestCase):
         self.assertEqual(self.install('uninstall')['state'], 'uninstalled')
         self.assertEqual((self.jobs, script.exists()), ([], False))
 
+    def test_refresh_preserves_unowned_sibling(self):
+        import hashlib
+        receipt = self.install()
+        launcher = Path(receipt['script'])
+        old = b'# previous release\n'
+        launcher.write_bytes(old)
+        self.receipt({**receipt, 'sha256': hashlib.sha256(old).hexdigest()})
+        sibling = launcher.with_name(launcher.name + '.tmp')
+        sibling.write_bytes(b'operator backup\n')
+
+        self.install()
+
+        self.assertTrue(sibling.exists(), 'refresh deleted an unrelated sibling file')
+        self.assertEqual(sibling.read_bytes(), b'operator backup\n')
+        self.assertEqual(launcher.read_bytes(), self.content)
+
     def test_owned_stale_launcher_stays_removable_after_replace_failure(self):
         import hashlib
         from unittest.mock import patch
