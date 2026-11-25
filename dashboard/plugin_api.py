@@ -248,8 +248,9 @@ def execute_command(raw):
     except (ValueError, UnicodeError, RecursionError):
         raise _ledger.LedgerError('INVALID_INPUT', 'desktop', 'body') from None
     _desktop.command_arguments(payload)
-    # The normal host authentication gate has already admitted this request.
-    # A worker-launched backend still cannot acquire operator privileges here.
+    # The normal host authentication gate has already admitted this request; it
+    # is the only check on the HTTP caller. operator_only() inspects this backend's
+    # own environment, so it refuses a worker-launched backend, not a worker client.
     _runtime.interventions.operator_only()
     _runtime.interventions.host_stop()
     if 'scope_id' in payload and payload['scope_id'] != identity_data()['scope_id']:
