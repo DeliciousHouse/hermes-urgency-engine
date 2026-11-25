@@ -277,6 +277,8 @@ class Runtime:
             if operation in MUTATIONS:
                 if surface != 'cli':
                     invalid('operation', 'READ_ONLY')
+                # Every write is attributed to the local operator, so workers are refused.
+                interventions.operator_only()
                 required, optional = (set(x.split()) for x in MUTATIONS[operation])
             else:
                 required, optional = READ_FIELDS[operation]
@@ -729,6 +731,7 @@ class Runtime:
             elif operation in ('health', 'tasks'):
                 data = self.kanban_read(operation, arguments_from(args, 'kanban_' + operation))
             else:
+                interventions.operator_only()
                 cfg = self.kanban_config()
                 if not cfg['kanban_sync_enabled'] or (not cfg['kanban_bindings'] and not (self.data_dir() / 'kanban.db').exists()):
                     data = dict(state='disabled')
@@ -796,6 +799,9 @@ class Runtime:
                 if operation == 'export':
                     data.update(table=table, retention_days=cfg['watchdog_retention_days'], limitations=LIMITATIONS)
             else:
+                if operation != 'tick':
+                    # The owned no-agent cron launcher runs tick; controls and observations are operator-only.
+                    interventions.operator_only()
                 if operation == 'observe':
                     with Path(args.json_file).open('rb') as stream:
                         event = read_json(stream)

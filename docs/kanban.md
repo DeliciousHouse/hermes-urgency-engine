@@ -34,6 +34,10 @@ All CLI rows begin with `hermes urgency kanban`.
 | `sync` | Required `--request-id ID --reason TEXT`; one bounded scan, even before watchdog installation |
 | `pause`, `resume` | Required `--request-id ID --reason TEXT`; persisted source control, not watchdog control |
 
+`sync`, `pause` and `resume` return `SOURCE_DENIED` (field `context`) in a worker
+context, as [operator writes](runtime.md#operator-writes) do. The due scan inside
+`watchdog tick` is not affected.
+
 Request IDs use the [ledger identifier rules](ledger.md#mutation-signatures).
 Reasons are nonempty and at most 1024 characters. Exact request replay returns
 its saved result; changed arguments with that ID conflict. A new scan after a

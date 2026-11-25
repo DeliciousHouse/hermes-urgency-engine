@@ -83,6 +83,11 @@ at most 256 KiB. `--json-file -` reads stdin with the same limit. Duplicate keys
 NaN/infinity, invalid Unicode, unknown fields and non-objects fail. The CLI stamps
 `actor="local-operator"` and, for deadline revisions, `intent="operator"`. Callers
 cannot override actor, intent, surface, profile, database or artifact root.
+Because every write carries operator attribution, `apply` returns `SOURCE_DENIED`
+(field `context`) in a worker context: a process whose environment carries
+`HERMES_KANBAN_TASK`, `HERMES_KANBAN_DB` or `HERMES_DELEGATED_CHILD_CONTEXT`, or a
+truthy `HERMES_CRON_SESSION` (an LLM cron run's terminal). Run it from your own
+shell instead.
 
 The following fields are required; optional fields are listed separately. See
 [ledger contracts](ledger.md) for field types, length limits, revision rules,

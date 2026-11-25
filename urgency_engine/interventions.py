@@ -15,7 +15,11 @@ PARAMETERS = {
     'create_recovery_task': {'title', 'body', 'assignee', 'priority', 'parents'},
 }
 IDS = ('request_id', 'incident_id', 'plan_id', 'project_id', 'board_id', 'task_id')
-WORKER_MARKERS = ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_DB', 'HERMES_DELEGATED_CHILD_CONTEXT')
+# Host markers for Kanban workers, delegated children and LLM cron runs. The host
+# stamps HERMES_CRON_SESSION onto a cron run's subprocesses and may bind it to ''
+# for non-cron sessions, so it counts only when truthy, as the host reads it.
+WORKER_MARKERS = ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_DB', 'HERMES_DELEGATED_CHILD_CONTEXT', 'HERMES_CRON_SESSION')
+TRUTHY = frozenset({'1', 'true', 'yes', 'on'})
 
 
 def validate(payload, redact):
@@ -231,8 +235,13 @@ class Actions:
             return self.get(action_id), True
 
 
+def worker_context():
+    return any(os.environ.get(key, '').strip().lower() in TRUTHY if key == 'HERMES_CRON_SESSION'
+               else os.environ.get(key) for key in WORKER_MARKERS)
+
+
 def operator_only():
-    if any(os.environ.get(key) for key in WORKER_MARKERS):
+    if worker_context():
         fail('SOURCE_DENIED', 'context', next_action='Use the explicit local operator command, not a worker context.')
 
 

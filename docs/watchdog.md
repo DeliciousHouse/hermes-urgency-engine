@@ -26,6 +26,11 @@ All commands below start with `hermes urgency watchdog`.
 | `observe` | `--json-file FILE`: explicit typed local observation, at most 16 KiB after JSON parsing. No conversational mutation equivalent. |
 | `uninstall` | Removes only the owned cron and unchanged launcher. Retains ledger, monitor and audit data. Edited or ambiguous assets return `INSTALL_CONFLICT`. |
 
+`install`, `uninstall`, `pause`, `resume` and `observe` return `SOURCE_DENIED`
+(field `context`) in a worker context, as [operator writes](runtime.md#operator-writes)
+do, so a monitored worker cannot pause, remove or feed its own watchdog. `tick` and
+the reads stay available; the owned no-agent cron job runs `tick`.
+
 Reads return `{"ok":true,"data":...}`; pages include `schema_version: 1`,
 `items`, `has_more`, `next`. Pass `next` as `--after` while `has_more` is true.
 Before initialization, reads return uninitialized health or empty pages without
