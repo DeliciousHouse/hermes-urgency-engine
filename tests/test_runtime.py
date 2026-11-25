@@ -267,6 +267,45 @@ class RuntimeTests(unittest.TestCase):
             self.assertNotIn('Canonical task:', self.runtime.pre_llm_call(session_id='session')['context'])
         self.assertEqual({p.name: p.read_bytes() for p in self.root.glob('*.db')}, before)
 
+    def test_guidance_omits_card_titles_and_delimits_data(self):
+        """protects=pre-turn instruction channel; fails_when=a Kanban card title reaches every turn
+        or quoted data escapes its delimiters; seam=real stores and source fixture."""
+        from urgency_engine.kanban import Sync
+        from test_kanban_reconciliation import Source
+        self.project()
+        self.ctx.settings.update(default_project='p', context_max_chars=8000, kanban_sync_enabled=True,
+                                 kanban_bindings=[dict(board='demo', tenant='synthetic', project_id='p')])
+        source = Source()
+        source.title = 'INJECTED card title'
+        with Sync(sqlite3.connect(self.root / 'kanban.db'), clock=lambda: self.now, redact=str) as sync:
+            with self.runtime.open(self.runtime.settings()) as ledger:
+                sync.scan(self.runtime.kanban_config(), ledger, None, self.root / 'data.db',
+                          source, request_id='seed', reason='Fixture')
+                task = ledger.get_task('demo', 'task')
+                # An operator edit afterwards does not make the card title trusted.
+                ledger.upsert_task('demo', 'task', project_id='p', goal=task['goal'], expected_revision=task['revision'],
+                                   request_id='edit', actor='operator', reason='estimate', remaining_seconds=60)
+                ledger.upsert_task('local', 'own', project_id='p', goal='Operator goal', expected_revision=0,
+                                   request_id='own', actor='operator', reason='plan')
+        for bindings in (self.ctx.settings['kanban_bindings'], []):
+            self.ctx.settings['kanban_bindings'] = bindings
+            text = self.runtime.pre_llm_call()['context']
+            self.assertNotIn('INJECTED', text)
+            lines = text.splitlines()
+            begin, end = lines.index('BEGIN URGENCY DATA'), lines.index('END URGENCY DATA')
+            tasks = {(t['board_id'], t['task_id']): t for t in
+                     (json.loads(line.removeprefix('Task: ')) for line in lines if line.startswith('Task: '))}
+            self.assertEqual(tasks['demo', 'task']['goal_omitted'], 'kanban_card_title')
+            self.assertNotIn('goal', tasks['demo', 'task'])
+            self.assertEqual(tasks['local', 'own']['goal'], 'Operator goal')
+            self.assertTrue(all(begin < i < end for i, line in enumerate(lines) if line.startswith(('Objective: ', 'Task: '))))
+        self.ctx.settings['context_max_chars'] = 512
+        short = self.runtime.pre_llm_call()['context']
+        self.assertLessEqual(len(short), 512)
+        self.assertIn('END URGENCY DATA', short.splitlines())
+        self.assertTrue(short.endswith('[Guidance truncated; query status/explain/task for details.]'))
+        self.assertEqual(self.request('task', board_id='demo', task_id='task')['data']['goal'], 'INJECTED card title')
+
     def test_cached_tasks_show_age_and_exclude_removed_bindings_without_writes(self):
         """protects=scoped fresh reads; fails_when=stale/rebound source looks current;
         why_new=cached projection boundary; seam=real stores; no_claim=live source read.

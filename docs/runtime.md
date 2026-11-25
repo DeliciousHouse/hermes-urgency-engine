@@ -154,9 +154,14 @@ journal setup. SQLite can still maintain WAL coordination files for an existing
 WAL ledger. The hook never snapshots
 forecasts, moves targets, changes criteria or grants credit.
 
-The hook labels objective/task text as untrusted data. It includes up to five
+The hook places its quoted values, one label and JSON value per line, between
+`BEGIN URGENCY DATA` and `END URGENCY DATA` lines and labels them untrusted data;
+truncation keeps the end line. It includes up to five
 active deadlines ordered by urgency descending, target ascending and ID; up to
-five tasks with criteria; and the recorded byte-evidence limitation. Missing
+five tasks with criteria; and the recorded byte-evidence limitation. A task goal
+that Kanban sync ever wrote is a card title that other agents can edit, so the
+hook replaces it with `"goal_omitted":"kanban_card_title"`, even after the binding
+is removed or an operator edits the task; `urgency_query task` still returns it on request. Missing
 blocker information stays unknown. Long guidance is explicitly truncated. The
 hook reads one size-limited snapshot of the atomically replaced focus file
 without taking the writer lock. It applies a 750 ms cooperative work budget and
