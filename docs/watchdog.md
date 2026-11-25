@@ -88,12 +88,20 @@ Tick timing: the owned launcher allows `plugins list` 60 seconds and the tick
 passes the tick a wall-clock sync deadline 40 seconds before its own timeout
 (`URGENCY_ENGINE_TICK_DEADLINE`). The tick's Kanban sync uses at most 100
 seconds and never runs past that deadline. Every native child is cut off at the
-deadline, and collection returns `partial` with validated work flushed, so the
-deadline and checkpoint evaluation always runs in the same tick. A tick run by
-hand uses the 100-second default. A launcher installed by an earlier release
-keeps its old bytes. Ownership is checked against the packaged launcher, so
-reinstall then reports `INSTALL_CONFLICT` on `launcher`. Upgrading an existing
-installation therefore needs the owned job and launcher replaced deliberately.
+deadline, and collection returns `partial` with validated work flushed. A
+`SOURCE_*` failure is recorded and does not stop the tick, so deadline and
+checkpoint evaluation still runs in the same tick. Other sync errors, such as
+`STORE_BUSY` while an operator sync holds the scan lock, still fail that tick. A tick run by hand uses the
+100-second default. A launcher installed by an earlier release keeps its old
+35-second timeout and sets no deadline. Ownership is checked against the
+packaged launcher bytes, so after upgrading, both `install` and `uninstall`
+report `INSTALL_CONFLICT` on `launcher`. Run `hermes urgency watchdog uninstall`
+with the old release before upgrading, then `install` with the new one.
+
+With a 20-second CLI start, the budget covers inventory for one binding and at
+least one detail. With several bindings, inventory alone can exceed it. The
+tick then records `SOURCE_TIMEOUT` and still evaluates deadlines, but the sync
+makes no progress.
 
 Lifecycle hooks only mark dirty bindings; missing
 worker/dependency telemetry stays unknown. Explicit availability/dependency
@@ -263,7 +271,7 @@ credentials. No delivery acknowledgement or exactly-once guarantee is claimed.
    a new `request_id` or `occurred_at`.
 4. Pause with `hermes urgency watchdog pause --request-id pause-1 --reason maintenance`.
    Resume with `hermes urgency watchdog resume --request-id resume-1 --reason ready`.
-5. Run `hermes urgency watchdog uninstall` before disabling/removing the plugin.
+5. Run `hermes urgency watchdog uninstall` before disabling, removing or upgrading the plugin.
    An already-installed launcher also exits quietly if the plugin is disabled/removed.
 
 Troubleshooting: `STORE_BUSY` permits a bounded retry after the other writer ends.

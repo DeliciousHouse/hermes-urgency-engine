@@ -580,6 +580,7 @@ class RuntimeTests(unittest.TestCase):
         from unittest.mock import patch
         from urgency_engine import runtime as runtime_module
         from urgency_engine.kanban import Sync, NativeSource
+        from urgency_engine.ledger import LedgerError
         from urgency_engine.watchdog import Monitor
         from test_kanban_reconciliation import Source
         self.project()
@@ -590,18 +591,39 @@ class RuntimeTests(unittest.TestCase):
                 timezone='UTC', owner='fixture', source='fixture', request_id='due', actor='test')
         self.now += timedelta(seconds=1)
         source = Source()
+        stores = (patch.object(Sync, 'host', side_effect=lambda **kw: Sync(sqlite3.connect(self.root / 'kanban.db'), **kw)),
+                  patch.object(Monitor, 'host', side_effect=lambda **kw: Monitor.open(self.root / 'watchdog.db', **kw)))
+
+        def tick():
+            with stores[0], stores[1], redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                return self.runtime.cli(setup_parser(Parser()).parse_args(['watchdog', 'tick', '--force']))
+
+        def incidents():
+            with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now, readonly=True) as monitor:
+                return [item['detector'] for item in monitor.page('incidents')['items']]
+
         with patch.dict(os.environ, {'URGENCY_ENGINE_TICK_DEADLINE': repr(time.time() - 1)}):
+            with patch.object(NativeSource, 'inventory', side_effect=source.inventory), \
+                 patch.object(NativeSource, 'detail', side_effect=source.detail):
+                self.assertEqual((tick(), source.calls), (0, 0))
             self.assertEqual(runtime_module.tick_source_budget(), 0)
-            with patch.object(Sync, 'host', side_effect=lambda **kw: Sync(sqlite3.connect(self.root / 'kanban.db'), **kw)), \
-                 patch.object(Monitor, 'host', side_effect=lambda **kw: Monitor.open(self.root / 'watchdog.db', **kw)), \
-                 patch.object(NativeSource, 'inventory', side_effect=source.inventory), \
-                 patch.object(NativeSource, 'detail', side_effect=source.detail), \
-                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                code = self.runtime.cli(setup_parser(Parser()).parse_args(['watchdog', 'tick', '--force']))
-        self.assertEqual((code, source.calls), (0, 0))
-        with Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now, readonly=True) as monitor:
-            self.assertIn('expired_deadline', [item['detector'] for item in monitor.page('incidents')['items']])
+        self.assertIn('expired_deadline', incidents())
         self.assertEqual(self.runtime.kanban_read('health', {})['last_result']['state'], 'partial')
+
+        # The production transport receives the same deadline; never launch the real CLI here.
+        seen = []
+
+        def transport(argv, **options):
+            seen.append(options)
+            raise LedgerError('SOURCE_TIMEOUT', 'kanban', 'transport')
+
+        self.now += timedelta(seconds=61)
+        with patch.object(runtime_module, 'read_process', side_effect=transport):
+            self.assertEqual(tick(), 0)
+        self.assertEqual(len(seen), 1)
+        self.assertIsInstance(seen[0]['deadline'], float)
+        self.assertEqual(self.runtime.kanban_read('health', {})['last_error'], 'SOURCE_TIMEOUT')
+        self.assertIn('expired_deadline', incidents())
         for value, budget in (('nan', runtime_module.TICK_SOURCE_SECONDS), ('junk', runtime_module.TICK_SOURCE_SECONDS),
                               (repr(time.time() + 10 ** 6), runtime_module.TICK_SOURCE_SECONDS)):
             with patch.dict(os.environ, {'URGENCY_ENGINE_TICK_DEADLINE': value}):
