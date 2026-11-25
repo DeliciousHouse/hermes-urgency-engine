@@ -187,12 +187,16 @@ The adapter uses public native CLI inventory and its registered snapshot CLI
 for detail. The child initializes built-in tools and calls the documented
 `ctx.dispatch_tool` API for `kanban_show`; it never reads board SQL or invokes
 a private handler. Parent sync/tick retains the same interpreter and profile.
-The scan's timeout cleanup terminates the owned snapshot tree, including its
-nested board-check process. On POSIX, the scan signals the owned process group
+Every native CLI call (board discovery, inventory, snapshot detail and the
+priority intervention's `edit`) runs as an owned process tree: a Windows job
+object that kills on close, or a new POSIX session. When the call returns or
+times out, the whole tree is terminated, including the snapshot's nested
+board-check process and any descendant that inherited stdout. A descendant
+holding stdout open therefore ends in `SOURCE_TIMEOUT` within the call's
+timeout; it cannot stall the caller. On POSIX, the scan signals the owned process group
 before reaping its leader, including on macOS with Python 3.11 or 3.12.
 There is no weaker CLI `show` fallback on denial
-or missing capability. Standalone snapshot and priority intervention transport
-are unchanged. **Native `kanban list` recomputes
+or missing capability. **Native `kanban list` recomputes
 dependency readiness**; opting in accepts that normal native effect. Collection
 is therefore not described as side-effect-free, even though this adapter never
 writes board rows directly or bypasses worker fences. Cached conversational

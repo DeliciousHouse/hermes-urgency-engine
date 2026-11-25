@@ -500,6 +500,28 @@ class TransportTests(unittest.TestCase):
             # gstack-timing-ok: bound the real inherited-pipe drain, not the child sleep.
             self.assertLess(elapsed, 2)
 
+    def test_plain_transport_owns_descendant_holding_stdout(self):
+        """Inventory and edit reads must not wait on, or leak, a pipe-holding descendant."""
+        from pathlib import Path
+        import sys
+        import tempfile
+        import time
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'descendant'
+            code = ('import time; from pathlib import Path; time.sleep(2.5); '
+                    f'Path({str(marker)!r}).write_text("escaped")')
+            child = ('import subprocess, sys; '
+                     f'subprocess.Popen([sys.executable, "-c", {code!r}]); print("[]", flush=True)')
+            start = time.monotonic()
+            with self.assertRaises(LedgerError) as caught:
+                kanban.read_process([sys.executable, '-c', child], timeout=.5)
+            elapsed = time.monotonic() - start
+            time.sleep(max(0, start + 3 - time.monotonic()))
+            self.assertEqual((caught.exception.code, caught.exception.field), ('SOURCE_TIMEOUT', 'transport'))
+            self.assertFalse(marker.exists())
+            # gstack-timing-ok: bound the real inherited-pipe drain, not the child sleep.
+            self.assertLess(elapsed, 2)
+
 
 class ProjectionTests(unittest.TestCase):
     def test_configuration_is_explicit_bounded_and_disjoint(self):

@@ -43,59 +43,12 @@ def fail(field, code='SOURCE_MALFORMED') -> NoReturn:
 
 def read_process(argv, *, timeout: float = 20, limit=16 * 1024 * 1024, receipt=None,
                  snapshot_phases=False):
-    """Bound stdout in memory; retain no stderr or native private task bodies."""
-    if snapshot_phases:
-        return read_snapshot_process(argv, timeout, limit)
-    output = bytearray()
-    overflow = threading.Event()
-    try:
-        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                 stderr=subprocess.DEVNULL)
-    except OSError:
-        fail('transport', 'SOURCE_UNAVAILABLE')
+    """Bound stdout in memory; retain no stderr or native private task bodies.
 
-    def drain():
-        while True:
-            chunk = child.stdout.read(65536)
-            if not chunk:
-                return
-            if len(output) + len(chunk) > limit:
-                overflow.set()
-                return
-            output.extend(chunk)
-
-    reader = threading.Thread(target=drain, daemon=True)
-    try:
-        reader.start()
-        end = time.monotonic() + timeout
-        while child.poll() is None and not overflow.is_set() and time.monotonic() < end:
-            overflow.wait(.01)
-        if overflow.is_set():
-            fail('output', 'SOURCE_LIMIT')
-        if child.poll() is None:
-            fail('transport', 'SOURCE_TIMEOUT')
-        reader.join(timeout)
-        if overflow.is_set():
-            fail('output', 'SOURCE_LIMIT')
-        if reader.is_alive():
-            fail('transport', 'SOURCE_TIMEOUT')
-        if child.returncode:
-            if receipt is not None:
-                # The edit CLI has no structured no-effect refusal receipt.
-                raise LedgerError('NATIVE_EDIT_FAILED', 'kanban', side_effects='unknown')
-            fail('transport', 'SOURCE_DENIED')
-    finally:
-        if child.poll() is None:
-            child.kill()
-        child.wait()
-        if reader.ident is not None:
-            reader.join(timeout)
-        child.stdout.close()
-    if receipt is not None:
-        if output.strip() != receipt:
-            raise LedgerError('SOURCE_MALFORMED', 'kanban', side_effects='unknown')
-        return True
-    return decode_source(output)
+    Every read owns its process tree, which is killed when the read returns.
+    """
+    return read_snapshot_process(argv, timeout, limit, SNAPSHOT_PHASES if snapshot_phases else (),
+                                 receipt=receipt)
 
 
 def decode_source(output):
@@ -113,7 +66,7 @@ def decode_source(output):
         fail('json')
 
 
-def read_snapshot_process(argv, timeout, limit):
+def read_snapshot_process(argv, timeout, limit, phases=SNAPSHOT_PHASES, *, receipt=None):
     """Each ordered phase gets one budget, including output drain in the last phase."""
     signals = queue.SimpleQueue()
     output = bytearray()
@@ -122,7 +75,7 @@ def read_snapshot_process(argv, timeout, limit):
 
     def drain(stream):
         try:
-            for phase in SNAPSHOT_PHASES:
+            for phase in phases:
                 marker = f'@urgency:{phase}'.encode('ascii')
                 if stream.readline(len(marker) + 2) not in (marker + b'\n', marker + bytes((13, 10))):
                     signals.put((time.monotonic(), 'SOURCE_MALFORMED'))
@@ -142,21 +95,24 @@ def read_snapshot_process(argv, timeout, limit):
         finally:
             stream.close()
 
-    phase = 'startup'
+    phase = 'startup' if phases else 'transport'
     end = time.monotonic() + timeout
     try:
         with snapshot_process(argv) as child:
             reader = threading.Thread(target=drain, args=(child.stdout,), daemon=True)
             reader.start()
-            for next_phase in (*SNAPSHOT_PHASES, None):
+            for next_phase in (*phases, None):
                 arrived, error = signals.get(timeout=max(0, end - time.monotonic()))
                 if arrived >= end:
                     fail(phase, 'SOURCE_TIMEOUT')
                 if error == 'SOURCE_LIMIT':
                     fail('output', error)
                 if error or next_phase is None:
-                    # A nonzero child has no valid snapshot; never read its stderr.
+                    # A nonzero child has no valid output; never read its stderr.
                     if snapshot_exit_status(child, max(0, end - time.monotonic())):
+                        if receipt is not None:
+                            # The edit CLI has no structured no-effect refusal receipt.
+                            raise LedgerError('NATIVE_EDIT_FAILED', 'kanban', side_effects='unknown')
                         fail('transport', 'SOURCE_DENIED')
                     if error:
                         fail(phase, error)
@@ -171,6 +127,10 @@ def read_snapshot_process(argv, timeout, limit):
             reader.join(2)
         elif child is not None and child.stdout is not None:
             child.stdout.close()
+    if receipt is not None:
+        if output.strip() != receipt:
+            raise LedgerError('SOURCE_MALFORMED', 'kanban', side_effects='unknown')
+        return True
     return decode_source(output)
 
 
