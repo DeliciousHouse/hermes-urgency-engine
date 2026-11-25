@@ -298,8 +298,12 @@ Troubleshooting: `STORE_BUSY` permits a bounded retry after the other writer end
 not deletion of active incidents. `CLOCK_ROLLBACK` waits for clock correction.
 `UNSUPPORTED_SCHEMA`/`CORRUPT_STATE` require backup and diagnosis, not automatic repair.
 `INSTALL_CONFLICT` requires inspecting `hermes cron list` and the owned launcher:
-preserve edited/unrelated assets. An interrupted create may have succeeded; read
-public cron state before retrying. Never blindly add a duplicate job.
+preserve edited/unrelated assets. Refreshing an owned launcher leaves unrelated
+files in the scripts directory untouched. An interrupted create may have
+succeeded; read public cron state before retrying. Never blindly add a duplicate job.
+If the cron job is missing and launcher replacement fails, the install receipt
+still recognizes the unchanged launcher. Once the file is accessible, uninstall
+can remove it without discarding watchdog data.
 
 Rollback: pause, uninstall the owned job, stop writes, and use SQLite's backup API for
 ledger and monitor databases, plus `kanban.db` when canonical sync is configured.

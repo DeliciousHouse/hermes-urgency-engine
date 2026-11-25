@@ -1224,6 +1224,44 @@ class WatchdogInstallTests(unittest.TestCase):
         self.assertEqual(self.install('uninstall')['state'], 'uninstalled')
         self.assertEqual((self.jobs, script.exists()), ([], False))
 
+    def test_refresh_preserves_unowned_sibling(self):
+        import hashlib
+        receipt = self.install()
+        launcher = Path(receipt['script'])
+        old = b'# previous release\n'
+        launcher.write_bytes(old)
+        self.receipt({**receipt, 'sha256': hashlib.sha256(old).hexdigest()})
+        sibling = launcher.with_name(launcher.name + '.tmp')
+        sibling.write_bytes(b'operator backup\n')
+
+        self.install()
+
+        self.assertTrue(sibling.exists(), 'refresh deleted an unrelated sibling file')
+        self.assertEqual(sibling.read_bytes(), b'operator backup\n')
+        self.assertEqual(launcher.read_bytes(), self.content)
+
+    def test_owned_stale_launcher_stays_removable_after_replace_failure(self):
+        import hashlib
+        from unittest.mock import patch
+        receipt = self.install()
+        launcher = Path(receipt['script'])
+        old = b'# previous release\n'
+        launcher.write_bytes(old)
+        self.receipt({**receipt, 'sha256': hashlib.sha256(old).hexdigest()})
+        self.jobs.clear()  # The scheduler no longer has the job, but the receipt owns the file.
+        sibling = launcher.with_name(launcher.name + '.tmp')
+        sibling.write_bytes(b'operator backup\n')
+
+        with patch('urgency_engine.runtime.os.replace', side_effect=PermissionError('transient file sharing refusal')):
+            with self.assertRaises(PermissionError):
+                self.install()
+        self.assertEqual(launcher.read_bytes(), old)
+        self.assertEqual(set(launcher.parent.iterdir()), {launcher, sibling})
+        self.assertEqual(sibling.read_bytes(), b'operator backup\n')
+
+        self.assertEqual(self.install('uninstall')['state'], 'uninstalled')
+        self.assertFalse(launcher.exists())
+
     def test_edited_launcher_still_conflicts(self):
         receipt = self.install()
         script = Path(receipt['script'])

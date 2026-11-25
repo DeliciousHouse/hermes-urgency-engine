@@ -13,6 +13,7 @@ import re
 import shlex
 import sqlite3
 import sys
+import tempfile
 import time
 import traceback
 from typing import NoReturn
@@ -960,12 +961,24 @@ class Runtime:
         found = jobs()
         receipt = monitor.meta('install')
 
-        def owned():
-            # The current launcher, or the unedited one an earlier release installed.
-            data = script.read_bytes()
-            return data == content or bool(receipt and receipt.get('sha256') == hashlib.sha256(data).hexdigest())
         if len(found) > 1 or (found and not exact(found[0])):
             conflict('job')
+        def owned():
+            data = script.read_bytes()
+            if data == content:
+                return True
+            digest = hashlib.sha256(data).hexdigest()
+            return bool(receipt and (
+                receipt.get('sha256') == digest
+                or (receipt.get('state') == 'installing' and receipt.get('previous_sha256') == digest)
+            ))
+        def refresh():
+            if script.read_bytes() != content:
+                with tempfile.TemporaryDirectory(dir=script.parent) as directory:
+                    temporary = Path(directory) / script.name
+                    with temporary.open('xb') as stream:
+                        stream.write(content)
+                    os.replace(temporary, script)
         if script.is_symlink() or (script.exists() and not owned()):
             conflict('launcher')
         if receipt and receipt.get('home') != str(home):
@@ -991,19 +1004,6 @@ class Runtime:
                 monitor.audit(uuid.uuid4().hex, 'uninstall', ['uninstall'], {'state': 'uninstalled'})
             return {'state': 'uninstalled', 'retained_data': True}
 
-        def refresh():
-            # Replace an owned launcher from an earlier release in place. The file
-            # then matches this package, so a crash before the receipt update is safe.
-            if script.read_bytes() == content:
-                return
-            temporary = script.with_name(f'.{script.name}.{uuid.uuid4().hex}.tmp')
-            try:
-                with temporary.open('xb') as stream:
-                    stream.write(content)
-                os.replace(temporary, script)
-            except OSError:
-                temporary.unlink(missing_ok=True)
-                conflict('launcher_refresh')
         if found:
             if not receipt or (receipt.get('job_id') and receipt['job_id'] != found[0]['job_id']):
                 conflict('ownership')
@@ -1023,7 +1023,11 @@ class Runtime:
                     conflict('pending_install')
                 if script.exists() and not current:
                     conflict('launcher_owner')
-                monitor.put('install', dict(state='installing', home=str(home), sha256=sha))
+                reservation = dict(state='installing', home=str(home), sha256=sha)
+                # A failed atomic replacement can leave the old launcher in place.
+                if current and current.get('sha256'):
+                    reservation['previous_sha256'] = current['sha256']
+                monitor.put('install', reservation)
             script.parent.mkdir(parents=True, exist_ok=True)
             if not script.exists():
                 with script.open('xb') as stream:
