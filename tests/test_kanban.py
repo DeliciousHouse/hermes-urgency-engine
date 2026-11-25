@@ -302,9 +302,10 @@ class TransportTests(unittest.TestCase):
         context.start()
         self.addCleanup(context.stop)
         calls = []
-        def run(argv):
+        def run(argv, **options):
             calls.append(argv)
             if 'snapshot' in argv:
+                self.assertEqual(options, {'snapshot_phases': True} if '--transport-phases' in argv else {})
                 return dict(ok=True, data=dict(task=dict(id='task'), parents=[]))
             return [{'slug': 'demo'}] if 'boards' in argv else []
         adapter = kanban.NativeSource(run)
@@ -316,6 +317,8 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         adapter.detail(BINDING, 'task')
         self.assertEqual(calls[-1][-5:], ['snapshot', '--board', 'demo', '--task', 'task'])
+        kanban.NativeSource(run, snapshot_phases=True).detail(BINDING, 'task')
+        self.assertEqual(calls[-1][-6:], ['snapshot', '--board', 'demo', '--task', 'task', '--transport-phases'])
 
     def test_transport_enforces_timeout_output_limit_and_json(self):
         """protects=owned subprocess bounds; fails_when=hang or output accepted;
@@ -331,6 +334,59 @@ class TransportTests(unittest.TestCase):
             with self.subTest(code=code), self.assertRaises(LedgerError) as caught:
                 kanban.read_process([sys.executable, '-c', source], **options)
             self.assertEqual(caught.exception.code, code)
+
+    def test_snapshot_startup_and_board_validation_have_separate_deadlines(self):
+        """Two independently responsive phases must not share a child deadline."""
+        import inspect
+        import sys
+        child = ('import time; time.sleep(.65); print("@urgency:board", flush=True); '
+                 'time.sleep(.65); print("@urgency:detail", flush=True); print("[]")')
+        options = {'snapshot_phases': True} if 'snapshot_phases' in inspect.signature(kanban.read_process).parameters else {}
+        self.assertEqual(kanban.read_process([sys.executable, '-c', child], timeout=1.1,
+                                              **options), [])
+
+    def test_snapshot_phase_refusals_do_not_renew_deadlines_or_return_payload(self):
+        import sys
+        markers = 'print("@urgency:board", flush=True); print("@urgency:detail", flush=True); '
+        for script, code, field in (
+            ('import time; time.sleep(5)', 'SOURCE_TIMEOUT', 'startup'),
+            ('print("@urgency:board", flush=True); import time; time.sleep(5)', 'SOURCE_TIMEOUT', 'board'),
+            (markers + 'import time; time.sleep(5)', 'SOURCE_TIMEOUT', 'detail'),
+            ('print("@urgency:board\\n@urgency:board", flush=True)', 'SOURCE_MALFORMED', 'board'),
+            (markers + 'print("x"*4096)', 'SOURCE_LIMIT', 'output'),
+            (markers + 'print("[]"); raise SystemExit(1)', 'SOURCE_DENIED', 'transport'),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(LedgerError) as caught:
+                    kanban.read_process([sys.executable, '-c', script], timeout=1.0, limit=512,
+                                        snapshot_phases=True)
+                self.assertEqual((caught.exception.code, caught.exception.field), (code, field))
+
+    def test_snapshot_timeout_cleans_up_descendant_holding_stdout(self):
+        """An exited parent does not make an inherited pipe safe to close."""
+        import inspect
+        from pathlib import Path
+        import sys
+        import tempfile
+        import time
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'descendant'
+            code = ('import time; from pathlib import Path; time.sleep(2.5); '
+                    f'Path({str(marker)!r}).write_text("escaped")')
+            child = ('import subprocess, sys; '
+                     f'subprocess.Popen([sys.executable, "-c", {code!r}]); '
+                     'print("@urgency:board", flush=True)')
+            options = {'snapshot_phases': True} if 'snapshot_phases' in inspect.signature(kanban.read_process).parameters else {}
+            start = time.monotonic()
+            with self.assertRaises(LedgerError) as caught:
+                kanban.read_process([sys.executable, '-c', child], timeout=.5, **options)
+            self.assertEqual(caught.exception.code, 'SOURCE_TIMEOUT')
+            elapsed = time.monotonic() - start
+            time.sleep(max(0, start + 3 - time.monotonic()))
+            self.assertFalse(marker.exists())
+            self.assertEqual(caught.exception.field, 'board')
+            # gstack-timing-ok: bound the real inherited-pipe drain, not the child sleep.
+            self.assertLess(elapsed, 2)
 
 
 class ProjectionTests(unittest.TestCase):

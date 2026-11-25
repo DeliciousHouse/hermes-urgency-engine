@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
+import queue
 import re
 import subprocess
 import threading
@@ -14,6 +15,7 @@ from typing import NoReturn
 
 from contextlib import contextmanager
 import sqlite3
+from ._snapshot_process import snapshot_exit_status, snapshot_process
 from .ledger import LedgerError, _id, _json, _integer, _text
 
 
@@ -21,6 +23,7 @@ DEFAULTS = dict(kanban_sync_enabled=False, kanban_bindings=[],
                 kanban_sync_seconds=60, kanban_max_tasks=10000)
 STATUSES = {'todo', 'ready', 'triage', 'running', 'blocked', 'review', 'done', 'archived'}
 MAX_INTENT_BYTES = 16 * 1024 * 1024
+SNAPSHOT_PHASES = ('board', 'detail')
 
 
 def intent_batch_size(remaining):
@@ -38,8 +41,11 @@ def fail(field, code='SOURCE_MALFORMED') -> NoReturn:
     raise LedgerError(code, 'kanban', field)
 
 
-def read_process(argv, *, timeout=20, limit=16 * 1024 * 1024, receipt=None):
+def read_process(argv, *, timeout: float = 20, limit=16 * 1024 * 1024, receipt=None,
+                 snapshot_phases=False):
     """Bound stdout in memory; retain no stderr or native private task bodies."""
+    if snapshot_phases:
+        return read_snapshot_process(argv, timeout, limit)
     output = bytearray()
     overflow = threading.Event()
     try:
@@ -89,6 +95,10 @@ def read_process(argv, *, timeout=20, limit=16 * 1024 * 1024, receipt=None):
         if output.strip() != receipt:
             raise LedgerError('SOURCE_MALFORMED', 'kanban', side_effects='unknown')
         return True
+    return decode_source(output)
+
+
+def decode_source(output):
     try:
         def pairs(items):
             result = {}
@@ -103,10 +113,72 @@ def read_process(argv, *, timeout=20, limit=16 * 1024 * 1024, receipt=None):
         fail('json')
 
 
+def read_snapshot_process(argv, timeout, limit):
+    """Each ordered phase gets one budget, including output drain in the last phase."""
+    signals = queue.SimpleQueue()
+    output = bytearray()
+    reader = None
+    child = None
+
+    def drain(stream):
+        try:
+            for phase in SNAPSHOT_PHASES:
+                marker = f'@urgency:{phase}'.encode('ascii')
+                if stream.readline(len(marker) + 2) not in (marker + b'\n', marker + bytes((13, 10))):
+                    signals.put((time.monotonic(), 'SOURCE_MALFORMED'))
+                    return
+                signals.put((time.monotonic(), None))
+            while True:
+                chunk = stream.read(min(65536, limit + 1 - len(output)))
+                if not chunk:
+                    signals.put((time.monotonic(), None))
+                    return
+                if len(output) + len(chunk) > limit:
+                    signals.put((time.monotonic(), 'SOURCE_LIMIT'))
+                    return
+                output.extend(chunk)
+        except OSError:
+            signals.put((time.monotonic(), 'SOURCE_UNAVAILABLE'))
+        finally:
+            stream.close()
+
+    phase = 'startup'
+    end = time.monotonic() + timeout
+    try:
+        with snapshot_process(argv) as child:
+            reader = threading.Thread(target=drain, args=(child.stdout,), daemon=True)
+            reader.start()
+            for next_phase in (*SNAPSHOT_PHASES, None):
+                arrived, error = signals.get(timeout=max(0, end - time.monotonic()))
+                if arrived >= end:
+                    fail(phase, 'SOURCE_TIMEOUT')
+                if error == 'SOURCE_LIMIT':
+                    fail('output', error)
+                if error or next_phase is None:
+                    # A nonzero child has no valid snapshot; never read its stderr.
+                    if snapshot_exit_status(child, max(0, end - time.monotonic())):
+                        fail('transport', 'SOURCE_DENIED')
+                    if error:
+                        fail(phase, error)
+                    break
+                phase, end = next_phase, arrived + timeout
+    except (queue.Empty, subprocess.TimeoutExpired):
+        fail(phase, 'SOURCE_TIMEOUT')
+    except OSError:
+        fail('transport', 'SOURCE_UNAVAILABLE')
+    finally:
+        if reader and reader.ident is not None:
+            reader.join(2)
+        elif child is not None and child.stdout is not None:
+            child.stdout.close()
+    return decode_source(output)
+
+
 class NativeSource:
     """Public CLI transport. List performs native readiness recomputation."""
-    def __init__(self, run=read_process):
+    def __init__(self, run=read_process, *, snapshot_phases=False):
         self.run = run
+        self.snapshot_phases = snapshot_phases
 
     def _check_board(self, binding):
         import os
@@ -119,8 +191,10 @@ class NativeSource:
         import sys
         self._check_board(binding)
         _id(task_id, 'task_id')
-        result = self.run([sys.executable, '-m', 'hermes_cli.main', 'urgency', 'kanban',
-                           'snapshot', '--board', binding['board'], '--task', task_id])
+        argv = [sys.executable, '-m', 'hermes_cli.main', 'urgency', 'kanban',
+                'snapshot', '--board', binding['board'], '--task', task_id]
+        result = (self.run([*argv, '--transport-phases'], snapshot_phases=True)
+                  if self.snapshot_phases else self.run(argv))
         if not isinstance(result, dict) or result.get('ok') is not True or not isinstance(result.get('data'), dict):
             fail('snapshot')
         return result['data']
@@ -631,6 +705,11 @@ class Sync:
                 try:
                     document = source.detail(binding, task_id)
                 except LedgerError as exc:
+                    if exc.code == 'SOURCE_TIMEOUT' and count:
+                        # Retain only the validated prefix, not the timed-out row.
+                        # The failed request stays pending and retains unknown coverage.
+                        apply_collected()
+                        exc.side_effects = 'unknown'
                     self.mark_unknown(key, exc.code)
                     raise
                 projection = project(document, binding, self.clock(), self.redact)
