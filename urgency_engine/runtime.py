@@ -27,6 +27,10 @@ PLUGIN_ID = 'hermes-urgency-engine'
 MAX_INPUT_BYTES = 256 * 1024
 # Inventory and one detail are four cold CLI starts; 20 s each was measured on Windows.
 TICK_SOURCE_SECONDS = 100
+# Without a launcher deadline (a launcher from an earlier release, which kills the
+# tick at 35 s, or a hand run): 20 s tick start + 8 s sync + 4 s child reaping
+# leaves time to flush and evaluate deadlines.
+LEGACY_TICK_SOURCE_SECONDS = 8
 
 
 def tick_source_budget():
@@ -36,8 +40,8 @@ def tick_source_budget():
     try:
         left = float(os.environ['URGENCY_ENGINE_TICK_DEADLINE']) - time.time()
     except (KeyError, ValueError):
-        return TICK_SOURCE_SECONDS
-    return max(0.0, min(TICK_SOURCE_SECONDS, left)) if math.isfinite(left) else TICK_SOURCE_SECONDS
+        return LEGACY_TICK_SOURCE_SECONDS
+    return max(0.0, min(TICK_SOURCE_SECONDS, left)) if math.isfinite(left) else LEGACY_TICK_SOURCE_SECONDS
 EVIDENCE = {'evidence_kind': 'artifact_byte_identity',
             'limitation': 'Matching bytes is not independent semantic quality acceptance.',
             'confidence': 'insufficient_evidence'}

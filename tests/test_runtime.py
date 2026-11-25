@@ -624,10 +624,24 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsInstance(seen[0]['deadline'], float)
         self.assertEqual(self.runtime.kanban_read('health', {})['last_error'], 'SOURCE_TIMEOUT')
         self.assertIn('expired_deadline', incidents())
-        for value, budget in (('nan', runtime_module.TICK_SOURCE_SECONDS), ('junk', runtime_module.TICK_SOURCE_SECONDS),
+        legacy = runtime_module.LEGACY_TICK_SOURCE_SECONDS
+        for value, budget in (('nan', legacy), ('junk', legacy), ('1e400', legacy),
                               (repr(time.time() + 10 ** 6), runtime_module.TICK_SOURCE_SECONDS)):
             with patch.dict(os.environ, {'URGENCY_ENGINE_TICK_DEADLINE': value}):
                 self.assertEqual(runtime_module.tick_source_budget(), budget)
+
+    def test_tick_without_launcher_deadline_fits_the_previous_launcher_timeout(self):
+        """A launcher from an earlier release kills the tick at 35 s and passes no deadline."""
+        import os
+        from unittest.mock import patch
+        from urgency_engine import runtime as runtime_module
+        from urgency_engine import _snapshot_process
+        env = {k: v for k, v in os.environ.items() if k != 'URGENCY_ENGINE_TICK_DEADLINE'}
+        with patch.dict(os.environ, env, clear=True):
+            budget = runtime_module.tick_source_budget()
+        cold_start, reaping, flush_and_evaluate = 20, _snapshot_process._REAP_TIMEOUT + 2, 3
+        self.assertLessEqual(cold_start + budget + reaping + flush_and_evaluate, 35)
+        self.assertGreater(budget, 0)
 
     def test_launcher_timeout_covers_cold_start_budget_and_reserve(self):
         """The launcher must outlast tick startup plus the sync budget and its flush."""
