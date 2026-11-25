@@ -862,6 +862,31 @@ class RuntimeTests(unittest.TestCase):
         self.ctx.redact_text = lambda *args, **kwargs: None
         self.assertIsNone(self.runtime.pre_llm_call())
 
+    def test_unavailable_redactor_suppresses_context(self):
+        self.project()
+        self.ctx.settings['default_project'] = 'p'
+
+        def unavailable(text, force=False):
+            raise RuntimeError('synthetic redactor unavailable')
+
+        for redactor in (lambda text, force=False: None, unavailable):
+            with self.subTest(redactor=redactor.__name__):
+                self.ctx.redact_text = redactor
+                self.assertIsNone(self.runtime.pre_llm_call())
+
+    def test_single_redaction_failure_suppresses_context(self):
+        self.project()
+        self.ctx.settings['default_project'] = 'p'
+        redact = self.ctx.redact_text
+
+        def unavailable_once(text, force=False):
+            self.ctx.redact_text = redact
+            raise RuntimeError('synthetic transient redactor failure')
+
+        self.ctx.redact_text = unavailable_once
+        self.assertIsNone(self.runtime.pre_llm_call())
+        self.assertIn('Urgency planning guidance', self.runtime.pre_llm_call()['context'])
+
     def test_expired_focus_does_not_fall_back_to_another_project(self):
         """protects=expired selection isolation; fails_when=default leaks; seam=clock."""
         self.project()
