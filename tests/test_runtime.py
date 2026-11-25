@@ -673,6 +673,63 @@ class RuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(sync_until, cold_start + TICK_SOURCE_SECONDS)
         self.assertGreaterEqual(options['timeout'] - sync_until, 30)
 
+    def test_install_and_uninstall_take_over_a_launcher_from_an_earlier_release(self):
+        """protects=upgrade path; fails_when=a changed launcher locks out install/uninstall;
+        why_new=receipt hash ownership; seam=temp home, fake public cron; no_claim=real Hermes cron.
+        """
+        import hashlib
+        import sys
+        import types
+        from unittest.mock import patch
+        from urgency_engine.ledger import LedgerError
+        from urgency_engine.watchdog import Monitor
+        home = (self.root / 'home').resolve()
+        script = home / 'scripts' / 'hermes-urgency-engine-watchdog.py'
+        packaged = (Path(__file__).resolve().parents[1] / 'scripts' / 'watchdog.py').read_bytes()
+        previous = b'# launcher written by an earlier release\nraise SystemExit(0)\n'
+        jobs, calls = [], []
+
+        def cron(action, **arguments):
+            calls.append(action)
+            if action == 'create':
+                jobs.append(dict(job_id='job-%d' % len(calls), no_agent=True, **arguments))
+                return {'success': True, 'job_id': jobs[-1]['job_id']}
+            if action == 'remove':
+                jobs[:] = [job for job in jobs if job['job_id'] != arguments['job_id']]
+            return {'success': True, 'jobs': [dict(job) for job in jobs]}
+
+        def earlier_release_install(monitor, launcher=previous):
+            script.parent.mkdir(parents=True, exist_ok=True)
+            script.write_bytes(launcher)
+            jobs[:] = [dict(job_id='job-old', name='hermes-urgency-engine-watchdog', script=script.name, no_agent=True)]
+            with monitor.transaction():
+                monitor.put('install', dict(state='installed', job_id='job-old', home=str(home),
+                                            sha256=hashlib.sha256(launcher).hexdigest(), script=str(script),
+                                            no_agent=True, deliver='local'))
+
+        fake_home = types.SimpleNamespace(get_hermes_home=lambda: home)
+        with patch.dict(sys.modules, {'hermes_constants': fake_home}), patch.object(self.runtime, 'cron', side_effect=cron), \
+             Monitor.open(self.root / 'watchdog.db', clock=lambda: self.now) as monitor:
+            earlier_release_install(monitor)
+            receipt = self.runtime.monitor_install(monitor, 'install', 'local')
+            self.assertEqual(script.read_bytes(), packaged)
+            self.assertEqual((receipt['job_id'], receipt['sha256']), ('job-old', hashlib.sha256(packaged).hexdigest()))
+            self.assertNotIn('create', calls)
+            self.assertEqual(sorted(p.name for p in script.parent.iterdir()), [script.name])
+
+            earlier_release_install(monitor)
+            self.assertEqual(self.runtime.monitor_install(monitor, 'uninstall', 'local')['state'], 'uninstalled')
+            self.assertEqual((jobs, script.exists()), ([], False))
+
+            # An operator-edited launcher is still not ours to replace or delete.
+            earlier_release_install(monitor)
+            script.write_bytes(previous + b'# operator edit\n')
+            for operation in ('install', 'uninstall'):
+                with self.assertRaises(LedgerError) as caught:
+                    self.runtime.monitor_install(monitor, operation, 'local')
+                self.assertEqual((caught.exception.code, script.read_bytes()), ('INSTALL_CONFLICT', previous + b'# operator edit\n'))
+            self.assertEqual(len(jobs), 1)
+
     def test_diagnose_reports_actual_schema_after_unknown_work_write(self):
         """protects=upgrade diagnostics; fails_when=outdated schema reported;
         why_new=migration; seam=real Runtime; no_claim=installed upgrade.

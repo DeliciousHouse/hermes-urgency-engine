@@ -916,9 +916,14 @@ class Runtime:
                     and (home / 'scripts' / job['script']).resolve() == script and job.get('name') == 'hermes-urgency-engine-watchdog')
         found = jobs()
         receipt = monitor.meta('install')
+
+        def owned():
+            # The current launcher, or the unedited one an earlier release installed.
+            data = script.read_bytes()
+            return data == content or bool(receipt and receipt.get('sha256') == hashlib.sha256(data).hexdigest())
         if len(found) > 1 or (found and not exact(found[0])):
             conflict('job')
-        if script.is_symlink() or (script.exists() and script.read_bytes() != content):
+        if script.is_symlink() or (script.exists() and not owned()):
             conflict('launcher')
         if receipt and receipt.get('home') != str(home):
             conflict('profile')
@@ -934,7 +939,7 @@ class Runtime:
                 if jobs():
                     conflict('remove_readback')
             if script.exists():
-                if script.read_bytes() != content:
+                if not owned():
                     conflict('launcher')
                 script.unlink()
             with monitor.transaction():
@@ -942,11 +947,27 @@ class Runtime:
                 monitor.put('paused', True)
                 monitor.audit(uuid.uuid4().hex, 'uninstall', ['uninstall'], {'state': 'uninstalled'})
             return {'state': 'uninstalled', 'retained_data': True}
+
+        def refresh():
+            # Replace an owned launcher from an earlier release in place. The file
+            # then matches this package, so a crash before the receipt update is safe.
+            if script.read_bytes() == content:
+                return
+            temporary = script.with_name(f'.{script.name}.{uuid.uuid4().hex}.tmp')
+            try:
+                with temporary.open('xb') as stream:
+                    stream.write(content)
+                import os
+                os.replace(temporary, script)
+            except OSError:
+                temporary.unlink(missing_ok=True)
+                conflict('launcher_refresh')
         if found:
             if not receipt or (receipt.get('job_id') and receipt['job_id'] != found[0]['job_id']):
                 conflict('ownership')
             if not script.exists():
                 conflict('launcher_missing')
+            refresh()
             job = found[0]
         else:
             # Reserve before external work. Unknown create outcomes are reconciled,
@@ -962,6 +983,8 @@ class Runtime:
             if not script.exists():
                 with script.open('xb') as stream:
                     stream.write(content)
+            else:
+                refresh()
             result = self.cron('create', schedule='every 1m', name='hermes-urgency-engine-watchdog',
                                script=script.name, no_agent=True, deliver=deliver, enabled_toolsets=[])
             found = jobs()

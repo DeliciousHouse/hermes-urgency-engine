@@ -17,14 +17,14 @@ All commands below start with `hermes urgency watchdog`.
 
 | Command | Arguments and effect |
 | --- | --- |
-| `install` | `--deliver local` by default, or an existing Hermes delivery target. Explicitly writes one owned launcher and registers one no-agent job every minute. Existing owned installation is reconciled. |
+| `install` | `--deliver local` by default, or an existing Hermes delivery target. Explicitly writes one owned launcher and registers one no-agent job every minute. Existing owned installation is reconciled; an unedited launcher written by an earlier release is replaced with the current one. |
 | `tick` | `--force` skips next-due throttling, not pause, deduplication or notice limits. Exit 0 with empty stdout when quiet; fresh notices are one JSON summary; failures exit 1 on stderr. |
 | `health` | Read-only schema version, install receipt, pause, last successful evaluation, last complete scan, cursor, lag, next due, coverage and limitations. A stored install receipt is not a live scheduler-health probe. |
 | `pause`, `resume` | Require `--request-id ID --reason TEXT`. Persist audited control; resume makes the next tick due. Same request and payload replay; different payload conflicts. |
 | `incidents`, `plans` | Read-only pages, `--project ID` optional, `--limit N` default 100 (1–500), `--after ID` continuation. Includes historical resolved records. |
 | `export` | `--table incidents` by default; also `plans`, `observations`, `monitor_audit`. Same paging flags; audit continuation is an integer and does not support project filtering. Writes JSON to stdout, never an arbitrary destination path. |
 | `observe` | `--json-file FILE`: explicit typed local observation, at most 16 KiB after JSON parsing. No conversational mutation equivalent. |
-| `uninstall` | Removes only the owned cron and unchanged launcher. Retains ledger, monitor and audit data. Edited or ambiguous assets return `INSTALL_CONFLICT`. |
+| `uninstall` | Removes only the owned cron and unchanged launcher (current, or as recorded in the install receipt). Retains ledger, monitor and audit data. Edited or ambiguous assets return `INSTALL_CONFLICT`. |
 
 Reads return `{"ok":true,"data":...}`; pages include `schema_version: 1`,
 `items`, `has_more`, `next`. Pass `next` as `--after` while `has_more` is true.
@@ -91,14 +91,19 @@ seconds and never runs past that deadline. Every native child is cut off at the
 deadline, and collection returns `partial` with validated work flushed. A
 `SOURCE_*` failure is recorded and does not stop the tick, so deadline and
 checkpoint evaluation still runs in the same tick. Other sync errors, such as
-`STORE_BUSY` while an operator sync holds the scan lock, still fail that tick. A tick run by hand uses the
-100-second default. A launcher installed by an earlier release keeps its old
-35-second timeout and sets no deadline. Ownership is checked against the
-packaged launcher bytes, so after upgrading, both `install` and `uninstall`
-report `INSTALL_CONFLICT` on `launcher`. Run `hermes urgency watchdog uninstall`
-with the old release before upgrading, then `install` with the new one.
+`STORE_BUSY` while an operator sync holds the scan lock, still fail that tick.
 
-With a 20-second CLI start, the budget covers inventory for one binding and at
+Without a deadline (a tick run by hand, or a launcher installed by an earlier
+release, which kills the tick after 35 seconds), the sync uses at most 8
+seconds, so a 20-second tick start, child cleanup, the flush and deadline
+evaluation still fit in 35 seconds. On a slow host that is usually too short for
+inventory, so the tick records `SOURCE_TIMEOUT` and evaluates deadlines without
+sync progress. The earlier launcher also gives `plugins list` only 20 seconds.
+After upgrading, run `hermes urgency watchdog install` once: it keeps the
+existing job and replaces the launcher if its bytes still match the install
+receipt. An edited launcher is never replaced and returns `INSTALL_CONFLICT`.
+
+With a 20-second CLI start, the 100-second budget covers inventory for one binding and at
 least one detail. With several bindings, inventory alone can exceed it. The
 tick then records `SOURCE_TIMEOUT` and still evaluates deadlines, but the sync
 makes no progress.
@@ -271,7 +276,8 @@ credentials. No delivery acknowledgement or exactly-once guarantee is claimed.
    a new `request_id` or `occurred_at`.
 4. Pause with `hermes urgency watchdog pause --request-id pause-1 --reason maintenance`.
    Resume with `hermes urgency watchdog resume --request-id resume-1 --reason ready`.
-5. Run `hermes urgency watchdog uninstall` before disabling, removing or upgrading the plugin.
+5. Run `hermes urgency watchdog uninstall` before disabling or removing the plugin. After an upgrade,
+   run `hermes urgency watchdog install` to refresh the owned launcher.
    An already-installed launcher also exits quietly if the plugin is disabled/removed.
 
 Troubleshooting: `STORE_BUSY` permits a bounded retry after the other writer ends.
