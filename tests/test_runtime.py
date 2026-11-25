@@ -828,5 +828,96 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn('CORRUPT_STATE', self.runtime.pre_llm_call(session_id='other')['context'])
 
 
+class WatchdogInstallTests(unittest.TestCase):
+    """Owned-launcher and cron reconciliation against a fake public cron surface."""
+
+    def setUp(self):
+        import sys
+        import types
+        from unittest.mock import patch
+        from urgency_engine.watchdog import Monitor
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.home = self.root / 'home'
+        self.home.mkdir()
+        constants = types.ModuleType('hermes_constants')
+        constants.get_hermes_home = lambda: self.home
+        modules = patch.dict(sys.modules, {'hermes_constants': constants})
+        modules.start()
+        self.addCleanup(modules.stop)
+        self.runtime = Runtime(Context(self.root / 'state.json'), data_dir=lambda: self.root)
+        self.jobs = []
+        def cron(action, **arguments):
+            if action == 'list':
+                return {'jobs': [dict(job) for job in self.jobs]}
+            if action == 'create':
+                self.jobs.append(dict(job_id='job-1', name=arguments['name'], script=arguments['script'],
+                                      no_agent=arguments['no_agent']))
+                return {'job_id': 'job-1'}
+            self.jobs[:] = [job for job in self.jobs if job['job_id'] != arguments['job_id']]
+            return {}
+        self.runtime.cron = cron
+        self.monitor = Monitor.open(self.root / 'watchdog.db', clock=lambda: datetime(2030, 1, 1, tzinfo=timezone.utc))
+        self.addCleanup(self.monitor.db.close)
+        self.content = (Path(__file__).resolve().parents[1] / 'scripts' / 'watchdog.py').read_bytes()
+
+    def receipt(self, value):
+        with self.monitor.transaction():
+            self.monitor.put('install', value)
+
+    def install(self, operation='install'):
+        return self.runtime.monitor_install(self.monitor, operation, 'local')
+
+    def conflict(self, operation):
+        from urgency_engine.ledger import LedgerError
+        with self.assertRaises(LedgerError) as caught:
+            self.install(operation)
+        self.assertEqual(caught.exception.code, 'INSTALL_CONFLICT')
+        return caught.exception.field
+
+    def test_linked_scripts_directory_installs_and_uninstalls(self):
+        import os
+        target = self.root / 'dotfiles-scripts'
+        target.mkdir()
+        if os.name == 'nt':
+            import _winapi
+            _winapi.CreateJunction(str(target), str(self.home / 'scripts'))
+        else:
+            os.symlink(target, self.home / 'scripts')
+        receipt = self.install()
+        self.assertEqual((receipt['state'], receipt['job_id']), ('installed', 'job-1'))
+        self.assertEqual((target / 'hermes-urgency-engine-watchdog.py').read_bytes(), self.content)
+        self.assertEqual(self.install()['job_id'], 'job-1')
+        self.assertEqual(self.install('uninstall')['state'], 'uninstalled')
+        self.assertEqual((self.jobs, list(target.iterdir())), ([], []))
+
+    def test_launcher_from_installed_receipt_is_owned_and_replaced(self):
+        import hashlib
+        receipt = self.install()
+        script = Path(receipt['script'])
+        old = b'# launcher shipped by an earlier release' + bytes(self.content)
+        script.write_bytes(old)
+        self.receipt({**receipt, 'sha256': hashlib.sha256(old).hexdigest()})
+        refreshed = self.install()
+        self.assertEqual((refreshed['job_id'], refreshed['sha256']), ('job-1', hashlib.sha256(self.content).hexdigest()))
+        self.assertEqual(script.read_bytes(), self.content)
+        self.assertEqual([path.name for path in script.parent.iterdir()], [script.name])
+        script.write_bytes(old)
+        self.receipt({**refreshed, 'sha256': hashlib.sha256(old).hexdigest()})
+        self.assertEqual(self.install('uninstall')['state'], 'uninstalled')
+        self.assertEqual((self.jobs, script.exists()), ([], False))
+
+    def test_edited_launcher_still_conflicts(self):
+        receipt = self.install()
+        script = Path(receipt['script'])
+        script.write_bytes(b'# edited by hand')
+        self.assertEqual(self.conflict('install'), 'launcher')
+        self.assertEqual(self.conflict('uninstall'), 'launcher')
+        self.receipt({**receipt, 'sha256': None})
+        self.assertEqual(self.conflict('uninstall'), 'launcher')
+        self.assertEqual((script.read_bytes(), len(self.jobs)), (b'# edited by hand', 1))
+
+
 if __name__ == '__main__':
     unittest.main()
