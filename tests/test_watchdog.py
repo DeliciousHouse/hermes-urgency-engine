@@ -539,6 +539,39 @@ class WatchdogTests(unittest.TestCase):
                     monitor.capacity({**DEFAULTS, 'watchdog_max_rows': 1})
             self.assertIsNone(monitor.meta('must_rollback'))
 
+    def test_telemetry_within_one_retention_window_cannot_block_new_incidents(self):
+        """protects=bounded monitor store; fails_when=observe receipts fill the row cap for good;
+        why_new=host tool and sync telemetry volume; seam=real monitor store; no_claim=disk quota.
+        """
+        cfg = {**DEFAULTS, 'watchdog_max_rows': 100}
+        with self.monitor() as monitor:
+            for n in range(150):
+                monitor.observe(dict(request_id=f'tool{n}', reason='fixture', project_id='demo', board_id=None,
+                    task_id=None, kind='tool_outcome', occurred_at=self.now.isoformat(),
+                    data=dict(tool_name='shell', outcome='success', duration_seconds=0)), self.ledger_path, cfg)
+                monitor.observe(dict(request_id=f'beat{n}', reason='fixture', project_id='demo', board_id='board',
+                    task_id='task', kind='task_signal', occurred_at=self.now.isoformat(),
+                    data=dict(heartbeat_at=self.now.isoformat())), self.ledger_path, cfg)
+            monitor.tick(self.ledger_path, cfg, force=True)
+            self.now += timedelta(seconds=1800)
+            self.assertTrue(monitor.tick(self.ledger_path, cfg, force=True)['notices'])
+            self.assertLessEqual(monitor.rows(), 100)
+        self.assertIn('stalled', self.detectors())
+
+    def test_expired_observe_receipts_keep_the_evidence_watermark_monotonic(self):
+        """protects=replay receipts expire with their observation; fails_when=receipts never expire
+        or a reused sequence hides new evidence; why_new=retention; seam=real store; no_claim=replay after expiry.
+        """
+        self.observe({'heartbeat_at': self.now.isoformat()}, event='first')
+        self.observe({'heartbeat_at': self.now.isoformat()}, event='second')
+        self.now += timedelta(days=31)
+        self.observe({'heartbeat_at': self.now.isoformat()}, event='third')
+        with self.monitor(True) as monitor:
+            receipts = [row[0] for row in monitor.db.execute('SELECT request_id FROM monitor_audit ORDER BY sequence')]
+            evidence = monitor.meta('evidence:["board","task"]')
+        self.assertEqual(receipts, ['second', 'third'])
+        self.assertEqual(evidence['records']['heartbeat_at']['value'], self.now.isoformat())
+
     def test_unrelated_observations_do_not_refresh_source_freshness(self):
         self.observe({'dependency_state': 'unreachable', 'agent_available': False}, event='source')
         source_time = self.now
