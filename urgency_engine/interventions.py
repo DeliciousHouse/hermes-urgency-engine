@@ -246,14 +246,28 @@ def operator_only():
 
 
 def host_stop():
-    # This host predicate owns profile/fleet sentinel semantics. Older hosts may lack it.
+    """Refuse while `hermes pause` is engaged for this profile or its fleet root.
+
+    Hermes publishes no stop predicate (agent.estop is not in plugin_api.json), so this stats the
+    ESTOP sentinel `hermes pause` writes, at the paths agent/estop.py checks, resolved with the
+    public hermes_constants helpers. Fail closed: a resolver or stat error counts as paused.
+    """
+    # ponytail: sentinel name/location is host convention, not published; swap for the public
+    # predicate once Hermes ships one.
     try:
-        from agent.estop import is_engaged
-    except ModuleNotFoundError as exc:
-        if exc.name in ('agent', 'agent.estop'):
-            return
-        raise
-    if is_engaged():
+        from hermes_constants import get_default_hermes_root, get_hermes_home
+        home = get_hermes_home()
+        paths = {home / 'ESTOP', get_default_hermes_root() / 'ESTOP',
+                 get_default_hermes_root(home=home) / 'ESTOP'}
+    except Exception:
+        fail('PAUSED', 'host', next_action='Hermes home could not be resolved; refusing to apply.')
+    for path in paths:
+        try:
+            os.stat(path)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            pass
         fail('PAUSED', 'host', next_action='Hermes is paused; inspect the host stop before applying.')
 
 
